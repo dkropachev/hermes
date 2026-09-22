@@ -157,6 +157,9 @@ _SPECS = [
         _arg("--workspace",
              help="scratch | worktree | worktree:<path> | dir:<path> (default: scratch; "
                   "an explicit 'scratch' also opts out of a project-scoped board's project)"),
+        _arg("--workspace-access", choices=("read", "write"), default="write",
+             help="Repository coordination mode for worktree tasks when a workspace provider is configured "
+                  "(default: write)"),
         _arg("--branch", help="Branch name for worktree tasks, e.g. wt/t6-wire"),
         _arg("--project",
              help="Link to a project (id or slug). Anchors the task's "

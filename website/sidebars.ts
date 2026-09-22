@@ -829,6 +829,7 @@ const sidebars: SidebarsConfig = {
                 'developer-guide/web-search-provider-plugin',
                 'developer-guide/browser-provider-plugin',
                 'developer-guide/terminal-environment-plugin',
+                'developer-guide/workspace-provider-plugin',
               ],
             },
             'developer-guide/creating-skills',

@@ -929,6 +929,7 @@ hermes kanban init                                     # create kanban.db + prin
 hermes kanban create "<title>" [--body ...] [--assignee <profile>]
                                 [--parent <id>]... [--tenant <name>]
                                 [--workspace scratch|worktree|worktree:<path>|dir:<path>]
+                                [--workspace-access read|write]
                                 [--branch <name>]
                                 [--priority N] [--triage] [--idempotency-key KEY]
                                 [--max-runtime 30m|2h|1d|<seconds>]
@@ -1001,13 +1002,19 @@ All commands are also available as a slash command in the interactive CLI and in
 | `kanban.dispatch_profiles` | unset (any existing profile) | Per-home claim allowlist for boards shared across Hermes homes. When the key is present, this home's dispatcher only claims cards whose assignee is listed — fail-closed: an empty list, `null` or a bare `dispatch_profiles:` claims nothing, and a config read that fails logs a warning and claims nothing; other assignees land in `skipped_nonspawnable`. Only omitting the key means "any existing profile". `hermes kanban diagnostics` prints the resolved value for this home (`any`, the listed names, or `none (fail-closed: …)`). See [Shared boards across homes](#shared-boards-across-homes). |
 | `kanban.auto_promote_children` | `true` | After `decompose_triage_task()` produces children with no parent-blocker dependencies, they're automatically promoted to `ready` so the dispatcher can pick them up. Set to `false` to require manual review — children stay in `todo` until you promote them. |
 | `kanban.default_workdir` | unset | Board-level default working directory applied to new tasks when neither `--workspace` nor the task itself overrides it. Per-task `workspace:` still wins. |
+| `kanban.workspace_provider` | unset | Explicit plugin name that reserves `worktree` workspaces before worker spawn. Missing/unavailable providers fail closed; scratch and dir tasks are unchanged. See [Workspace Provider Plugins](../../developer-guide/workspace-provider-plugin.md). |
 
 ```yaml
 kanban:
   max_in_progress: 2
   auto_promote_children: false
   default_workdir: ~/work/active-project
+  workspace_provider: git-workspace-leases
 ```
+
+`--workspace-access` defaults to `write`. With a selected provider, `read` requests may overlap
+while a provider can reserve `write` exclusively. This is coordination/publication intent, not a
+filesystem permission bit; builds in a read workspace may still create local artifacts.
 
 ### Scheduled task starts (`scheduled_at`)
 

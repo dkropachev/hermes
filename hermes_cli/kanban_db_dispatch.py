@@ -152,6 +152,11 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    workspace_deferred: list[str] = field(default_factory=list)
+    """Task ids requeued without failure because the selected workspace
+    provider reported reader/writer contention."""
+    workspace_lease_lost: list[int] = field(default_factory=list)
+    """Active run ids whose persisted provider lease failed renewal."""
 
 
 def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
@@ -173,6 +178,8 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
             counts[reason] = counts.get(reason, 0) + 1
         if res.rate_limited:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
+        if res.workspace_deferred:
+            counts["workspace_deferred"] = counts.get("workspace_deferred", 0) + len(res.workspace_deferred)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
@@ -1456,6 +1463,101 @@ def _record_task_failure(
         return True
 
 
+def _defer_workspace_claim(conn: sqlite3.Connection, task_id: str, reason: str) -> None:
+    """Return a provider-contended run to its source lane without a failure.
+
+    Reader/writer contention is normal scheduling pressure, not broken task
+    execution and not infrastructure failure. In particular it must not stamp
+    ``last_failure_error`` or activate the infrastructure respawn cooldown.
+    """
+    with _kb.write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None or row["status"] != "running" or row["current_run_id"] is None:
+            return
+        retry_status = _kb._retry_status_for_run(conn, task_id, row["current_run_id"])
+        changed = conn.execute(
+            "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL, worker_started_at = NULL "
+            "WHERE id = ? AND status = 'running' AND current_run_id = ?",
+            (retry_status, task_id, int(row["current_run_id"])),
+        ).rowcount
+        if changed != 1:
+            return
+        run_id = _kb._end_run(
+            conn, task_id, outcome="workspace_deferred", status="workspace_deferred",
+            error=str(reason)[:500], metadata={"retry_status": retry_status},
+        )
+        _kb._append_event(
+            conn, task_id, "workspace_deferred",
+            {"reason": str(reason)[:500], "retry_status": retry_status}, run_id=run_id,
+        )
+
+
+def _reclaim_lost_workspace_leases(
+    conn: sqlite3.Connection, run_ids: Iterable[int], *, board: Optional[str], signal_fn=None,
+) -> list[int]:
+    """Stop runs whose provider says lease ownership is gone.
+
+    A lost writer may never keep executing beside a successor. Verified local
+    workers are terminated before their claim is released; one that survives
+    remains claimed and is retried next tick rather than spawning a duplicate.
+    """
+    reclaimed: list[int] = []
+    for run_id in run_ids:
+        row = conn.execute(
+            "SELECT t.id AS task_id, t.status, t.current_run_id, t.claim_lock, "
+            "t.worker_pid, t.worker_started_at "
+            "FROM tasks t JOIN task_runs r ON r.id = t.current_run_id "
+            "WHERE r.id = ? AND r.ended_at IS NULL",
+            (int(run_id),),
+        ).fetchone()
+        if row is None or row["status"] != "running":
+            continue
+        termination = _terminate_reclaimed_worker(
+            row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+            started_at=row["worker_started_at"],
+        )
+        if _worker_survived_termination(termination):
+            _kb._log.error(
+                "kanban: workspace lease lost for task %s run %s, but worker pid %s survived; "
+                "holding the claim and retrying termination next tick",
+                row["task_id"], run_id, row["worker_pid"],
+            )
+            continue
+        with _kb.write_txn(conn):
+            retry_status = _kb._retry_status_for_run(conn, row["task_id"], int(run_id))
+            changed = conn.execute(
+                "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL, worker_started_at = NULL, last_heartbeat_at = NULL "
+                "WHERE id = ? AND status = 'running' AND current_run_id = ? "
+                "AND claim_lock IS ?",
+                (retry_status, row["task_id"], int(run_id), row["claim_lock"]),
+            ).rowcount
+            if changed != 1:
+                continue
+            payload = {"retry_status": retry_status, **termination}
+            ended_run_id = _kb._end_run(
+                conn, row["task_id"], outcome="workspace_lease_lost",
+                status="workspace_lease_lost", error="workspace provider lease ownership lost",
+                metadata=payload,
+            )
+            _kb._append_event(
+                conn, row["task_id"], "workspace_lease_lost", payload, run_id=ended_run_id,
+            )
+        try:
+            _kbwp.release_workspace_lease(
+                conn, int(run_id), board=board, outcome="workspace_lease_lost",
+            )
+        except Exception:
+            _kb._log.warning(
+                "kanban: stale workspace lease release failed for run %s", run_id, exc_info=True,
+            )
+        reclaimed.append(int(run_id))
+    return reclaimed
+
+
 def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     """Record the spawned child's pid + its restart-stable fingerprint (``_process_fingerprint``), and
     emit a ``spawned`` event carrying them. The fingerprint is what lets every later liveness/kill
@@ -2052,10 +2154,23 @@ def _dispatch_lane_task(
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
         return False
+    run_id = claimed.current_run_id
+    provider_managed = False
     try:
         resolved_branch_name = None
         if claimed.workspace_kind == "worktree":
-            workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
+            plan = _kbw._plan_worktree_workspace(claimed, board=board)
+            try:
+                workspace_path, resolved_branch_name, provider_managed = _kbwp.acquire_workspace(
+                    conn, claimed, str(plan.path), plan.branch, str(plan.repo_root), board=board,
+                )
+            except _kbwp.WorkspaceProviderBusy as exc:
+                _defer_workspace_claim(conn, claimed.id, str(exc))
+                result.workspace_deferred.append(claimed.id)
+                return False
+            workspace, resolved_branch_name = _kbw._materialize_worktree_plan(
+                plan, path=workspace_path, branch=resolved_branch_name,
+            )
         else:
             workspace = _kbw.resolve_workspace(claimed, board=board)
     except Exception as exc:
@@ -2064,15 +2179,29 @@ def _dispatch_lane_task(
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
         ):
             result.auto_blocked.append(claimed.id)
+        if provider_managed and run_id is not None:
+            try:
+                _kbwp.release_workspace_lease(conn, run_id, board=board, outcome="workspace_failed")
+            except Exception:
+                _kb._log.warning(
+                    "kanban: workspace lease release failed after workspace setup failure for %s",
+                    claimed.id, exc_info=True,
+                )
         return False
-    _kbw.set_workspace_path(conn, claimed.id, str(workspace))
-    if claimed.workspace_kind == "worktree":
-        _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+    claimed.workspace_path = str(workspace)
+    if not provider_managed:
+        _kbw.set_workspace_path(conn, claimed.id, str(workspace))
+    if claimed.workspace_kind == "worktree" and not provider_managed:
+        claimed.branch_name = resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}"
+        _kbw.set_branch_name(conn, claimed.id, claimed.branch_name)
+    elif claimed.workspace_kind == "worktree":
+        claimed.branch_name = resolved_branch_name
     _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
     if lane == "review":
         # Force-load sdlc-review; the kanban lifecycle is already in every
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
+    pid = None
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
@@ -2099,6 +2228,16 @@ def _dispatch_lane_task(
             infrastructure=infrastructure,
         ):
             result.auto_blocked.append(claimed.id)
+        # No child exists to own this run, so retaining its repository lease
+        # until the next dispatcher sweep would needlessly block waiters.
+        if run_id is not None and not pid:
+            try:
+                _kbwp.release_workspace_lease(conn, run_id, board=board, outcome="spawn_failed")
+            except Exception:
+                _kb._log.warning(
+                    "kanban: workspace lease release failed after spawn failure for %s",
+                    claimed.id, exc_info=True,
+                )
         return False
 
 
@@ -2145,6 +2284,7 @@ def _run_reclaim_phase(
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
     reap_worker_zombies()
     result.reaped_terminal_workers = reap_terminal_workers(conn)
+    _kbwp.release_finished_workspace_leases(conn, board=board)
     result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
@@ -2156,6 +2296,8 @@ def _run_reclaim_phase(
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
+    result.workspace_lease_lost = _kbwp.renew_active_workspace_leases(conn, board=board)
+    _reclaim_lost_workspace_leases(conn, result.workspace_lease_lost, board=board)
 
 
 def _tick_spawn_budget(
@@ -2963,3 +3105,4 @@ def run_daemon(
 from hermes_cli import kanban_db as _kb  # noqa: E402
 from hermes_cli import kanban_db_connect as _kbc  # noqa: E402
 from hermes_cli import kanban_db_workspace as _kbw  # noqa: E402
+from hermes_cli import kanban_workspace_provider as _kbwp  # noqa: E402

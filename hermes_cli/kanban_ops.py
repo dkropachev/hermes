@@ -309,11 +309,15 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     removed_ws = 0
     with kbc.connect_closing() as conn:
         rows = conn.execute(
-            "SELECT id, workspace_kind, workspace_path, branch_name FROM tasks "
+            "SELECT id, workspace_kind, workspace_path, branch_name, "
+            "EXISTS(SELECT 1 FROM task_runs r WHERE r.task_id = tasks.id "
+            "AND r.workspace_provider IS NOT NULL) AS provider_managed FROM tasks "
             "WHERE status = 'archived'"
         ).fetchall()
     for row in rows:
         if row["workspace_kind"] == "worktree":
+            if row["provider_managed"]:
+                continue
             # Backstop for worktrees that escaped the completion/archive hook.
             # Same safety predicate: only clean, fully-pushed worktrees go.
             wt_path = row["workspace_path"]

@@ -100,7 +100,15 @@ def _scrub_local_state(conn: sqlite3.Connection) -> None:
         """,
         (int(time.time()),),
     )
-    conn.execute("UPDATE task_runs SET claim_lock = NULL, worker_pid = NULL")
+    conn.execute(
+        "UPDATE task_runs SET claim_lock = NULL, worker_pid = NULL, "
+        "workspace_provider = NULL, workspace_provider_scope = NULL, workspace_lease_id = NULL, "
+        "workspace_lease_path = NULL, workspace_lease_branch = NULL, "
+        "workspace_repo_root = NULL, workspace_board = NULL, workspace_board_db_path = NULL, "
+        "workspace_requested_path = NULL, workspace_requested_branch = NULL, "
+        "workspace_lease_expires_at = NULL, "
+        "workspace_lease_released_at = NULL"
+    )
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
