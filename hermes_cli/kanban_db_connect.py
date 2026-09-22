@@ -837,6 +837,9 @@ _LATER_TASK_COLUMNS = (
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
     ("worker_started_at", "worker_started_at INTEGER"),
+    # Reader/writer intent consumed only when kanban.workspace_provider selects
+    # a plugin. Existing tasks are conservative writers after migration.
+    ("workspace_access", "workspace_access TEXT NOT NULL DEFAULT 'write'"),
 )
 
 _NOTIFY_SUB_COLUMNS = (
@@ -855,6 +858,19 @@ _TASK_RUN_COLUMNS = (
     # Spawn-time start fingerprint of the run's worker_pid (PID-reuse guard for the
     # terminal-worker reaper; NULL = legacy row, never signalled).
     ("worker_started_at", "worker_started_at INTEGER"),
+    ("workspace_provider", "workspace_provider TEXT"),
+    ("workspace_provider_scope", "workspace_provider_scope TEXT"),
+    ("workspace_lease_id", "workspace_lease_id TEXT"),
+    ("workspace_lease_path", "workspace_lease_path TEXT"),
+    ("workspace_lease_branch", "workspace_lease_branch TEXT"),
+    ("workspace_repo_root", "workspace_repo_root TEXT"),
+    ("workspace_access", "workspace_access TEXT"),
+    ("workspace_board", "workspace_board TEXT"),
+    ("workspace_board_db_path", "workspace_board_db_path TEXT"),
+    ("workspace_requested_path", "workspace_requested_path TEXT"),
+    ("workspace_requested_branch", "workspace_requested_branch TEXT"),
+    ("workspace_lease_expires_at", "workspace_lease_expires_at REAL"),
+    ("workspace_lease_released_at", "workspace_lease_released_at INTEGER"),
 )
 
 
@@ -1035,7 +1051,11 @@ _REBUILD_SPECS = {
         " worker_pid INTEGER, worker_started_at INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
-        " error TEXT)",
+        " error TEXT, workspace_provider TEXT, workspace_provider_scope TEXT, workspace_lease_id TEXT,"
+        " workspace_lease_path TEXT, workspace_lease_branch TEXT,"
+        " workspace_repo_root TEXT, workspace_access TEXT, workspace_board TEXT,"
+        " workspace_board_db_path TEXT, workspace_requested_path TEXT, workspace_requested_branch TEXT,"
+        " workspace_lease_expires_at REAL, workspace_lease_released_at INTEGER)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",

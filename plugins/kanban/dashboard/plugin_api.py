@@ -384,6 +384,7 @@ class CreateTaskBody(BaseModel):
     priority: int = 0
     workspace_kind: Optional[str] = None  # None = scratch, or the board project's worktree when scoped
     workspace_path: Optional[str] = None
+    workspace_access: str = "write"
     parents: list[str] = Field(default_factory=list)
     triage: bool = False
     idempotency_key: Optional[str] = None
@@ -681,6 +682,11 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 def delete_task(task_id: str, board: Optional[str] = Query(None)):
     with _board_conn(board) as (board, conn):
         if not kanban_db.delete_task(conn, task_id):
+            if kanban_db.get_task(conn, task_id) is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"task {task_id} still owns a workspace lease; archive it and wait for release",
+                )
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
         return {"deleted": True, "task_id": task_id}
 

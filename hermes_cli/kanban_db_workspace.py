@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Optional
 from typing import TYPE_CHECKING
 import contextlib
+from dataclasses import dataclass
 
 from hermes_cli.worktree_ops import release_lsp_clients
 
@@ -24,6 +25,16 @@ if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
 
 _REMOVABLE_KINDS = ("scratch", "worktree")
+
+
+@dataclass(frozen=True)
+class WorktreePlan:
+    """Mutation-free worktree resolution used before provider admission."""
+
+    path: Path
+    branch: str
+    repo_root: Path
+    materialize: bool
 
 
 def _path_key(path: Path | str | None) -> str:
@@ -157,6 +168,14 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         # Kill the (dead) tmux worker session BEFORE removing a worktree so a
         # lingering worker never has its cwd deleted from under it.
         if kind == "worktree":
+            from hermes_cli.kanban_workspace_provider import task_has_provider_workspace
+
+            if task_has_provider_workspace(conn, task_id):
+                # Provider release runs only after the worker PID is gone and
+                # owns checkout cleanup. Removing it here would delete a live
+                # worker's cwd before that lifecycle boundary.
+                _try_cleanup_parent_workspaces(conn, task_id)
+                return
             _cleanup_worker_tmux(conn, task_id)
             _cleanup_worktree_workspace(task_id, path, row["branch_name"])
             _try_cleanup_parent_workspaces(conn, task_id)
@@ -283,6 +302,10 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             ):
                 continue
             if row["workspace_kind"] == "worktree":
+                from hermes_cli.kanban_workspace_provider import task_has_provider_workspace
+
+                if task_has_provider_workspace(conn, parent_id):
+                    continue
                 _cleanup_worktree_workspace(parent_id, row["workspace_path"], row["branch_name"])
                 continue
             wp = Path(row["workspace_path"])
@@ -457,19 +480,16 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         )
 
 
-def _anchored_worktree(repo_root: Path, task_id: str, branch_name: str) -> tuple[Path, str]:
-    """Materialize the canonical ``<repo>/.worktrees/<task-id>`` worktree."""
-    target = repo_root / ".worktrees" / task_id
-    _ensure_git_worktree(repo_root, target, branch_name)
-    return target, branch_name
+def _plan_worktree_workspace(task: Task, *, board: Optional[str] = None) -> WorktreePlan:
+    """Resolve a worktree target without changing Git or the filesystem.
 
-
-def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> tuple[Path, str]:
-    """Resolve + materialize a linked git worktree for ``task``. With no
+    With no
     ``task.workspace_path`` the anchor is the board's ``default_workdir`` so
     every worktree lands under a board-owned repo (``<repo>/.worktrees/<id>``)
     instead of the dispatcher's incidental CWD (whatever dir the gateway was
-    launched from); with no anchor configured we fail loudly rather than guess."""
+    launched from); with no anchor configured we fail loudly rather than guess.
+    Provider admission runs against this plan before :func:`_materialize_worktree_plan`.
+    """
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
     if not task.workspace_path:
         board_slug = board if board else _kb.get_current_board()
@@ -493,7 +513,12 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
                 f"task {task.id} has workspace_kind=worktree but board "
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
-        return _anchored_worktree(repo_root, task.id, branch_name)
+        return WorktreePlan(
+            path=(repo_root / ".worktrees" / task.id).resolve(strict=False),
+            branch=branch_name,
+            repo_root=repo_root,
+            materialize=True,
+        )
 
     requested = Path(task.workspace_path).expanduser()
     if not requested.is_absolute():
@@ -505,8 +530,10 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
 
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
+        common = _git_common_dir(requested)
+        existing_root = common.parent if common is not None and common.name == ".git" else requested_resolved
         if actual_branch == branch_name:
-            return requested_resolved, actual_branch
+            return WorktreePlan(requested_resolved, actual_branch, existing_root, False)
         # The requested path is an existing checkout of a DIFFERENT task's
         # branch (decompose children inherit the root's workspace_path
         # verbatim, so siblings all point here). Reusing it would run this task
@@ -516,15 +543,23 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if _path_key(fallback.resolve(strict=False)) != _path_key(requested_resolved):
-                _ensure_git_worktree(fallback_root, fallback, branch_name)
-                return fallback.resolve(strict=False), branch_name
+                return WorktreePlan(
+                    fallback.resolve(strict=False), branch_name, fallback_root, True,
+                )
         # No repo to anchor a fallback on (or the occupied path IS this task's
         # own canonical worktree): keep the legacy reuse rather than fail dispatch.
-        return requested_resolved, actual_branch or branch_name
+        return WorktreePlan(
+            requested_resolved, actual_branch or branch_name, existing_root, False,
+        )
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and _path_key(requested_resolved) == _path_key(repo_root):
-        return _anchored_worktree(repo_root, task.id, branch_name)
+        return WorktreePlan(
+            (repo_root / ".worktrees" / task.id).resolve(strict=False),
+            branch_name,
+            repo_root,
+            True,
+        )
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
     if repo_root is None:
@@ -532,8 +567,40 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    _ensure_git_worktree(repo_root, requested, branch_name)
-    return requested, branch_name
+    return WorktreePlan(requested_resolved, branch_name, repo_root, True)
+
+
+def _materialize_worktree_plan(
+    plan: WorktreePlan, *, path: Optional[str | Path] = None, branch: Optional[str] = None,
+) -> tuple[Path, str]:
+    """Materialize a core target or validate a provider-owned checkout."""
+    target = Path(path).expanduser().resolve(strict=False) if path is not None else plan.path
+    effective_branch = str(branch or plan.branch)
+    if _path_key(target) == _path_key(plan.path):
+        if plan.materialize:
+            _ensure_git_worktree(plan.repo_root, target, effective_branch)
+        actual_branch = _git_current_branch(target)
+        if actual_branch and actual_branch != effective_branch:
+            raise RuntimeError(
+                f"workspace {target} is on branch {actual_branch!r}, expected {effective_branch!r}"
+            )
+        return target, effective_branch
+    if not target.is_dir() or _git_toplevel(target) is None:
+        raise RuntimeError(
+            f"workspace provider returned a path that is not an existing Git checkout: {target}"
+        )
+    actual_branch = _git_current_branch(target)
+    if actual_branch and actual_branch != effective_branch:
+        raise RuntimeError(
+            f"provider workspace {target} is on branch {actual_branch!r}, "
+            f"expected {effective_branch!r}"
+        )
+    return target, effective_branch
+
+
+def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> tuple[Path, str]:
+    """Resolve and materialize a linked Git worktree for ``task``."""
+    return _materialize_worktree_plan(_plan_worktree_workspace(task, board=board))
 
 
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:

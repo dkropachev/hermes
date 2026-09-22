@@ -17,18 +17,20 @@ _STATUS_ICONS = {
 
 _TASK_DICT_FIELDS = (
     "id", "title", "body", "assignee", "status", "priority", "tenant",
-    "workspace_kind", "workspace_path", "branch_name", "project_id",
+    "workspace_kind", "workspace_path", "workspace_access", "branch_name", "project_id",
     "created_by", "created_at", "started_at", "completed_at", "result",
     "skills", "max_runtime_seconds", "max_retries", "model_override", "provider_override",
     "session_id", "workflow_template_id", "current_step_key", "completion_contract", "last_failure_error",
 )
 _SHOW_RUN_FIELDS = (
     "id", "profile", "step_key", "status", "outcome", "summary", "error",
-    "metadata", "worker_pid", "started_at", "ended_at",
+    "metadata", "worker_pid", "started_at", "ended_at", "workspace_provider",
+    "workspace_lease_id", "workspace_lease_path", "workspace_access", "workspace_lease_released_at",
 )
 _RUNS_RUN_FIELDS = (
     "id", "profile", "status", "outcome", "started_at", "ended_at",
-    "summary", "error", "metadata", "worker_pid", "step_key",
+    "summary", "error", "metadata", "worker_pid", "step_key", "workspace_provider",
+    "workspace_lease_id", "workspace_lease_path", "workspace_access", "workspace_lease_released_at",
 )
 _ATTACHMENT_FIELDS = ("id", "filename", "content_type", "size", "uploaded_by", "stored_path", "created_at")
 

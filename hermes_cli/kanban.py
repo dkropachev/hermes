@@ -371,6 +371,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             conn, title=args.title, body=body, assignee=args.assignee,
             created_by=args.created_by or _profile_author(),
             workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
+            workspace_access=getattr(args, "workspace_access", "write"),
             project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
             parents=tuple(args.parent or ()), triage=bool(getattr(args, "triage", False)),
             idempotency_key=getattr(args, "idempotency_key", None),
@@ -514,7 +515,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     field("assignee", task.assignee or "-")
     if task.tenant:
         field("tenant", task.tenant)
-    field("workspace", f"{task.workspace_kind}" + (f" @ {task.workspace_path}" if task.workspace_path else ""))
+    field("workspace", f"{task.workspace_kind}/{task.workspace_access}" +
+          (f" @ {task.workspace_path}" if task.workspace_path else ""))
     if task.branch_name:
         field("branch", task.branch_name)
     if task.skills:

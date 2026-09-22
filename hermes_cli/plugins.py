@@ -1053,6 +1053,11 @@ _SCOPED_PROVIDER_REGISTRARS: Tuple[Tuple[str, str, str, str, str, str, Dict[str,
      "docker, singularity, modal, daytona, vercel_sandbox, ssh) are rejected — plugins never shadow "
      "in-tree backends.",
      {"normalize": "lower", "reject_message": "Plugin '%s' terminal environment provider rejected: %s"}),
+    ("register_workspace_provider", "workspace_provider", "agent.workspace_registry",
+     "agent.workspace_provider:WorkspaceProvider", "workspace provider",
+     "Register an :class:`agent.workspace_provider.WorkspaceProvider`; ``provider.name`` is matched by "
+     "``kanban.workspace_provider`` when a task requests provider-managed workspace allocation.",
+     {"normalize": "lower"}),
     ("register_secret_source", "secret_source", "agent.secret_sources.registry",
      "agent.secret_sources.base:SecretSource", "secret source",
      "Register a :class:`agent.secret_sources.base.SecretSource`, run by ``load_hermes_dotenv()`` "

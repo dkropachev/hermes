@@ -422,6 +422,15 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "Absolute path for 'dir' or 'worktree' workspace. "
                 "Relative paths are rejected at dispatch."
         )),
+        "workspace_access": {
+            "type": "string",
+            "enum": ["read", "write"],
+            "description": (
+                "Repository coordination mode used by an optional workspace provider. "
+                "Readers may overlap; writers are exclusive. Defaults to 'write'. "
+                "This controls publication authority, not filesystem permissions."
+            ),
+        },
         "project": _prop("string", (
                 "Optional project id or slug to link the task to. When "
                 "set, the task becomes a git worktree under the project's "

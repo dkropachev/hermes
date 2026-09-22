@@ -110,6 +110,7 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+VALID_WORKSPACE_ACCESS = {"read", "write"}
 
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
@@ -232,7 +233,7 @@ _TICK_ACTIVITY_FIELDS = (
     "spawned", "reclaimed", "promoted", "reconciled_orphans", "reaped_terminal_workers", "crashed", "stale",
     "timed_out", "auto_blocked", "rate_limited", "auto_assigned_default",
     "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
-    "skipped_nonspawnable",
+    "skipped_nonspawnable", "workspace_deferred", "workspace_lease_lost",
 )
 
 
@@ -658,6 +659,18 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     d = board_dir(normed)
     if not d.exists():
         raise ValueError(f"board {normed!r} does not exist")
+    from hermes_cli.kanban_db_connect import connect_closing
+
+    with connect_closing(board=normed) as conn:
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE workspace_provider IS NOT NULL "
+            "AND workspace_lease_released_at IS NULL"
+        ).fetchone()[0]
+    if pending:
+        raise ValueError(
+            f"board {normed!r} has {pending} pending workspace lease(s); "
+            "let the dispatcher release them before removing the board"
+        )
 
     # If the user removed the currently-active board, revert to default.
     if get_current_board() == normed:
@@ -732,6 +745,10 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    # Coordination mode consumed by an optional ``kanban.workspace_provider``.
+    # It does not chmod the checkout; ``read`` means shared repository access
+    # without publication authority, while ``write`` is exclusive.
+    workspace_access: str = "write"
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -749,6 +766,7 @@ class Task:
             skills=skills_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
+            workspace_access=str(g("workspace_access", "write") or "write"),
         )
 
 
@@ -790,9 +808,23 @@ class Run:
     summary: Optional[str]
     metadata: Optional[dict]
     error: Optional[str]
+    workspace_provider: Optional[str] = None
+    workspace_provider_scope: Optional[str] = None
+    workspace_lease_id: Optional[str] = None
+    workspace_lease_path: Optional[str] = None
+    workspace_lease_branch: Optional[str] = None
+    workspace_repo_root: Optional[str] = None
+    workspace_access: Optional[str] = None
+    workspace_board: Optional[str] = None
+    workspace_board_db_path: Optional[str] = None
+    workspace_requested_path: Optional[str] = None
+    workspace_requested_branch: Optional[str] = None
+    workspace_lease_expires_at: Optional[float] = None
+    workspace_lease_released_at: Optional[int] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Run":
+        g = lambda col: _lossy_text(_row_get(row, col))  # noqa: E731
         return cls(
             **{
                 col: _lossy_text(row[col]) for col in (
@@ -804,6 +836,22 @@ class Run:
             started_at=int(row["started_at"]),
             ended_at=_opt_int(row["ended_at"]),
             metadata=_json_or(_lossy_text(row["metadata"])),
+            workspace_provider=g("workspace_provider"),
+            workspace_provider_scope=g("workspace_provider_scope"),
+            workspace_lease_id=g("workspace_lease_id"),
+            workspace_lease_path=g("workspace_lease_path"),
+            workspace_lease_branch=g("workspace_lease_branch"),
+            workspace_repo_root=g("workspace_repo_root"),
+            workspace_access=g("workspace_access"),
+            workspace_board=g("workspace_board"),
+            workspace_board_db_path=g("workspace_board_db_path"),
+            workspace_requested_path=g("workspace_requested_path"),
+            workspace_requested_branch=g("workspace_requested_branch"),
+            workspace_lease_expires_at=(
+                float(row["workspace_lease_expires_at"])
+                if _row_get(row, "workspace_lease_expires_at") is not None else None
+            ),
+            workspace_lease_released_at=_opt_int(_row_get(row, "workspace_lease_released_at")),
         )
 
 
@@ -879,6 +927,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     completed_at         INTEGER,
     workspace_kind       TEXT NOT NULL DEFAULT 'scratch',
     workspace_path       TEXT,
+    workspace_access     TEXT NOT NULL DEFAULT 'write',
     branch_name          TEXT,
     -- Optional link to a first-class Project (hermes_cli/projects_db). When set,
     -- the task's worktree is anchored under the project's primary repo with a
@@ -1022,7 +1071,23 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    -- Optional plugin-owned workspace lease. The provider name is captured
+    -- per run so a config change cannot redirect renew/release to a different
+    -- implementation midway through work.
+    workspace_provider          TEXT,
+    workspace_provider_scope    TEXT,
+    workspace_lease_id          TEXT,
+    workspace_lease_path        TEXT,
+    workspace_lease_branch      TEXT,
+    workspace_repo_root         TEXT,
+    workspace_access            TEXT,
+    workspace_board             TEXT,
+    workspace_board_db_path     TEXT,
+    workspace_requested_path    TEXT,
+    workspace_requested_branch  TEXT,
+    workspace_lease_expires_at  REAL,
+    workspace_lease_released_at INTEGER
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -1250,7 +1315,8 @@ def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
     workspace_kind: Optional[str] = None, workspace_path: Optional[str] = None,
-    branch_name: Optional[str] = None, tenant: Optional[str] = None, priority: int = 0,
+    branch_name: Optional[str] = None, workspace_access: str = "write",
+    tenant: Optional[str] = None, priority: int = 0,
     parents: Iterable[str] = (), triage: bool = False, idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None, skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None, model_override: Optional[str] = None,
@@ -1303,6 +1369,12 @@ def create_task(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
             f"got {workspace_kind!r}"
         )
+    workspace_access = str(workspace_access or "write").strip().lower()
+    if workspace_access not in VALID_WORKSPACE_ACCESS:
+        raise ValueError(
+            f"workspace_access must be one of {sorted(VALID_WORKSPACE_ACCESS)}, "
+            f"got {workspace_access!r}"
+        )
     if branch_name is not None:
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
@@ -1311,6 +1383,8 @@ def create_task(
     project_id, project_obj, project_repo, workspace_kind = _resolve_project_link(
         conn, project_id, project_source_task_id, workspace_kind, workspace_path
     )
+    if workspace_access != "write" and workspace_kind != "worktree":
+        raise ValueError("workspace_access='read' is only valid for worktree workspaces")
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
 
@@ -1355,17 +1429,17 @@ def create_task(
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
+                        workspace_access, branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
                         created_by, now, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
+                        workspace_access, branch_name, project_id, tenant, idempotency_key,
                         _opt_int(max_runtime_seconds),
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
@@ -1386,6 +1460,7 @@ def create_task(
                         "tenant": tenant,
                         "workspace_kind": workspace_kind,
                         "workspace_path": workspace_path,
+                        "workspace_access": workspace_access,
                         "branch_name": branch_name,
                         "project_id": project_id,
                         "skills": list(skills_list) if skills_list else None,
@@ -3933,6 +4008,9 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
         if _task_status(conn, task_id) != "archived":
             return False
+        from hermes_cli.kanban_workspace_provider import task_has_pending_workspace_lease
+        if task_has_pending_workspace_lease(conn, task_id):
+            return False
         _delete_task_relations(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
@@ -3941,6 +4019,9 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete a task and its related rows in one txn; False when not found."""
     with write_txn(conn):
+        from hermes_cli.kanban_workspace_provider import task_has_pending_workspace_lease
+        if task_has_pending_workspace_lease(conn, task_id):
+            return False
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
@@ -4044,7 +4125,10 @@ def _ctx_header(lines: list[str], task: Task) -> None:
     lines.append(f"Status:   {task.status}")
     if task.tenant:
         lines.append(f"Tenant:   {task.tenant}")
-    lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
+    lines.append(
+        f"Workspace: {task.workspace_kind}/{task.workspace_access} @ "
+        f"{task.workspace_path or '(unresolved)'}"
+    )
     if task.max_runtime_seconds is not None:
         terminal_timeout = _worker_terminal_timeout_env(
             task.max_runtime_seconds, os.environ.get("TERMINAL_TIMEOUT"),
