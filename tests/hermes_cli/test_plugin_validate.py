@@ -190,6 +190,38 @@ class TestCapabilityProbe:
         report = validate_plugin_dir(d)
         assert report.ok, report.failures
 
+    def test_workspace_types_are_imported_only_after_feature_probe(self, tmp_path):
+        d = _make_plugin(
+            tmp_path,
+            manifest={**BASE_MANIFEST, "provides_tools": ["fallback_tool", "lease_tool"]},
+            init_py=(
+                "def register(ctx):\n"
+                "    probe = getattr(ctx, 'has_host_feature', None)\n"
+                "    if probe and probe('workspace_leases.v1'):\n"
+                "        from hermes_cli.plugin_workspaces import WorkspaceLeaseError\n"
+                "        assert WorkspaceLeaseError is not None\n"
+                "        ctx.register_tool('lease_tool', schema={}, handler=lambda **kw: None)\n"
+                "    else:\n"
+                "        ctx.register_tool('fallback_tool', schema={}, handler=lambda **kw: None)\n"
+            ),
+        )
+        report = validate_plugin_dir(d)
+        assert report.ok, report.failures
+
+    def test_unconditional_workspace_module_import_fails_legacy_probe(self, tmp_path):
+        d = _make_plugin(
+            tmp_path,
+            manifest=dict(BASE_MANIFEST),
+            init_py=(
+                "from hermes_cli.plugin_workspaces import WorkspaceLeaseError\n"
+                "def register(ctx):\n"
+                "    assert WorkspaceLeaseError is not None\n"
+            ),
+        )
+        report = validate_plugin_dir(d)
+        assert not report.ok
+        assert any("older host" in failure for failure in report.failures)
+
     def test_workspace_intent_factory_is_pure_and_shape_valid(self, tmp_path):
         d = _make_plugin(
             tmp_path,

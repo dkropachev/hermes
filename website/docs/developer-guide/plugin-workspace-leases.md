@@ -189,8 +189,9 @@ make retention an explicit plugin policy; do not silently delete quarantined wor
 
 ## Failures to handle
 
-Import the exception classes from `hermes_cli.plugin_workspaces` when a workflow needs distinct
-recovery paths:
+After the feature probe succeeds, lazily import exception classes from
+`hermes_cli.plugin_workspaces` when a workflow needs distinct recovery paths. Do not import that
+module at plugin-module scope: older compatible Hermes hosts do not provide it.
 
 | Exception | Meaning |
 |---|---|

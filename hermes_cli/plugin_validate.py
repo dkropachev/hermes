@@ -205,6 +205,17 @@ context_methods = set(options["context_methods"])
 provider_kind = options["kind"] == "model-provider"
 workspace_leases = bool(options.get("workspace_leases"))
 
+if not workspace_leases:
+    class _BlockWorkspaceModule:
+        def find_spec(self, fullname, path=None, target=None):
+            if fullname == "hermes_cli.plugin_workspaces":
+                raise ModuleNotFoundError(
+                    "hermes_cli.plugin_workspaces is unavailable on this simulated older host"
+                )
+            return None
+
+    sys.meta_path.insert(0, _BlockWorkspaceModule())
+
 recorded = {"tools": [], "hooks": [], "middleware": [], "commands": [], "providers": []}
 
 
