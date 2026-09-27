@@ -29,7 +29,7 @@ from typing import Any, Mapping
 from hermes_constants import get_hermes_home, hermes_home_key, mkdir_under_hermes_home
 from hermes_cli.plugins_manifest import _portable_skill_namespace
 from hermes_cli.process_identity import _pid_alive_matches, _process_create_time
-from hermes_cli.sqlite_util import open_db, transaction
+from hermes_cli.sqlite_util import add_column_if_missing, open_db, transaction
 
 
 HOST_FEATURE = "workspace_leases.v1"
@@ -213,6 +213,8 @@ def _initialize(conn) -> None:
             output_capability_hash TEXT NOT NULL,
             plugin_identity_digest TEXT NOT NULL,
             ttl_seconds REAL NOT NULL,
+            ttl_seconds_provided INTEGER NOT NULL DEFAULT 0
+                CHECK (ttl_seconds_provided IN (0, 1)),
             result_generation INTEGER,
             state TEXT NOT NULL CHECK (state IN ('planned', 'committed', 'failed')),
             error_text TEXT,
@@ -227,9 +229,22 @@ def _initialize(conn) -> None:
     )
     columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(workspace_leases)")}
     if "plugin_identity_digest" not in columns:
-        conn.execute(
-            "ALTER TABLE workspace_leases ADD COLUMN "
-            "plugin_identity_digest TEXT NOT NULL DEFAULT ''"
+        add_column_if_missing(
+            conn,
+            "workspace_leases",
+            "plugin_identity_digest",
+            "plugin_identity_digest TEXT NOT NULL DEFAULT ''",
+        )
+    operation_columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(workspace_lease_operations)")
+    }
+    if "ttl_seconds_provided" not in operation_columns:
+        add_column_if_missing(
+            conn,
+            "workspace_lease_operations",
+            "ttl_seconds_provided",
+            "ttl_seconds_provided INTEGER NOT NULL DEFAULT 0 "
+            "CHECK (ttl_seconds_provided IN (0, 1))",
         )
 
 
@@ -243,6 +258,9 @@ def _connect(layout: _Layout):
         initialize=_initialize,
     )
     try:
+        # A fresh database has no identity row yet.  Serialize first-use binding so two
+        # dashboard workers cannot both observe the gap and race a plain INSERT.
+        conn.execute("BEGIN IMMEDIATE")
         with conn:
             bound = conn.execute(
                 "SELECT value FROM workspace_lease_metadata WHERE key='plugin_identity_digest'"
@@ -258,13 +276,17 @@ def _connect(layout: _Layout):
                         "workspace lease database predates plugin identity binding"
                     )
                 conn.execute(
-                    "INSERT INTO workspace_lease_metadata(key, value) VALUES "
+                    "INSERT OR IGNORE INTO workspace_lease_metadata(key, value) VALUES "
                     "('plugin_identity_digest', ?)",
                     (layout.plugin_identity_digest,),
                 )
-                bound_value = layout.plugin_identity_digest
-            else:
-                bound_value = str(bound[0])
+                bound = conn.execute(
+                    "SELECT value FROM workspace_lease_metadata "
+                    "WHERE key='plugin_identity_digest'"
+                ).fetchone()
+            if bound is None:
+                raise WorkspacePathError("workspace lease database identity binding failed")
+            bound_value = str(bound[0])
             if not hmac.compare_digest(bound_value, layout.plugin_identity_digest):
                 raise WorkspacePathError("workspace lease database belongs to another plugin identity")
         return conn
@@ -412,6 +434,7 @@ def _validate_operation(
     output_capability: str,
     input_handle: Mapping[str, Any] | None = None,
     ttl_seconds: float | None = None,
+    ttl_seconds_provided: bool | None = None,
 ) -> None:
     input_lease_id, input_capability_hash = None, None
     if input_handle is not None:
@@ -433,6 +456,13 @@ def _validate_operation(
         str(operation["plugin_identity_digest"]), layout.plugin_identity_digest,
     ):
         raise InvalidWorkspaceIntentError("workspace operation intent belongs to another plugin")
+    if (
+        ttl_seconds_provided is not None
+        and bool(operation["ttl_seconds_provided"]) != ttl_seconds_provided
+    ):
+        raise InvalidWorkspaceIntentError(
+            "workspace operation intent was reused with another TTL mode"
+        )
     if ttl_seconds is not None and float(operation["ttl_seconds"]) != float(ttl_seconds):
         raise InvalidWorkspaceIntentError("workspace operation intent was reused with another TTL")
 
@@ -986,6 +1016,7 @@ class PluginWorkspaces:
         ttl_seconds: float | None = None,
     ) -> dict[str, Any]:
         layout = self._layout()
+        ttl_was_provided = ttl_seconds is not None
         operation_id, successor_capability = _parse_intent(intent)
         previous_lease_id, previous_capability = _parse_handle(handle)
         with transaction(_connect(layout), immediate=True) as conn:
@@ -1002,6 +1033,7 @@ class PluginWorkspaces:
                     output_capability=successor_capability,
                     input_handle=handle,
                     ttl_seconds=None if ttl_seconds is None else _ttl(ttl_seconds),
+                    ttl_seconds_provided=ttl_was_provided,
                 )
                 if operation["state"] != "committed":
                     raise InvalidWorkspaceIntentError(
@@ -1046,14 +1078,15 @@ class PluginWorkspaces:
                 """INSERT INTO workspace_lease_operations
                    (operation_id, operation_kind, workspace_id, input_lease_id,
                     input_capability_hash, output_lease_id, output_capability_hash,
-                    plugin_identity_digest, ttl_seconds, result_generation, state,
-                    error_text, created_at, updated_at)
-                   VALUES (?, 'reconnect', ?, ?, ?, ?, ?, ?, ?, ?, 'committed', NULL, ?, ?)""",
+                    plugin_identity_digest, ttl_seconds, ttl_seconds_provided,
+                    result_generation, state, error_text, created_at, updated_at)
+                   VALUES (?, 'reconnect', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'committed',
+                           NULL, ?, ?)""",
                 (
                     operation_id, row["workspace_id"], previous_lease_id,
                     _capability_hash(previous_capability), successor_lease_id,
                     _capability_hash(successor_capability), layout.plugin_identity_digest,
-                    ttl, int(updated["generation"]), now, now,
+                    ttl, int(ttl_was_provided), int(updated["generation"]), now, now,
                 ),
             )
             _event(conn, updated, "reconnected", {
@@ -1065,7 +1098,10 @@ class PluginWorkspaces:
 
     def inspect(self, handle: Mapping[str, Any]) -> dict[str, Any]:
         layout = self._layout()
-        with transaction(_connect(layout)) as conn:
+        # Inspection is generation-fenced with the same writer lock as release/reconnect.
+        # Otherwise a reader can validate generation N, let a replacement generation publish,
+        # and then return the stale row paired with the replacement directory/events.
+        with transaction(_connect(layout), immediate=True) as conn:
             row = _validated_row(conn, layout, handle)
             now = time.time()
             if row["state"] != "active":

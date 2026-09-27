@@ -267,6 +267,15 @@ class RecordingContext:
 class RecordingWorkspaces:
     # Shape-only facade; registration probes must never mutate host state.
 
+    def new_intent(self):
+        # Pure, deterministic, and shape-valid.  Plugins commonly prepare an intent before
+        # registering a handler; that must validate without granting registration-time I/O.
+        return {
+            "contract_version": 1,
+            "operation_id": "00000000-0000-4000-8000-000000000000",
+            "output_capability": "validate-probe-output-capability-00000000",
+        }
+
     def _blocked(self, *args, **kwargs):
         raise RuntimeError("workspace lifecycle calls are not allowed during plugin registration")
 

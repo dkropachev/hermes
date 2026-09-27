@@ -7,7 +7,9 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -201,17 +203,81 @@ def test_acquire_intent_recovers_crash_with_both_workspace_names(
 
 def test_reconnect_intent_replays_successor_after_lost_response(tmp_path: Path) -> None:
     ctx = _context(tmp_path / "home")
-    predecessor = _acquire(ctx, "reconnect-replay")
+    predecessor = _acquire(ctx, "reconnect-replay", ttl_seconds=123)
     intent = ctx.workspaces.new_intent()
 
     successor = ctx.workspaces.reconnect(predecessor, intent=intent)
     assert ctx.workspaces.reconnect(predecessor, intent=intent) == successor
-    with pytest.raises(InvalidWorkspaceIntentError, match="reused"):
+    with pytest.raises(InvalidWorkspaceIntentError, match="TTL mode"):
         ctx.workspaces.reconnect(
             predecessor,
             intent=intent,
             ttl_seconds=123,
         )
+
+    explicit_predecessor = _acquire(ctx, "reconnect-explicit", ttl_seconds=123)
+    explicit_intent = ctx.workspaces.new_intent()
+    explicit_successor = ctx.workspaces.reconnect(
+        explicit_predecessor, intent=explicit_intent, ttl_seconds=123,
+    )
+    assert ctx.workspaces.reconnect(
+        explicit_predecessor, intent=explicit_intent, ttl_seconds=123,
+    ) == explicit_successor
+    with pytest.raises(InvalidWorkspaceIntentError, match="TTL mode"):
+        ctx.workspaces.reconnect(explicit_predecessor, intent=explicit_intent)
+
+
+def test_legacy_operation_receipts_gain_ttl_presence_column(tmp_path: Path) -> None:
+    import hermes_cli.plugin_workspaces as workspace_module
+
+    home = tmp_path / "home"
+    data_dir = home / "plugin-data/pr-review"
+    data_dir.mkdir(parents=True)
+    db = data_dir / "workspace-leases.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE workspace_lease_operations (operation_id TEXT PRIMARY KEY)"
+        )
+
+    layout = workspace_module._layout("pr-review", "", home)
+    workspace_module._connect(layout).close()
+    with sqlite3.connect(db) as conn:
+        columns = {
+            row[1]: row for row in conn.execute("PRAGMA table_info(workspace_lease_operations)")
+        }
+    assert columns["ttl_seconds_provided"][3] == 1
+    assert columns["ttl_seconds_provided"][4] == "0"
+
+
+def test_fresh_database_identity_binding_is_serialized(tmp_path: Path) -> None:
+    import hermes_cli.plugin_workspaces as workspace_module
+
+    home = tmp_path / "home"
+    layout = workspace_module._layout("pr-review", "", home)
+    workers = 12
+    start = threading.Barrier(workers)
+
+    def first_open() -> str:
+        start.wait(timeout=10)
+        conn = workspace_module._connect(layout)
+        try:
+            row = conn.execute(
+                "SELECT value FROM workspace_lease_metadata "
+                "WHERE key='plugin_identity_digest'"
+            ).fetchone()
+            return str(row[0])
+        finally:
+            conn.close()
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        digests = list(pool.map(lambda _index: first_open(), range(workers)))
+
+    assert set(digests) == {layout.plugin_identity_digest}
+    with sqlite3.connect(layout.db_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM workspace_lease_metadata "
+            "WHERE key='plugin_identity_digest'"
+        ).fetchone()[0] == 1
 
 
 def test_native_and_portable_generated_namespaces_are_disjoint(tmp_path: Path) -> None:
@@ -586,6 +652,46 @@ def test_expiry_is_sampled_after_transaction_entry(
     monkeypatch.setattr(workspace_module.time, "time", lambda: 10.0 if entered else 1.0)
     with pytest.raises(WorkspaceLeaseExpiredError):
         ctx.workspaces.renew(handle)
+
+
+def test_inspect_holds_generation_fence_until_snapshot_is_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hermes_cli.plugin_workspaces as workspace_module
+
+    home = tmp_path / "home"
+    ctx = _context(home)
+    handle = _acquire(ctx, "inspect-fence")
+    db = home / "plugin-data/pr-review/workspace-leases.db"
+    inspection_started = threading.Event()
+    finish_inspection = threading.Event()
+    real_require = workspace_module._require_workspace_directory
+
+    def pause_after_row_validation(path: Path) -> None:
+        real_require(path)
+        inspection_started.set()
+        assert finish_inspection.wait(timeout=10)
+
+    monkeypatch.setattr(
+        workspace_module, "_require_workspace_directory", pause_after_row_validation,
+    )
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(ctx.workspaces.inspect, handle)
+        assert inspection_started.wait(timeout=10)
+        try:
+            # Release/reconnect/reacquire all begin with this same write lock.  If another
+            # generation could publish here, inspect could pair its old row with the new tree.
+            with sqlite3.connect(db, timeout=0) as contender:
+                with pytest.raises(sqlite3.OperationalError, match="locked"):
+                    contender.execute("BEGIN IMMEDIATE")
+        finally:
+            finish_inspection.set()
+        snapshot = future.result(timeout=10)
+
+    assert snapshot["leaseId"] == handle["lease_id"]
+    ctx.workspaces.release(handle)
+    successor = _acquire(ctx, "inspect-fence")
+    assert ctx.workspaces.inspect(successor)["generation"] == snapshot["generation"] + 1
 
 
 def test_cleanup_deletes_only_empty_and_quarantines_every_nonempty_tree(tmp_path: Path) -> None:

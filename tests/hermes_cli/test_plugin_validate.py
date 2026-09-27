@@ -190,6 +190,27 @@ class TestCapabilityProbe:
         report = validate_plugin_dir(d)
         assert report.ok, report.failures
 
+    def test_workspace_intent_factory_is_pure_and_shape_valid(self, tmp_path):
+        d = _make_plugin(
+            tmp_path,
+            manifest={**BASE_MANIFEST, "provides_tools": ["lease_tool"]},
+            init_py=(
+                "def register(ctx):\n"
+                "    probe = getattr(ctx, 'has_host_feature', None)\n"
+                "    if probe and probe('workspace_leases.v1'):\n"
+                "        first = ctx.workspaces.new_intent()\n"
+                "        second = ctx.workspaces.new_intent()\n"
+                "        assert first == second and first is not second\n"
+                "        assert set(first) == {'contract_version', 'operation_id', 'output_capability'}\n"
+                "        assert first['contract_version'] == 1\n"
+                "        assert len(first['operation_id']) == 36\n"
+                "        assert len(first['output_capability']) >= 32\n"
+                "        ctx.register_tool('lease_tool', schema={}, handler=lambda **kw: None)\n"
+            ),
+        )
+        report = validate_plugin_dir(d)
+        assert report.ok, report.failures
+
     def test_workspace_mutation_is_blocked_during_registration(self, tmp_path):
         d = _make_plugin(
             tmp_path,
