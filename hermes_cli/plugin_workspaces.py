@@ -110,6 +110,7 @@ def _plugin_namespace(plugin_id: str, skill_namespace: str) -> str:
             if skill_namespace.startswith("agent-plugin-")
             and _PLUGIN_NAMESPACE_RE.fullmatch(skill_namespace)
             and ".." not in skill_namespace
+            and not skill_namespace.endswith(".")
             else _portable_skill_namespace(plugin_id)
         )
     candidate = plugin_id
@@ -118,6 +119,7 @@ def _plugin_namespace(plugin_id: str, skill_namespace: str) -> str:
         candidate == folded
         and _PLUGIN_NAMESPACE_RE.fullmatch(candidate)
         and ".." not in candidate
+        and not candidate.endswith(".")
         and candidate.split(".", 1)[0] not in _WINDOWS_RESERVED
         and not candidate.startswith(("agent-plugin-", "hermes-native-"))
     ):
@@ -138,11 +140,12 @@ def _validated_workspace_id(workspace_id: str) -> str:
         not isinstance(workspace_id, str)
         or not _WORKSPACE_ID_RE.fullmatch(workspace_id)
         or ".." in workspace_id
+        or workspace_id.endswith(".")
         or workspace_id.split(".", 1)[0] in _WINDOWS_RESERVED
     ):
         raise ValueError(
             "workspace_id must be 1-128 lowercase ASCII letters, numbers, '.', '_', or '-' "
-            "(without '..' or a reserved device name)"
+            "(without '..', a trailing '.', or a reserved device name)"
         )
     return workspace_id
 
@@ -335,6 +338,10 @@ def _initialize(conn) -> None:
             acquired_at REAL NOT NULL,
             heartbeat_at REAL NOT NULL,
             expires_at REAL NOT NULL,
+            heartbeat_monotonic REAL,
+            expires_monotonic REAL,
+            expiry_observer TEXT,
+            expiry_observed_monotonic REAL,
             released_at REAL,
             generation INTEGER NOT NULL,
             acquire_intent_id TEXT,
@@ -388,6 +395,13 @@ def _initialize(conn) -> None:
         conn.execute("ALTER TABLE workspace_leases ADD COLUMN plugin_identity TEXT")
     if "acquire_intent_id" not in columns:
         conn.execute("ALTER TABLE workspace_leases ADD COLUMN acquire_intent_id TEXT")
+    for column in (
+        "heartbeat_monotonic", "expires_monotonic", "expiry_observed_monotonic",
+    ):
+        if column not in columns:
+            conn.execute(f"ALTER TABLE workspace_leases ADD COLUMN {column} REAL")
+    if "expiry_observer" not in columns:
+        conn.execute("ALTER TABLE workspace_leases ADD COLUMN expiry_observer TEXT")
     conn.execute(
         """CREATE UNIQUE INDEX IF NOT EXISTS workspace_lease_acquire_intent
            ON workspace_leases(acquire_intent_id)"""
@@ -455,6 +469,8 @@ def _owner_status(row: Mapping[str, Any]) -> str:
         pid = int(row["owner_pid"])
     except (KeyError, TypeError, ValueError):
         return "dead"
+    if pid <= 0:
+        return "dead"
     if str(_row_value(row, "owner_host") or "") != socket.gethostname():
         return "unknown"
     current_instance = _host_instance()
@@ -486,6 +502,63 @@ def _owner_state(row: Mapping[str, Any]) -> bool | None:
     """Compatibility-shaped owner result used by lifecycle decisions."""
     status = _owner_status(row)
     return True if status == "self" else False if status == "dead" else None
+
+
+def _verified_instance(value: object) -> bool:
+    return isinstance(value, str) and bool(value) and value != "unverified"
+
+
+def _expiry_observer_token() -> str:
+    host, instance = socket.gethostname(), _host_instance()
+    if _verified_instance(instance):
+        return f"boot:{host}:{instance}"
+    started = _process_create_time()
+    return f"process:{host}:{os.getpid()}:{started if started is not None else 'unknown'}"
+
+
+def _fresh_expiry(ttl: float) -> tuple[float, float, float, float, str, float]:
+    wall, monotonic = time.time(), time.monotonic()
+    return (
+        wall, wall + ttl, monotonic, monotonic + ttl,
+        _expiry_observer_token(), monotonic,
+    )
+
+
+def _lease_expired(conn, row: Mapping[str, Any]) -> bool:
+    """Canonical expiry decision: same-boot monotonic, otherwise one full local TTL observation."""
+    current_host, current_instance = socket.gethostname(), _host_instance()
+    owner_host = str(_row_value(row, "owner_host") or "")
+    owner_instance = str(_row_value(row, "owner_instance") or "unverified")
+    now = time.monotonic()
+    if (
+        owner_host == current_host
+        and _verified_instance(owner_instance)
+        and _verified_instance(current_instance)
+    ):
+        if owner_instance != current_instance:
+            return True
+        deadline = _row_value(row, "expires_monotonic")
+        if isinstance(deadline, (int, float)) and math.isfinite(float(deadline)):
+            return now >= float(deadline)
+
+    # A wall-clock-expired read never grants authority. Foreign hosts, unverified boot identity,
+    # and legacy rows must remain continuously observed by this local boot/process for a full TTL.
+    observer = _expiry_observer_token()
+    recorded_observer = _row_value(row, "expiry_observer")
+    observed_at = _row_value(row, "expiry_observed_monotonic")
+    if (
+        recorded_observer != observer
+        or not isinstance(observed_at, (int, float))
+        or not math.isfinite(float(observed_at))
+        or now < float(observed_at)
+    ):
+        conn.execute(
+            """UPDATE workspace_leases SET expiry_observer=?, expiry_observed_monotonic=?
+               WHERE lease_id=? AND generation=?""",
+            (observer, now, row["lease_id"], row["generation"]),
+        )
+        return False
+    return now - float(observed_at) >= float(row["ttl_seconds"])
 
 
 def _handle(lease_id: str, capability: str) -> dict[str, Any]:
@@ -776,7 +849,13 @@ def _finish_detached_cleanup(detached: Path, receipt: dict[str, Any]) -> dict[st
             # The only existing safe-to-delete tree is empty. Atomic rmdir refuses a late file;
             # recursive deletion would race classification and destroy newly-created content.
             detached.rmdir()
-            _sync_dirs(detached.parent)
+            try:
+                _sync_dirs(detached.parent)
+            except OSError as exc:
+                raise WorkspaceDurabilityError(
+                    f"workspace removal completed but metadata flush failed: {exc}",
+                    mutation_completed=True,
+                ) from exc
             finished["disposition"] = "removed"
             finished.pop("detached_path", None)
         else:
@@ -896,6 +975,8 @@ def _public_snapshot(conn, row: Mapping[str, Any]) -> dict[str, Any]:
         "acquiredAt": float(row["acquired_at"]),
         "heartbeatAt": float(row["heartbeat_at"]),
         "expiresAt": float(row["expires_at"]),
+        "heartbeatMonotonic": row["heartbeat_monotonic"],
+        "expiresMonotonic": row["expires_monotonic"],
         "releasedAt": row["released_at"],
         "ttlSeconds": float(row["ttl_seconds"]),
         "cleanup": cleanup,
@@ -947,7 +1028,9 @@ class PluginWorkspaces:
         reclaimed: str | None = None
 
         with transaction(_connect(layout), immediate=True) as conn:
-            now = time.time()
+            now, expires_wall, heartbeat_mono, expires_mono, observer, observed_mono = (
+                _fresh_expiry(ttl)
+            )
             operation = conn.execute(
                 "SELECT * FROM workspace_lease_operations WHERE operation_id=?",
                 (operation_id,),
@@ -983,7 +1066,7 @@ class PluginWorkspaces:
                     raise InvalidWorkspaceHandleError("workspace acquire intent scope is invalid")
                 state = intent_row["state"]
                 owner_status = _owner_status(intent_row)
-                expired = float(intent_row["expires_at"]) <= now
+                expired = _lease_expired(conn, intent_row)
                 if owner_status in {"live", "unknown"} and not expired:
                     raise WorkspaceInUseError(
                         f"workspace {workspace_id!r} intent is owned by another live process"
@@ -996,11 +1079,14 @@ class PluginWorkspaces:
                     _validate_workspace_path(Path(intent_row["workspace_path"]))
                     changed = conn.execute(
                         """UPDATE workspace_leases SET owner_pid=?, owner_create_time=?,
-                           owner_host=?, owner_instance=?, heartbeat_at=?, expires_at=?, updated_at=?
+                           owner_host=?, owner_instance=?, heartbeat_at=?, expires_at=?,
+                           heartbeat_monotonic=?, expires_monotonic=?, expiry_observer=?,
+                           expiry_observed_monotonic=?, updated_at=?
                            WHERE lease_id=? AND generation=? AND state='active'
                            AND acquire_intent_id=?""",
                         (
-                            pid, created, host, instance, now, now + ttl, now,
+                            pid, created, host, instance, now, expires_wall,
+                            heartbeat_mono, expires_mono, observer, observed_mono, now,
                             intent_row["lease_id"], intent_row["generation"], operation_id,
                         ),
                     ).rowcount
@@ -1045,10 +1131,13 @@ class PluginWorkspaces:
                 changed = conn.execute(
                     """UPDATE workspace_leases SET lease_id=?, state='preparing', owner_pid=?,
                        owner_create_time=?, owner_host=?, owner_instance=?, ttl_seconds=?,
-                       heartbeat_at=?, expires_at=?, released_at=NULL, generation=?, cleanup_json=?,
-                       updated_at=? WHERE workspace_id=? AND acquire_intent_id=?""",
+                       heartbeat_at=?, expires_at=?, heartbeat_monotonic=?, expires_monotonic=?,
+                       expiry_observer=?, expiry_observed_monotonic=?, released_at=NULL,
+                       generation=?, cleanup_json=?, updated_at=?
+                       WHERE workspace_id=? AND acquire_intent_id=?""",
                     (
-                        lease_id, pid, created, host, instance, ttl, now, now + ttl, generation,
+                        lease_id, pid, created, host, instance, ttl, now, expires_wall,
+                        heartbeat_mono, expires_mono, observer, observed_mono, generation,
                         json.dumps(cleanup, sort_keys=True), now, workspace_id, operation_id,
                     ),
                 ).rowcount
@@ -1081,7 +1170,7 @@ class PluginWorkspaces:
                         )
                     if old["state"] in {"active", "preparing", "releasing"}:
                         owner_status = _owner_status(old)
-                        expired = float(old["expires_at"]) <= now
+                        expired = _lease_expired(conn, old)
                         live_transition = old["state"] in {"preparing", "releasing"}
                         if owner_status in {"self", "live"} and live_transition:
                             raise WorkspaceInUseError(
@@ -1120,14 +1209,16 @@ class PluginWorkspaces:
                        (workspace_id, lease_id, capability_hash, contract_version, state,
                         plugin_namespace, plugin_identity, profile_key, workspace_path, owner_pid,
                         owner_create_time, owner_host, owner_instance, ttl_seconds, acquired_at,
-                        heartbeat_at, expires_at, released_at, generation, acquire_intent_id,
-                        cleanup_json, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        heartbeat_at, expires_at, heartbeat_monotonic, expires_monotonic,
+                        expiry_observer, expiry_observed_monotonic, released_at, generation,
+                        acquire_intent_id, cleanup_json, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         workspace_id, lease_id, capability_hash, HANDLE_VERSION, "preparing",
                         layout.plugin_namespace, layout.plugin_identity, layout.profile_key,
                         str(layout.workspaces_dir / workspace_id), pid, created, host, instance,
-                        ttl, now, now, now + ttl, None, generation, operation_id,
+                        ttl, now, now, expires_wall, heartbeat_mono, expires_mono,
+                        observer, observed_mono, None, generation, operation_id,
                         json.dumps(cleanup, sort_keys=True), now,
                     ),
                 )
@@ -1237,7 +1328,10 @@ class PluginWorkspaces:
                     )
 
         with transaction(_connect(layout), immediate=True) as conn:
-            ready_at = time.time()
+            (
+                ready_at, ready_expires_wall, ready_mono, ready_expires_mono,
+                ready_observer, ready_observed_mono,
+            ) = _fresh_expiry(ttl)
             current = _validated_row(
                 conn, layout, _handle(lease_id, capability), validate_path=False,
             )
@@ -1250,9 +1344,14 @@ class PluginWorkspaces:
             _validate_workspace_path(Path(current["workspace_path"]))
             changed = conn.execute(
                 """UPDATE workspace_leases SET state='active', heartbeat_at=?, expires_at=?,
-                   updated_at=? WHERE lease_id=? AND state='preparing' AND generation=?
-                   AND acquire_intent_id=?""",
-                (ready_at, ready_at + ttl, ready_at, lease_id, generation, operation_id),
+                   heartbeat_monotonic=?, expires_monotonic=?, expiry_observer=?,
+                   expiry_observed_monotonic=?, updated_at=? WHERE lease_id=?
+                   AND state='preparing' AND generation=? AND acquire_intent_id=?""",
+                (
+                    ready_at, ready_expires_wall, ready_mono, ready_expires_mono,
+                    ready_observer, ready_observed_mono, ready_at, lease_id,
+                    generation, operation_id,
+                ),
             ).rowcount
             if changed != 1:
                 raise InvalidWorkspaceHandleError("workspace activation lost its fence")
@@ -1277,19 +1376,26 @@ class PluginWorkspaces:
         layout = self._layout()
         with transaction(_connect(layout), immediate=True) as conn:
             row = _validated_row(conn, layout, handle, validate_path=False)
-            now = time.time()
             if row["state"] != "active":
                 raise InvalidWorkspaceHandleError("workspace lease has been released")
             _validate_workspace_path(Path(row["workspace_path"]))
-            if float(row["expires_at"]) <= now:
+            if _lease_expired(conn, row):
                 raise WorkspaceLeaseExpiredError("workspace lease expired; reconnect it before use")
             if _owner_state(row) is not True:
                 raise WorkspaceOwnershipError("workspace lease belongs to another live process")
             ttl = _ttl(row["ttl_seconds"] if ttl_seconds is None else ttl_seconds)
+            now, expires_wall, heartbeat_mono, expires_mono, observer, observed_mono = (
+                _fresh_expiry(ttl)
+            )
             conn.execute(
-                "UPDATE workspace_leases SET ttl_seconds=?, heartbeat_at=?, expires_at=?, updated_at=? "
-                "WHERE lease_id=? AND state='active' AND generation=?",
-                (ttl, now, now + ttl, now, row["lease_id"], row["generation"]),
+                """UPDATE workspace_leases SET ttl_seconds=?, heartbeat_at=?, expires_at=?,
+                   heartbeat_monotonic=?, expires_monotonic=?, expiry_observer=?,
+                   expiry_observed_monotonic=?, updated_at=? WHERE lease_id=?
+                   AND state='active' AND generation=?""",
+                (
+                    ttl, now, expires_wall, heartbeat_mono, expires_mono, observer,
+                    observed_mono, now, row["lease_id"], row["generation"],
+                ),
             )
             if conn.execute("SELECT changes()").fetchone()[0] != 1:
                 raise InvalidWorkspaceHandleError("workspace lease changed during renewal")
@@ -1349,18 +1455,26 @@ class PluginWorkspaces:
                     )
                     raise InvalidWorkspaceHandleError("workspace reconnect intent was superseded")
                 owner_status = _owner_status(row)
-                expired = float(row["expires_at"]) <= now
+                expired = _lease_expired(conn, row)
                 if owner_status in {"live", "unknown"} and not expired:
                     raise WorkspaceOwnershipError(
                         "workspace lease still belongs to another live process"
                     )
                 _validate_workspace_path(Path(row["workspace_path"]))
+                (
+                    fresh_wall, fresh_expires_wall, fresh_mono, fresh_expires_mono,
+                    fresh_observer, fresh_observed_mono,
+                ) = _fresh_expiry(ttl)
                 changed = conn.execute(
                     """UPDATE workspace_leases SET owner_pid=?, owner_create_time=?, owner_host=?,
-                       owner_instance=?, ttl_seconds=?, heartbeat_at=?, expires_at=?, updated_at=?
+                       owner_instance=?, ttl_seconds=?, heartbeat_at=?, expires_at=?,
+                       heartbeat_monotonic=?, expires_monotonic=?, expiry_observer=?,
+                       expiry_observed_monotonic=?, updated_at=?
                        WHERE lease_id=? AND generation=? AND state='active'""",
                     (
-                        *_owner_stamp(), ttl, now, now + ttl, now,
+                        *_owner_stamp(), ttl, fresh_wall, fresh_expires_wall,
+                        fresh_mono, fresh_expires_mono, fresh_observer,
+                        fresh_observed_mono, fresh_wall,
                         row["lease_id"], row["generation"],
                     ),
                 ).rowcount
@@ -1381,7 +1495,7 @@ class PluginWorkspaces:
                     raise InvalidWorkspaceHandleError("workspace lease has been released")
                 _validate_workspace_path(Path(row["workspace_path"]))
                 owner_status = _owner_status(row)
-                expired = float(row["expires_at"]) <= now
+                expired = _lease_expired(conn, row)
                 if owner_status in {"live", "unknown"} and not expired:
                     raise WorkspaceOwnershipError(
                         "workspace lease still belongs to another live process"
@@ -1402,13 +1516,21 @@ class PluginWorkspaces:
                     ),
                 )
                 pid, created, host, instance = _owner_stamp()
+                (
+                    fresh_wall, fresh_expires_wall, fresh_mono, fresh_expires_mono,
+                    fresh_observer, fresh_observed_mono,
+                ) = _fresh_expiry(ttl)
                 changed = conn.execute(
                     """UPDATE workspace_leases SET owner_pid=?, owner_create_time=?, owner_host=?,
-                       owner_instance=?, ttl_seconds=?, heartbeat_at=?, expires_at=?, updated_at=?,
-                       lease_id=?, capability_hash=?, generation=?
+                       owner_instance=?, ttl_seconds=?, heartbeat_at=?, expires_at=?,
+                       heartbeat_monotonic=?, expires_monotonic=?, expiry_observer=?,
+                       expiry_observed_monotonic=?, updated_at=?, lease_id=?, capability_hash=?,
+                       generation=?
                        WHERE lease_id=? AND state='active' AND generation=?""",
                     (
-                        pid, created, host, instance, ttl, now, now + ttl, now,
+                        pid, created, host, instance, ttl, fresh_wall, fresh_expires_wall,
+                        fresh_mono, fresh_expires_mono, fresh_observer,
+                        fresh_observed_mono, fresh_wall,
                         successor_lease_id, successor_hash, successor_generation,
                         predecessor_lease_id, row["generation"],
                     ),
@@ -1429,11 +1551,10 @@ class PluginWorkspaces:
         layout = self._layout()
         with transaction(_connect(layout), immediate=True) as conn:
             row = _validated_row(conn, layout, handle, validate_path=False)
-            now = time.time()
             if row["state"] != "active":
                 raise InvalidWorkspaceHandleError("workspace lease has been released")
             _validate_workspace_path(Path(row["workspace_path"]))
-            if float(row["expires_at"]) <= now:
+            if _lease_expired(conn, row):
                 raise WorkspaceLeaseExpiredError("workspace lease expired; reconnect it before use")
             return _public_snapshot(conn, row)
 
@@ -1441,6 +1562,7 @@ class PluginWorkspaces:
         layout = self._layout()
         detached: Path | None = None
         released_snapshot: dict[str, Any] | None = None
+        release_error: WorkspacePathError | None = None
         with transaction(_connect(layout), immediate=True) as conn:
             now = time.time()
             row = _validated_row(conn, layout, handle, validate_path=False)
@@ -1486,7 +1608,7 @@ class PluginWorkspaces:
                 if row["state"] not in {"active", "releasing"}:
                     raise InvalidWorkspaceHandleError("workspace lease is not active")
                 owner_status = _owner_status(row)
-                expired = float(row["expires_at"]) <= now
+                expired = _lease_expired(conn, row)
                 if owner_status in {"live", "unknown"} and not expired:
                     raise WorkspaceOwnershipError("workspace lease still belongs to another live process")
                 planned = _planned_detached_path(
@@ -1536,23 +1658,53 @@ class PluginWorkspaces:
                     cleanup["planned_detached_path"] = str(planned)
                     _cleanup_receipt(conn, current, "release", "detached", cleanup)
                     finished_at = time.time()
-                    changed = conn.execute(
-                        """UPDATE workspace_leases SET state='released', released_at=?,
-                           cleanup_json=?, updated_at=? WHERE lease_id=? AND state='releasing'
-                           AND generation=?""",
-                        (
-                            finished_at, json.dumps(cleanup, sort_keys=True), finished_at,
-                            current["lease_id"], current["generation"],
-                        ),
-                    ).rowcount
-                    if changed != 1:
-                        raise InvalidWorkspaceHandleError("workspace lease changed during release")
-                    updated = conn.execute(
-                        "SELECT * FROM workspace_leases WHERE lease_id=?", (current["lease_id"],)
-                    ).fetchone()
-                    _cleanup_receipt(conn, updated, "release", "released", cleanup)
-                    _event(conn, updated, "released", {"cleanup": cleanup})
-                    released_snapshot = _public_snapshot(conn, updated)
+                    if detached is None and cleanup.get("disposition") == "preserved":
+                        changed = conn.execute(
+                            """UPDATE workspace_leases SET cleanup_json=?, updated_at=?
+                               WHERE lease_id=? AND state='releasing' AND generation=?""",
+                            (
+                                json.dumps(cleanup, sort_keys=True), finished_at,
+                                current["lease_id"], current["generation"],
+                            ),
+                        ).rowcount
+                        if changed != 1:
+                            raise InvalidWorkspaceHandleError(
+                                "workspace release failure lost its fence"
+                            )
+                        failed = conn.execute(
+                            "SELECT * FROM workspace_leases WHERE lease_id=?",
+                            (current["lease_id"],),
+                        ).fetchone()
+                        _cleanup_receipt(conn, failed, "release", "detach_failed", cleanup)
+                        _event(conn, failed, "release_detach_failed", {"cleanup": cleanup})
+                        release_error = WorkspacePathError(
+                            f"workspace release could not detach {current['workspace_path']}; "
+                            "contents were preserved and the same handle can retry"
+                        )
+                    else:
+                        changed = conn.execute(
+                            """UPDATE workspace_leases SET state='released', released_at=?,
+                               cleanup_json=?, updated_at=? WHERE lease_id=? AND state='releasing'
+                               AND generation=?""",
+                            (
+                                finished_at, json.dumps(cleanup, sort_keys=True), finished_at,
+                                current["lease_id"], current["generation"],
+                            ),
+                        ).rowcount
+                        if changed != 1:
+                            raise InvalidWorkspaceHandleError(
+                                "workspace lease changed during release"
+                            )
+                        updated = conn.execute(
+                            "SELECT * FROM workspace_leases WHERE lease_id=?",
+                            (current["lease_id"],),
+                        ).fetchone()
+                        _cleanup_receipt(conn, updated, "release", "released", cleanup)
+                        _event(conn, updated, "released", {"cleanup": cleanup})
+                        released_snapshot = _public_snapshot(conn, updated)
+
+        if release_error is not None:
+            raise release_error
 
         if detached is None:
             assert released_snapshot is not None

@@ -97,7 +97,8 @@ are rejected.
 
 `workspace_id` is a stable plugin-chosen identifier: 1–128 lowercase ASCII letters, digits,
 periods, underscores, or hyphens. It must start with a letter or digit, may not contain `..`, and
-may not be a reserved device name. Use a durable run ID rather than a display title.
+may not end in a period or be a reserved device name. Use a durable run ID rather than a display
+title; the trailing-period rule prevents Windows from aliasing two textual IDs to one directory.
 
 ## Handles and fencing
 
@@ -162,7 +163,12 @@ materializing repository content remains the plugin's responsibility.
 ## Cleanup and recovery
 
 Acquisition records the owner PID, process creation time, host, host-instance witness, generation,
-heartbeat, and expiry. After a worker restart, call `reconnect` with its persisted handle. A dead
+wall-clock audit timestamps, and a monotonic heartbeat/deadline. On the same verified boot, every
+expiry decision uses only the monotonic deadline, so wall-clock corrections neither reclaim early
+nor extend a lease. A verified reboot makes the old same-host owner dead. Foreign or unverifiable
+ownership must be observed continuously by one local boot/process for a full TTL before expiry;
+one wall-clock-expired read never grants authority. After a worker restart, call `reconnect` with
+its persisted handle. A dead
 owner can be reclaimed before expiry; an unexpired live or unverifiable foreign owner is refused.
 After expiry, the bearer may take over even if the previous PID still appears live or its liveness
 is unknown, because the TTL is the durable fencing boundary. Successful reconnect increments the
@@ -175,6 +181,9 @@ after a strict directory-metadata flush succeeds: POSIX uses directory `fsync`; 
 write-through `MoveFileEx` plus directory handles opened with backup semantics and
 `FlushFileBuffers`. A flush error fails the operation before its success state commits, while the
 deterministic detached name lets the same intent reconcile a rename that physically completed.
+If detach itself is refused, or both canonical and planned names exist, release remains durably in
+`releasing`, records the failure, and raises `WorkspacePathError`; clear the filesystem condition
+and retry the same handle. It never reports `released` while the canonical name is still occupied.
 
 Hermes removes only work it can prove disposable:
 

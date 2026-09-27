@@ -83,6 +83,14 @@ def _commit(path: Path, filename: str = "tracked.txt") -> None:
     )
 
 
+def _expire_lease(conn: sqlite3.Connection, lease_id: str) -> None:
+    conn.execute(
+        """UPDATE workspace_leases SET expires_at=0, expires_monotonic=0
+           WHERE lease_id=?""",
+        (lease_id,),
+    )
+
+
 def test_handle_is_opaque_serializable_and_profile_bound(tmp_path: Path) -> None:
     home_a, home_b = tmp_path / "profiles" / "a", tmp_path / "profiles" / "b"
     ctx = _context(home_a)
@@ -286,7 +294,7 @@ def test_expired_generation_is_atomically_reclaimed(tmp_path: Path) -> None:
     (old_path / "untracked.txt").write_text("old", encoding="utf-8")
     db = tmp_path / "home/plugin-data/pr-review/workspace-leases.db"
     with sqlite3.connect(db) as conn:
-        conn.execute("UPDATE workspace_leases SET expires_at=0 WHERE lease_id=?", (old["lease_id"],))
+        _expire_lease(conn, old["lease_id"])
 
     successor = _acquire(ctx, "ttl", ttl_seconds=60)
     snapshot = ctx.workspaces.inspect(successor)
@@ -303,12 +311,74 @@ def test_expired_handle_requires_reconnect_for_direct_use(tmp_path: Path) -> Non
     handle = _acquire(ctx, "expired", ttl_seconds=60)
     db = tmp_path / "home/plugin-data/pr-review/workspace-leases.db"
     with sqlite3.connect(db) as conn:
-        conn.execute("UPDATE workspace_leases SET expires_at=0 WHERE lease_id=?", (handle["lease_id"],))
+        _expire_lease(conn, handle["lease_id"])
 
     with pytest.raises(WorkspaceLeaseExpiredError):
         ctx.workspaces.inspect(handle)
     successor = _reconnect(ctx, handle)
     assert ctx.workspaces.inspect(successor)["generation"] == 2
+
+
+def test_same_boot_monotonic_expiry_ignores_wall_clock_jumps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import plugin_workspaces
+
+    wall, monotonic = [100.0], [10.0]
+    monkeypatch.setattr(plugin_workspaces, "_host_instance", lambda: "boot-id:test")
+    monkeypatch.setattr(plugin_workspaces.time, "time", lambda: wall[0])
+    monkeypatch.setattr(plugin_workspaces.time, "monotonic", lambda: monotonic[0])
+    ctx = _context(tmp_path / "home")
+    handle = _acquire(ctx, "clock", ttl_seconds=10)
+
+    wall[0] = 1_000_000.0
+    monotonic[0] = 11.0
+    assert ctx.workspaces.inspect(handle)["state"] == "active"
+    with pytest.raises(WorkspaceInUseError):
+        _acquire(ctx, "clock", ttl_seconds=10)
+
+    wall[0] = -1_000_000.0
+    monotonic[0] = 20.0
+    with pytest.raises(WorkspaceLeaseExpiredError):
+        ctx.workspaces.inspect(handle)
+    successor = _acquire(ctx, "clock", ttl_seconds=10)
+    assert ctx.workspaces.inspect(successor)["generation"] == 2
+
+
+def test_verified_reboot_is_dead_but_unknown_owner_needs_full_observation_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import plugin_workspaces
+
+    wall, monotonic, boot = [100.0], [10.0], ["boot-id:a"]
+    monkeypatch.setattr(plugin_workspaces, "_host_instance", lambda: boot[0])
+    monkeypatch.setattr(plugin_workspaces.time, "time", lambda: wall[0])
+    monkeypatch.setattr(plugin_workspaces.time, "monotonic", lambda: monotonic[0])
+    ctx = _context(tmp_path / "home")
+    before_reboot = _acquire(ctx, "reboot", ttl_seconds=60)
+    boot[0] = "boot-id:b"
+    after_reboot = _acquire(ctx, "reboot", ttl_seconds=60)
+    assert ctx.workspaces.inspect(after_reboot)["generation"] == 2
+    with pytest.raises(InvalidWorkspaceHandleError):
+        ctx.workspaces.inspect(before_reboot)
+
+    unknown = _acquire(ctx, "unknown", ttl_seconds=5)
+    db = tmp_path / "home/plugin-data/pr-review/workspace-leases.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """UPDATE workspace_leases SET owner_host='foreign-host', owner_instance='unverified',
+               expires_at=0, expires_monotonic=0, expiry_observer=NULL,
+               expiry_observed_monotonic=NULL WHERE lease_id=?""",
+            (unknown["lease_id"],),
+        )
+    wall[0] = 9_999_999.0
+    monotonic[0] = 100.0
+    assert ctx.workspaces.inspect(unknown)["state"] == "active"
+    monotonic[0] = 104.9
+    assert ctx.workspaces.inspect(unknown)["state"] == "active"
+    monotonic[0] = 105.0
+    with pytest.raises(WorkspaceLeaseExpiredError):
+        ctx.workspaces.inspect(unknown)
 
 
 def test_symlink_aliases_are_never_followed(tmp_path: Path) -> None:
@@ -342,6 +412,34 @@ def test_symlinked_host_namespace_is_rejected(tmp_path: Path) -> None:
     (home / "plugin-data").symlink_to(external, target_is_directory=True)
     with pytest.raises(WorkspacePathError):
         _acquire(_context(home), "run-1")
+
+
+def test_trailing_dot_ids_are_rejected_or_hashed(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    ctx = _context(home)
+    with pytest.raises(ValueError, match="trailing"):
+        _acquire(ctx, "run.")
+
+    native = _context(home, "native.")
+    native_handle = _acquire(native, "run")
+    native_namespace = Path(native.workspaces.inspect(native_handle)["path"]).parents[1].name
+    assert native_namespace.startswith("hermes-native-")
+    assert not native_namespace.endswith(".")
+
+    portable = _context(home, "portable.", skill_namespace="agent-plugin-portable.")
+    portable_handle = _acquire(portable, "run")
+    portable_namespace = Path(portable.workspaces.inspect(portable_handle)["path"]).parents[1].name
+    assert portable_namespace.startswith("agent-plugin-")
+    assert not portable_namespace.endswith(".")
+
+
+@pytest.mark.windows_only
+def test_windows_trailing_dot_workspace_alias_is_refused(tmp_path: Path) -> None:
+    ctx = _context(tmp_path / "home")
+    handle = _acquire(ctx, "run")
+    with pytest.raises(ValueError, match="trailing"):
+        _acquire(ctx, "run.")
+    assert Path(ctx.workspaces.inspect(handle)["path"]).name == "run"
 
 
 def test_cleanup_receipts_preserve_every_uncertain_or_unique_tree(tmp_path: Path) -> None:
@@ -499,7 +597,11 @@ def test_acquire_samples_after_lock_and_refreshes_after_slow_cleanup(
     (old_path / "preserve.txt").write_text("old", encoding="utf-8")
     db = tmp_path / "home/plugin-data/pr-review/workspace-leases.db"
     with sqlite3.connect(db) as conn:
-        conn.execute("UPDATE workspace_leases SET expires_at=5 WHERE lease_id=?", (old["lease_id"],))
+        conn.execute(
+            """UPDATE workspace_leases SET expires_at=5, expires_monotonic=5
+               WHERE lease_id=?""",
+            (old["lease_id"],),
+        )
 
     clock = [0.0]
     real_transaction = plugin_workspaces.transaction
@@ -520,12 +622,15 @@ def test_acquire_samples_after_lock_and_refreshes_after_slow_cleanup(
         return real_finish(path, receipt)
 
     monkeypatch.setattr(plugin_workspaces.time, "time", lambda: clock[0])
+    monkeypatch.setattr(plugin_workspaces.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(plugin_workspaces, "transaction", contended_transaction)
     monkeypatch.setattr(plugin_workspaces, "_finish_detached_cleanup", slow_finish)
     successor = _acquire(ctx, "slow", ttl_seconds=1)
     snapshot = ctx.workspaces.inspect(successor)
     assert snapshot["heartbeatAt"] == 20.0
     assert snapshot["expiresAt"] == 21.0
+    assert snapshot["heartbeatMonotonic"] == 20.0
+    assert snapshot["expiresMonotonic"] == 21.0
     assert snapshot["generation"] == 2
 
 
@@ -697,6 +802,63 @@ def test_released_missing_detached_target_is_terminally_reconciled(tmp_path: Pat
     assert ctx.workspaces.release(handle)["cleanup"] == released["cleanup"]
 
 
+def test_release_permission_failure_stays_releasing_and_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import plugin_workspaces
+
+    home = tmp_path / "home"
+    ctx = _context(home)
+    handle = _acquire(ctx, "permission-release")
+    original = plugin_workspaces._strict_replace
+
+    def denied(*_args, **_kwargs):
+        raise PermissionError("detach denied")
+
+    monkeypatch.setattr(plugin_workspaces, "_strict_replace", denied)
+    with pytest.raises(WorkspacePathError, match="same handle can retry"):
+        ctx.workspaces.release(handle)
+    db = home / "plugin-data/pr-review/workspace-leases.db"
+    with sqlite3.connect(db) as conn:
+        state, cleanup_json = conn.execute(
+            "SELECT state, cleanup_json FROM workspace_leases WHERE lease_id=?",
+            (handle["lease_id"],),
+        ).fetchone()
+    assert state == "releasing"
+    assert json.loads(cleanup_json)["disposition"] == "preserved"
+
+    monkeypatch.setattr(plugin_workspaces, "_strict_replace", original)
+    released = ctx.workspaces.release(handle)
+    assert released["state"] == "released"
+    assert ctx.workspaces.release(handle)["state"] == "released"
+
+
+def test_release_both_names_failure_stays_releasing_and_retries(tmp_path: Path) -> None:
+    from hermes_cli import plugin_workspaces
+
+    home = tmp_path / "home"
+    ctx = _context(home)
+    handle = _acquire(ctx, "both-release")
+    snapshot = ctx.workspaces.inspect(handle)
+    planned = plugin_workspaces._planned_detached_path(
+        ctx.workspaces._layout(), "both-release", handle["lease_id"],
+        snapshot["generation"], "release",
+    )
+    planned.mkdir()
+    (planned / "other.txt").write_text("preserve", encoding="utf-8")
+
+    with pytest.raises(WorkspacePathError, match="same handle can retry"):
+        ctx.workspaces.release(handle)
+    db = home / "plugin-data/pr-review/workspace-leases.db"
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT state FROM workspace_leases WHERE lease_id=?", (handle["lease_id"],),
+        ).fetchone()[0] == "releasing"
+    planned.rename(planned.with_name("operator-preserved"))
+    released = ctx.workspaces.release(handle)
+    assert released["state"] == "released"
+
+
 @pytest.mark.parametrize("owner_status", ["live", "unknown"])
 def test_expired_reconnect_can_fence_live_or_unknown_owner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, owner_status: str,
@@ -710,7 +872,7 @@ def test_expired_reconnect_can_fence_live_or_unknown_owner(
         _reconnect(ctx, handle)
     db = tmp_path / "home/plugin-data/pr-review/workspace-leases.db"
     with sqlite3.connect(db) as conn:
-        conn.execute("UPDATE workspace_leases SET expires_at=0 WHERE lease_id=?", (handle["lease_id"],))
+        _expire_lease(conn, handle["lease_id"])
     successor = _reconnect(ctx, handle)
     assert ctx.workspaces.inspect(successor)["generation"] == 2
 
@@ -818,10 +980,7 @@ def test_reconnect_response_ambiguity_replays_successor_from_new_process(
     intent = ctx.workspaces.new_intent()
     db = home / "plugin-data/pr-review/workspace-leases.db"
     with sqlite3.connect(db) as conn:
-        conn.execute(
-            "UPDATE workspace_leases SET expires_at=0 WHERE lease_id=?",
-            (predecessor["lease_id"],),
-        )
+        _expire_lease(conn, predecessor["lease_id"])
     script = r"""
 import json
 import os
@@ -934,10 +1093,7 @@ def test_detach_sync_fault_is_retryable_with_same_intent(
     (predecessor_path / "preserve.txt").write_text("old", encoding="utf-8")
     db = home / "plugin-data/pr-review/workspace-leases.db"
     with sqlite3.connect(db) as conn:
-        conn.execute(
-            "UPDATE workspace_leases SET expires_at=0 WHERE lease_id=?",
-            (predecessor["lease_id"],),
-        )
+        _expire_lease(conn, predecessor["lease_id"])
     intent = ctx.workspaces.new_intent()
     original = plugin_workspaces._strict_sync_directory
     fail_once = [True]
@@ -1007,6 +1163,35 @@ def test_mkdir_strict_flush_failure_never_commits_active_state(
     assert state == "released"
     monkeypatch.setattr(plugin_workspaces, "_strict_sync_directory", original)
     assert ctx.workspaces.inspect(_acquire(ctx, "mkdir-flush", intent=intent))["state"] == "active"
+
+
+def test_rmdir_flush_failure_reconciles_completed_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import plugin_workspaces
+
+    ctx = _context(tmp_path / "home")
+    handle = _acquire(ctx, "rmdir-flush")
+    snapshot = ctx.workspaces.inspect(handle)
+    layout = ctx.workspaces._layout()
+    planned = plugin_workspaces._planned_detached_path(
+        layout, "rmdir-flush", handle["lease_id"], snapshot["generation"], "release",
+    )
+    original = plugin_workspaces._strict_sync_directory
+
+    def fail_after_rmdir(path):
+        if path == layout.quarantine_dir and not planned.exists():
+            raise OSError("rmdir metadata flush failed")
+        return original(path)
+
+    monkeypatch.setattr(plugin_workspaces, "_strict_sync_directory", fail_after_rmdir)
+    with pytest.raises(plugin_workspaces.WorkspaceDurabilityError) as raised:
+        ctx.workspaces.release(handle)
+    assert raised.value.mutation_completed is True
+    monkeypatch.setattr(plugin_workspaces, "_strict_sync_directory", original)
+    released = ctx.workspaces.release(handle)
+    assert released["cleanup"]["disposition"] == "removed"
+    assert released["cleanup"]["reconciled_reason"] == "detached_target_absent"
 
 
 @pytest.mark.windows_only
