@@ -16,6 +16,7 @@ import os
 import re
 import secrets
 import socket
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -34,13 +35,13 @@ from hermes_cli.plugin_workspace_errors import (
     WorkspacePathError,
 )
 from hermes_cli.plugin_workspace_fs import (
-    HeldDirectory as _HeldDirectory,
+    HeldDirectory as _HeldDirectory, HeldRegularFile as _HeldRegularFile,
     safe_child as _safe_child,
     workspace_roots as _workspace_roots,
 )
 from hermes_cli.plugins_manifest import _portable_skill_namespace
 from hermes_cli.process_identity import _pid_alive_matches, _process_create_time
-from hermes_cli.sqlite_util import add_column_if_missing, open_db, transaction
+from hermes_cli.sqlite_util import add_column_if_missing, transaction
 
 
 HOST_FEATURE = "workspace_leases.v1"
@@ -73,11 +74,16 @@ class _Layout:
 
 
 class _AnchoredConnection:
-    """SQLite connection whose descriptor/reparse-safe data root stays held until close."""
+    """SQLite connection retaining the held data root and no-follow DB leaf until close."""
 
-    def __init__(self, conn, held_data: _HeldDirectory) -> None:
+    def __init__(self, conn, held_data: _HeldDirectory, held_db: _HeldRegularFile,
+                 held_roots_cm) -> None:
         self._conn = conn
         self._held_data = held_data
+        self._held_db = held_db
+        self._held_roots_cm = held_roots_cm
+        self.storage_data_identity = held_data.identity_json()
+        self.storage_db_identity = [int(part) for part in held_db.identity]
 
     def __getattr__(self, name):
         return getattr(self._conn, name)
@@ -93,7 +99,13 @@ class _AnchoredConnection:
         try:
             self._conn.close()
         finally:
-            self._held_data.__exit__(None, None, None)
+            try:
+                self._held_db.close()
+            finally:
+                try:
+                    self._held_roots_cm.__exit__(None, None, None)
+                finally:
+                    self._held_data.__exit__(None, None, None)
 
 
 def _native_hashed_namespace(plugin_id: str) -> str:
@@ -258,7 +270,7 @@ def _validate_legacy_rows(conn, layout: _Layout) -> None:
     )
 
 
-def _initialize(conn, layout: _Layout) -> None:
+def _initialize(conn, layout: _Layout, root_identities: Mapping[str, Any]) -> None:
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS workspace_leases (
@@ -287,6 +299,7 @@ def _initialize(conn, layout: _Layout) -> None:
             released_at REAL,
             generation INTEGER NOT NULL,
             acquire_intent_id TEXT,
+            root_identities_json TEXT,
             cleanup_json TEXT,
             updated_at REAL NOT NULL
         );
@@ -339,6 +352,7 @@ def _initialize(conn, layout: _Layout) -> None:
             "plugin_identity": "plugin_identity TEXT",
             "owner_machine_identity": "owner_machine_identity TEXT",
             "acquire_intent_id": "acquire_intent_id TEXT",
+            "root_identities_json": "root_identities_json TEXT",
             "heartbeat_monotonic": "heartbeat_monotonic REAL",
             "expires_monotonic": "expires_monotonic REAL",
             "expiry_observer": "expiry_observer TEXT",
@@ -348,6 +362,12 @@ def _initialize(conn, layout: _Layout) -> None:
             if column not in columns:
                 add_column_if_missing(conn, "workspace_leases", column, ddl)
         _validate_legacy_rows(conn, layout)
+        legacy_roots = json.dumps(dict(root_identities), sort_keys=True)
+        conn.execute(
+            """UPDATE workspace_leases SET root_identities_json=?
+               WHERE root_identities_json IS NULL""",
+            (legacy_roots,),
+        )
         conn.execute(
             """CREATE UNIQUE INDEX IF NOT EXISTS workspace_lease_acquire_intent
                ON workspace_leases(acquire_intent_id)"""
@@ -359,10 +379,38 @@ def _initialize(conn, layout: _Layout) -> None:
         conn.execute("COMMIT")
 
 
+def _preflight_existing_root_identities(conn, current: Mapping[str, Any]) -> None:
+    table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workspace_leases'"
+    ).fetchone()
+    if table is None:
+        return
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(workspace_leases)")}
+    if "root_identities_json" not in columns:
+        return
+    rows = conn.execute(
+        """SELECT DISTINCT root_identities_json FROM workspace_leases
+           WHERE root_identities_json IS NOT NULL"""
+    ).fetchall()
+    for row in rows:
+        try:
+            persisted = json.loads(row[0])
+        except (TypeError, ValueError) as exc:
+            raise WorkspacePathError("workspace storage root identity is malformed") from exc
+        if persisted != dict(current):
+            raise WorkspacePathError(
+                "workspace storage root identity changed before database open; "
+                f"expected={persisted}, current={dict(current)}"
+            )
+
+
 def _connect(layout: _Layout):
     sidecar_names = ("workspace-leases.db", "workspace-leases.db-wal", "workspace-leases.db-shm")
     held_data = _HeldDirectory(layout.data_dir)
     held_data.__enter__()
+    held_roots_cm = _workspace_roots(layout)
+    held_roots = held_roots_cm.__enter__()
+    held_db = _HeldRegularFile(held_data, "workspace-leases.db")
     try:
         for name in sidecar_names:
             try:
@@ -373,15 +421,36 @@ def _connect(layout: _Layout):
                 raise WorkspacePathError(
                     f"workspace lease database sidecar is unsafe: {layout.data_dir / name}"
                 )
-        db_open_path = held_data.child_path("workspace-leases.db")
-        conn = open_db(
-            db_open_path,
-            db_label=f"plugin-data/{layout.plugin_namespace}/workspace-leases.db",
-            foreign_keys=True,
-            synchronous_full=True,
-            wal_lock_retries=5,
-            initialize=lambda conn: _initialize(conn, layout),
-        )
+        held_db.__enter__()
+
+        db_open_path, _nofollow = held_db.open_path()
+        raw_conn = sqlite3.connect(db_open_path, timeout=5.0)
+        raw_conn.row_factory = sqlite3.Row
+        raw_conn.execute("PRAGMA busy_timeout=5000")
+        held_db.verify()
+        conn = _AnchoredConnection(raw_conn, held_data, held_db, held_roots_cm)
+        conn.storage_root_identities = {
+            "version": 1,
+            "data": held_data.identity_json(),
+            "workspaces": held_roots[0].identity_json(),
+            "quarantine": held_roots[1].identity_json(),
+        }
+        _preflight_existing_root_identities(conn, conn.storage_root_identities)
+        from hermes_state_wal import apply_wal_with_fallback
+
+        for attempt in range(5):
+            try:
+                apply_wal_with_fallback(
+                    conn, db_label=f"plugin-data/{layout.plugin_namespace}/workspace-leases.db",
+                )
+                break
+            except sqlite3.OperationalError as exc:
+                if str(exc).lower() != "database is locked" or attempt == 4:
+                    raise
+                time.sleep(0.01 * (2**attempt))
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA synchronous=FULL")
+        _initialize(conn, layout, conn.storage_root_identities)
         held_data.verify()
         if os.name != "nt":
             for name in sidecar_names:
@@ -392,11 +461,17 @@ def _connect(layout: _Layout):
                         )
                     held_data.chmod(name, 0o600)
         held_data.verify()
-        return _AnchoredConnection(conn, held_data)
+        held_db.verify()
+        return conn
     except BaseException:
         if "conn" in locals():
             conn.close()
-        held_data.__exit__(*sys.exc_info())
+        else:
+            if "raw_conn" in locals():
+                raw_conn.close()
+            held_db.close(strict=False)
+            held_roots_cm.__exit__(*sys.exc_info())
+            held_data.__exit__(*sys.exc_info())
         raise
 
 
@@ -663,6 +738,7 @@ def _validated_row(
         raise InvalidWorkspaceHandleError("workspace lease has an invalid persisted path")
     if validate_path:
         _validate_workspace_entry(layout, str(row["workspace_id"]))
+    _validate_row_roots(row, layout, current_identities=conn.storage_root_identities)
     return row
 
 
@@ -844,6 +920,83 @@ def _planned_detached_path(
     )
 
 
+def _root_identities(layout: _Layout) -> dict[str, Any]:
+    with _HeldDirectory(layout.data_dir) as data, _workspace_roots(layout) as roots:
+        return {
+            "version": 1,
+            "data": data.identity_json(),
+            "workspaces": roots[0].identity_json(),
+            "quarantine": roots[1].identity_json(),
+        }
+
+
+def _held_root_identities(
+    conn, roots: tuple[_HeldDirectory, _HeldDirectory],
+) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "data": list(conn.storage_data_identity),
+        "workspaces": roots[0].identity_json(),
+        "quarantine": roots[1].identity_json(),
+    }
+
+
+def _row_root_identities(row: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        identities = json.loads(row["root_identities_json"] or "null")
+    except (TypeError, ValueError, KeyError) as exc:
+        raise WorkspacePathError("workspace lease root identities are malformed") from exc
+    if not isinstance(identities, dict) or identities.get("version") != 1:
+        raise WorkspacePathError("workspace lease has no durable root identities")
+    return identities
+
+
+def _validate_row_roots(
+    row: Mapping[str, Any], layout: _Layout,
+    roots: tuple[_HeldDirectory, _HeldDirectory] | None = None,
+    data_identity: list[int] | None = None,
+    current_identities: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    expected = _row_root_identities(row)
+    if current_identities is not None:
+        current = dict(current_identities)
+    elif roots is None:
+        current = _root_identities(layout)
+    else:
+        current = {
+            "version": 1,
+            "data": data_identity if data_identity is not None else _root_identities(layout)["data"],
+            "workspaces": roots[0].identity_json(),
+            "quarantine": roots[1].identity_json(),
+        }
+    if expected != current:
+        raise WorkspacePathError(
+            "workspace storage root identity changed; refusing lease mutation "
+            f"(expected={expected}, current={current})"
+        )
+    return expected
+
+
+def _validate_cleanup_roots(
+    cleanup: Mapping[str, Any], roots: tuple[_HeldDirectory, _HeldDirectory],
+) -> None:
+    identities = cleanup.get("root_identities")
+    if not isinstance(identities, dict):
+        raise WorkspacePathError("cleanup plan has no durable root identities")
+    expected_workspaces = identities.get("workspaces")
+    expected_quarantine = identities.get("quarantine")
+    if expected_workspaces is None or expected_quarantine is None:
+        raise WorkspacePathError("cleanup plan has no durable root identities")
+    current_workspaces = roots[0].identity_json()
+    current_quarantine = roots[1].identity_json()
+    if expected_workspaces != current_workspaces or expected_quarantine != current_quarantine:
+        raise WorkspacePathError(
+            "workspace cleanup root identity changed; refusing to interpret path absence "
+            f"(expected workspaces={expected_workspaces}, quarantine={expected_quarantine}; "
+            f"current workspaces={current_workspaces}, quarantine={current_quarantine})"
+        )
+
+
 def _detach_workspace(
     layout: _Layout, workspace_id: str, lease_id: str, generation: int,
     operation: str, *, planned: Path | None = None,
@@ -893,9 +1046,12 @@ def _detach_workspace(
         return mutate(held)
 
 
-def _finish_detached_cleanup(detached: Path, receipt: dict[str, Any]) -> dict[str, Any]:
-    with _HeldDirectory(detached.parent) as quarantine:
-        return _finish_detached_cleanup_held(detached, receipt, quarantine)
+def _finish_detached_cleanup(
+    layout: _Layout, detached: Path, receipt: dict[str, Any],
+) -> dict[str, Any]:
+    with _workspace_roots(layout) as roots:
+        _validate_cleanup_roots(receipt, roots)
+        return _finish_detached_cleanup_held(detached, receipt, roots[1])
 
 
 def _finish_detached_cleanup_held(
@@ -969,6 +1125,9 @@ def _reconcile_pending_generation(
         with _workspace_roots(layout) as held:
             return _reconcile_pending_generation(conn, layout, row, held)
     workspaces, quarantine = roots
+    identities = _validate_row_roots(
+        row, layout, roots, list(conn.storage_data_identity),
+    )
     operation = _pending_operation(row)
     if operation is None:
         return
@@ -1027,6 +1186,7 @@ def _reconcile_pending_generation(
     _cleanup_receipt(
         conn, row, "recovery", "reconciled", {
             "interrupted_operation": operation, "preserved": preserved,
+            "root_identities": identities,
         },
     )
 
@@ -1105,6 +1265,7 @@ class PluginWorkspaces:
             now, expires_wall, heartbeat_mono, expires_mono, observer, observed_mono = (
                 _fresh_expiry(ttl)
             )
+            storage_roots = _held_root_identities(conn, recovery_roots)
             operation = conn.execute(
                 "SELECT * FROM workspace_lease_operations WHERE operation_id=?",
                 (operation_id,),
@@ -1138,6 +1299,10 @@ class PluginWorkspaces:
                     or not hmac.compare_digest(intent_row["capability_hash"], capability_hash)
                 ):
                     raise InvalidWorkspaceHandleError("workspace acquire intent scope is invalid")
+                _validate_row_roots(
+                    intent_row, layout, recovery_roots,
+                    list(conn.storage_data_identity),
+                )
                 state = intent_row["state"]
                 owner_status = _owner_status(intent_row)
                 expired = _lease_expired(conn, intent_row)
@@ -1202,6 +1367,7 @@ class PluginWorkspaces:
                     "disposition": "preparing",
                     "original_path": str(layout.workspaces_dir / workspace_id),
                     "planned_detached_path": str(planned_detached),
+                    "root_identities": storage_roots,
                 }
                 changed = conn.execute(
                     """UPDATE workspace_leases SET lease_id=?, state='preparing', owner_pid=?,
@@ -1268,6 +1434,7 @@ class PluginWorkspaces:
                     "disposition": "preparing",
                     "original_path": str(layout.workspaces_dir / workspace_id),
                     "planned_detached_path": str(planned_detached),
+                    "root_identities": storage_roots,
                 }
                 conn.execute(
                     """INSERT INTO workspace_lease_operations
@@ -1288,14 +1455,15 @@ class PluginWorkspaces:
                         ttl_seconds, acquired_at,
                         heartbeat_at, expires_at, heartbeat_monotonic, expires_monotonic,
                         expiry_observer, expiry_observed_monotonic, released_at, generation,
-                        acquire_intent_id, cleanup_json, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        acquire_intent_id, root_identities_json, cleanup_json, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         workspace_id, lease_id, capability_hash, HANDLE_VERSION, "preparing",
                         layout.plugin_namespace, layout.plugin_identity, layout.profile_key,
                         str(layout.workspaces_dir / workspace_id), pid, created, host, machine, instance,
                         ttl, now, now, expires_wall, heartbeat_mono, expires_mono,
                         observer, observed_mono, None, generation, operation_id,
+                        json.dumps(storage_roots, sort_keys=True),
                         json.dumps(cleanup, sort_keys=True), now,
                     ),
                 )
@@ -1311,7 +1479,7 @@ class PluginWorkspaces:
         )
 
         if detached is not None:
-            finished_cleanup = _finish_detached_cleanup(detached, cleanup)
+            finished_cleanup = _finish_detached_cleanup(layout, detached, cleanup)
             finished_cleanup.update({
                 "operation": "acquire", "planned_detached_path": str(planned_detached),
             })
@@ -1403,8 +1571,12 @@ class PluginWorkspaces:
                 layout, workspace_id, lease_id, generation, "acquire",
                 planned=planned_detached, roots=roots,
             )
+            plan_roots = _validate_row_roots(
+                current, layout, roots, list(conn.storage_data_identity),
+            )
             cleanup.update({
                 "operation": "acquire", "planned_detached_path": str(planned_detached),
+                "root_identities": plan_roots,
             })
             _cleanup_receipt(conn, current, "acquire", "detached", cleanup)
             path = layout.workspaces_dir / workspace_id
@@ -1730,6 +1902,7 @@ class PluginWorkspaces:
                         "operation": "release", "classification": "pending",
                         "disposition": "releasing", "original_path": row["workspace_path"],
                         "planned_detached_path": str(planned),
+                        "root_identities": _row_root_identities(row),
                     }
                     changed = conn.execute(
                         """UPDATE workspace_leases SET state='releasing', cleanup_json=?, updated_at=?
@@ -1770,6 +1943,7 @@ class PluginWorkspaces:
                     )
                     cleanup["operation"] = "release"
                     cleanup["planned_detached_path"] = str(planned)
+                    cleanup["root_identities"] = _row_root_identities(current)
                     _cleanup_receipt(conn, current, "release", "detached", cleanup)
                     finished_at = time.time()
                     if detached is None and cleanup.get("disposition") == "preserved":
@@ -1823,7 +1997,7 @@ class PluginWorkspaces:
         if detached is None:
             assert released_snapshot is not None
             return released_snapshot
-        cleanup = _finish_detached_cleanup(detached, cleanup)
+        cleanup = _finish_detached_cleanup(layout, detached, cleanup)
         cleanup["operation"] = "release"
         cleanup["planned_detached_path"] = str(planned)
         finished = time.time()

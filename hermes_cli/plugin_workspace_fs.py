@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 import stat
 from contextlib import contextmanager
 from pathlib import Path
@@ -98,6 +99,11 @@ class HeldDirectory:
         self.verify()
         return self.path / name
 
+    def identity_json(self) -> list[int]:
+        if self.identity is None:
+            raise WorkspacePathError(f"workspace parent identity unavailable: {self.path}")
+        return [int(part) for part in self.identity]
+
     def chmod(self, name: str, mode: int) -> None:
         if self.fd is not None:
             os.chmod(name, mode, dir_fd=self.fd, follow_symlinks=False)
@@ -115,8 +121,8 @@ class HeldDirectory:
     def sync(self) -> None:
         if self.fd is not None:
             os.fsync(self.fd)
-        else:  # pragma: no cover - exercised on Windows CI
-            windows_flush_handle(self.handle)
+        else:  # pragma: no cover - Windows namespace durability comes from write-through moves
+            self.verify()
 
     def mkdir(self, name: str, mode: int = 0o700) -> None:
         if self.fd is not None:
@@ -132,16 +138,41 @@ class HeldDirectory:
                 os.close(child_fd)
             self.sync()
         else:  # pragma: no cover - exercised on Windows CI
-            os.mkdir(self.path / name, mode)
-            strict_sync_directory(self.path / name)
-            self.sync()
+            staging = f".{name}.creating-{secrets.token_hex(8)}"
+            os.mkdir(self.path / staging, mode)
+            try:
+                with HeldDirectory(self.path / staging):
+                    pass
+                windows_move_write_through(
+                    self.path / staging, self.path / name, replace=False,
+                )
+            except BaseException:
+                try:
+                    os.rmdir(self.path / staging)
+                except OSError:
+                    pass
+                raise
         self.verify()
 
     def rmdir(self, name: str) -> None:
         if self.fd is not None:
             os.rmdir(name, dir_fd=self.fd)
         else:  # pragma: no cover - exercised on Windows CI
-            os.rmdir(self.path / name)
+            tombstone = f".{name}.removing-{secrets.token_hex(8)}"
+            windows_move_write_through(
+                self.path / name, self.path / tombstone, replace=False,
+            )
+            try:
+                os.rmdir(self.path / tombstone)
+            except OSError:
+                if not (self.path / name).exists():
+                    try:
+                        windows_move_write_through(
+                            self.path / tombstone, self.path / name, replace=False,
+                        )
+                    except OSError:
+                        pass
+                raise
         try:
             self.sync()
         except OSError as exc:
@@ -155,7 +186,9 @@ class HeldDirectory:
         if self.fd is not None and target.fd is not None:
             os.rename(name, target_name, src_dir_fd=self.fd, dst_dir_fd=target.fd)
         else:  # pragma: no cover - exercised on Windows CI
-            windows_move_write_through(self.path / name, target.path / target_name)
+            windows_move_write_through(
+                self.path / name, target.path / target_name, replace=False,
+            )
         try:
             self.sync()
             target.sync()
@@ -166,6 +199,78 @@ class HeldDirectory:
             ) from exc
         self.verify()
         target.verify()
+
+
+class HeldRegularFile:
+    """No-follow regular-file identity guard held while another API reopens the leaf."""
+
+    def __init__(self, parent: HeldDirectory, name: str, mode: int = 0o600) -> None:
+        self.parent, self.name, self.mode = parent, name, mode
+        self.fd: int | None = None
+        self.handle = None
+        self.identity: tuple[int, ...] | None = None
+
+    def __enter__(self) -> "HeldRegularFile":
+        try:
+            if self.parent.fd is not None:
+                self.fd = os.open(
+                    self.name,
+                    os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    self.mode, dir_fd=self.parent.fd,
+                )
+                info = os.fstat(self.fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise WorkspacePathError("workspace database leaf is not a regular file")
+                os.fchmod(self.fd, self.mode)
+                self.identity = (info.st_dev, info.st_ino)
+            else:  # pragma: no cover - exercised on Windows CI
+                self.handle, self.identity = windows_hold_regular_file(
+                    self.parent.path / self.name,
+                )
+            self.verify()
+            return self
+        except BaseException:
+            self.close(strict=False)
+            raise
+
+    def verify(self) -> None:
+        info = self.parent.stat(self.name)
+        if (
+            stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode)
+            or (self.fd is not None and info.st_nlink != 1)
+        ):
+            raise WorkspacePathError("workspace database leaf was replaced or aliased")
+        current = (
+            windows_path_file_identity(self.parent.path / self.name)
+            if self.parent.fd is None else (info.st_dev, info.st_ino)
+        )
+        if current != self.identity:
+            raise WorkspacePathError("workspace database leaf identity changed")
+
+    def open_path(self) -> tuple[Path, bool]:
+        """Path SQLite may reopen plus whether SQLITE_OPEN_NOFOLLOW must be requested."""
+        if self.fd is not None:
+            for root in (Path(f"/proc/self/fd/{self.fd}"), Path(f"/dev/fd/{self.fd}")):
+                if root.exists():
+                    return root, False
+            raise WorkspacePathError("no descriptor filesystem is available for SQLite")
+        return self.parent.path / self.name, True  # pragma: no cover - Windows CI
+
+    def close(self, *, strict: bool = True) -> None:
+        if self.fd is not None:
+            fd, self.fd = self.fd, None
+            try:
+                os.close(fd)
+            except OSError:
+                if strict:
+                    raise
+        if self.handle is not None:  # pragma: no cover - exercised on Windows CI
+            import ctypes
+
+            handle, self.handle = self.handle, None
+            if not windows_kernel32().CloseHandle(handle) and strict:
+                raise ctypes.WinError(ctypes.get_last_error())
 
 
 @contextmanager
@@ -199,13 +304,31 @@ def windows_hold_directory(path: Path):  # pragma: no cover - exercised on Windo
 
     kernel32 = windows_kernel32()
     handle = kernel32.CreateFileW(
-        str(path), 0x40000000 | 0x80, 0x00000001 | 0x00000002,
-        None, 3, 0x02000000 | 0x00200000 | 0x80000000, None,
+        str(path), 0x80, 0x00000001 | 0x00000002,
+        None, 3, 0x02000000 | 0x00200000, None,
     )
     if handle == ctypes.c_void_p(-1).value:
         raise ctypes.WinError(ctypes.get_last_error())
     try:
         identity = windows_directory_identity(handle)
+    except BaseException:
+        kernel32.CloseHandle(handle)
+        raise
+    return handle, identity
+
+
+def windows_hold_regular_file(path: Path):  # pragma: no cover - exercised on Windows CI
+    import ctypes
+
+    kernel32 = windows_kernel32()
+    handle = kernel32.CreateFileW(
+        str(path), 0x80000000 | 0x40000000, 0x00000001 | 0x00000002,
+        None, 4, 0x00200000 | 0x80000000, None,
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        identity = windows_regular_file_identity(handle)
     except BaseException:
         kernel32.CloseHandle(handle)
         raise
@@ -238,10 +361,26 @@ def windows_directory_identity(handle) -> tuple[int, ...]:  # pragma: no cover
     return (info.volume_serial, info.file_index_high, info.file_index_low)
 
 
+def windows_regular_file_identity(handle) -> tuple[int, ...]:  # pragma: no cover
+    identity = windows_directory_identity(handle)
+    return identity
+
+
 def windows_path_identity(path: Path) -> tuple[int, ...]:  # pragma: no cover
     import ctypes
 
     handle, identity = windows_hold_directory(path)
+    try:
+        return identity
+    finally:
+        if not windows_kernel32().CloseHandle(handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+
+def windows_path_file_identity(path: Path) -> tuple[int, ...]:  # pragma: no cover
+    import ctypes
+
+    handle, identity = windows_hold_regular_file(path)
     try:
         return identity
     finally:
@@ -256,24 +395,20 @@ def windows_flush_handle(handle) -> None:  # pragma: no cover
         raise ctypes.WinError(ctypes.get_last_error())
 
 
-def windows_move_write_through(source: Path, target: Path) -> None:  # pragma: no cover
+def windows_move_write_through(
+    source: Path, target: Path, *, replace: bool = False,
+) -> None:  # pragma: no cover
     import ctypes
 
-    if not windows_kernel32().MoveFileExW(str(source), str(target), 0x1 | 0x8):
+    flags = 0x8 | (0x1 if replace else 0)
+    if not windows_kernel32().MoveFileExW(str(source), str(target), flags):
         raise ctypes.WinError(ctypes.get_last_error())
 
 
 def strict_sync_directory(path: Path) -> None:
     if os.name == "nt":  # pragma: no cover - exercised on Windows CI
-        import ctypes
-
-        handle, _identity = windows_hold_directory(path)
-        try:
-            windows_flush_handle(handle)
-        finally:
-            if not windows_kernel32().CloseHandle(handle):
-                raise ctypes.WinError(ctypes.get_last_error())
-        return
+        with HeldDirectory(path):
+            return
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
         os.fsync(fd)
@@ -288,7 +423,7 @@ def sync_dirs(*paths: Path) -> None:
 
 def strict_replace(source: Path, target: Path, *sync_paths: Path) -> None:
     if os.name == "nt":  # pragma: no cover - exercised on Windows CI
-        windows_move_write_through(source, target)
+        windows_move_write_through(source, target, replace=True)
     else:
         os.replace(source, target)
     try:

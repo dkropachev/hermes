@@ -166,8 +166,9 @@ Windows holds reparse-point-safe directory handles without delete sharing, verif
 uses write-through moves. Replacing `workspaces/` or `workspace-quarantine/` during an operation
 therefore fails closed instead of redirecting work outside plugin data.
 The SQLite connection likewise owns a held `plugin-data/<namespace>/` handle for its full lifetime;
-on POSIX the database and WAL/SHM are opened through that descriptor, and on Windows the held
-no-delete-sharing handle prevents parent replacement while SQLite is live.
+on POSIX the main database is pre-opened with `O_NOFOLLOW` and SQLite reopens that held leaf through
+the descriptor filesystem while sidecars remain beneath the held parent. On Windows the held
+no-delete-sharing file and parent handles prevent replacement while SQLite is live.
 
 The lease database upgrades additively. Before backfilling a legacy row's canonical plugin identity,
 Hermes verifies every legacy row already names this plugin namespace and profile, has a valid
@@ -195,8 +196,9 @@ Release and stale-generation reclamation first rename the old directory away fro
 workspace name. That atomic detach prevents delayed cleanup from deleting a successor that has
 already acquired the same `workspace_id`. Hermes treats the filesystem transition as durable only
 after a strict directory-metadata flush succeeds: POSIX uses directory `fsync`; Windows uses
-write-through `MoveFileEx` plus directory handles opened with backup semantics and
-`FlushFileBuffers`. A flush error fails the operation before its success state commits, while the
+write-through `MoveFileEx` namespace transitions (staged creation and tombstoned removal), because
+Windows does not support `FlushFileBuffers` on directory handles. A durability error fails the
+operation before its success state commits, while the
 deterministic detached name lets the same intent reconcile a rename that physically completed.
 If detach itself is refused, or both canonical and planned names exist, release remains durably in
 `releasing`, records the failure, and raises `WorkspacePathError`; clear the filesystem condition
@@ -213,6 +215,9 @@ Hermes removes only work it can prove disposable:
 Cleanup intent and outcomes also enter an append-only, generation-keyed receipt ledger. Its
 deterministic detached names let a retry reconcile a crash after rename but before the lease-row
 transition commits; replacing the current lease row does not erase predecessor receipts.
+Every lease and cleanup plan also persists the data/workspaces/quarantine root file identities.
+A regular-directory replacement therefore fails closed on retry; absence under a replacement root
+is never reinterpreted as successful removal, and the original identity/path remains in the receipt.
 Snapshots include current ownership and timing fields, the canonical path, generation, bounded
 lifecycle events, the latest cleanup receipt, and recent `cleanupReceipts`. Surface quarantine
 receipts to an operator and make retention an explicit plugin policy; do not silently delete
