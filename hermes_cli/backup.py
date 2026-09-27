@@ -270,6 +270,9 @@ def _is_non_regular_path(path: Path) -> bool:
 def _should_exclude(rel_path: Path) -> bool:
     """Return True if *rel_path* (relative to hermes root) should be skipped."""
     parts = rel_path.parts
+    from hermes_cli.plugin_workspace_registry import is_workspace_runtime_path
+    if is_workspace_runtime_path(rel_path):
+        return True
     if _in_excluded_root_dir(rel_path):
         return True
     # ``hermes-agent`` only matches at the root level; nested same-named dirs are preserved.
@@ -286,13 +289,16 @@ def _iter_backup_files(hermes_root: Path, out_path: Path, skipped_dirs: Optional
     excluded tree, the root-only ``hermes-agent`` carve-out, root runtime trees, per-file rules),
     shared by ``hermes backup`` and the pre-update / pre-migration path so they can never drift.
     """
+    from hermes_cli.plugin_workspace_registry import is_workspace_runtime_path
+
     for dirpath, dirnames, filenames in os.walk(hermes_root, followlinks=False):
         rel_dir = Path(dirpath).relative_to(hermes_root)
         is_root = rel_dir == Path(".")
         kept = [
             d for d in dirnames
             if (d not in _EXCLUDED_DIRS or (d == "hermes-agent" and not is_root))
-            and not _in_excluded_root_dir(rel_dir / d)]
+            and not _in_excluded_root_dir(rel_dir / d)
+            and not is_workspace_runtime_path(rel_dir / d)]
         if skipped_dirs is not None:
             skipped_dirs.update(str(rel_dir / d) for d in set(dirnames) - set(kept))
         dirnames[:] = kept
@@ -942,6 +948,10 @@ def _import_members(
             tighten = target.suffix in {".json", ".env", ".conf"} or target.name in _SECRET_FILE_NAMES
         else:
             rel = member[len(prefix):] if prefix and member.startswith(prefix) else member
+            from hermes_cli.plugin_workspace_registry import is_workspace_runtime_path
+            if rel and is_workspace_runtime_path(rel):
+                skipped_runtime.append(rel)
+                continue
             if rel and Path(rel).name in _IMPORT_SKIP_NAMES:  # see ``_IMPORT_SKIP_NAMES``
                 skipped_runtime.append(rel)
                 continue
@@ -1156,12 +1166,18 @@ def create_quick_snapshot(
 def _quick_snapshot_candidates(home: Path):
     """Yield ``(src, rel_posix, in_dir)`` for every regular file a quick snapshot captures; heavy
     regenerable per-board subtrees (workspaces, attachments) are skipped."""
+    from hermes_cli.plugin_workspace_registry import is_workspace_runtime_path
+
     for rel in _QUICK_STATE_FILES:
+        if is_workspace_runtime_path(rel):
+            continue
         src = home / rel
         if src.is_dir():
             for sub in filter(Path.is_file, src.rglob("*")):
                 sub_rel = sub.relative_to(home).as_posix()
-                if "/workspaces/" in f"/{sub_rel}/" or "/attachments/" in f"/{sub_rel}/":
+                if (is_workspace_runtime_path(sub_rel)
+                        or "/workspaces/" in f"/{sub_rel}/"
+                        or "/attachments/" in f"/{sub_rel}/"):
                     continue
                 yield sub, sub_rel, True
         elif src.is_file():

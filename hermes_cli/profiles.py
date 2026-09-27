@@ -100,6 +100,29 @@ def _non_exportable_entries(directory: str, contents: list) -> set:
     return ignored
 
 
+def _workspace_runtime_entries(root_dir: Path, directory: str, contents: list) -> set:
+    """Non-portable workspace lease entries in one ``copytree`` directory.
+
+    Keep this path calculation lexical.  ``Path.resolve()`` follows a Windows junction (or a
+    symlinked directory on platforms where the walker follows it), losing the path's position
+    inside the profile and potentially admitting a reserved ``workspaces/`` child.  copytree's
+    callback receives paths assembled beneath *root_dir*, so ``relpath`` gives the namespace the
+    archive/clone will actually publish.
+    """
+    from hermes_cli.plugin_workspace_registry import is_workspace_runtime_path
+
+    try:
+        relative_dir = Path(os.path.relpath(directory, root_dir))
+    except (OSError, ValueError):
+        return set()
+    if relative_dir.parts and relative_dir.parts[0] == os.pardir:
+        return set()
+    return {
+        name for name in contents
+        if is_workspace_runtime_path(relative_dir / name)
+    }
+
+
 def _clone_all_copytree_ignore(source_dir: Path):
     """copytree ignore for --clone-all: history artifacts for any source, infrastructure
     only when the source is the default profile (see the two exclude sets above)."""
@@ -116,6 +139,7 @@ def _clone_all_copytree_ignore(source_dir: Path):
             # Fail open — better to over-copy than silently drop user data.
             at_root = False
         ignored = _non_exportable_entries(directory, names)
+        ignored.update(_workspace_runtime_entries(source_dir, directory, names))
         if at_root:
             ignored.update(root_exclude & set(names))
         return ignored
@@ -1930,6 +1954,7 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
     def _ignore_credentials(directory: str, contents: list) -> set:
         ignored = _non_exportable_entries(directory, contents)
         ignored.update(_EXPORT_CREDENTIAL_FILES & set(contents))
+        ignored.update(_workspace_runtime_entries(profile_dir, directory, contents))
         return ignored
 
     ignore = _default_export_ignore(profile_dir) if canon == "default" else _ignore_credentials
@@ -1937,7 +1962,11 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
         staged = Path(tmpdir) / canon
         shutil.copytree(profile_dir, staged, symlinks=True, ignore=ignore)
         for rel, content in (extra_files or {}).items():
-            target = staged.joinpath(*normalize_archive_parts(rel))
+            parts = normalize_archive_parts(rel)
+            from hermes_cli.plugin_workspace_registry import is_workspace_runtime_path
+            if is_workspace_runtime_path(Path(*parts)):
+                continue
+            target = staged.joinpath(*parts)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
         _scrub_export_secrets(staged)
@@ -1983,6 +2012,8 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
         if archive_root != canon:
             final_source = staging_root / canon
             extracted.rename(final_source)
+        from hermes_cli.plugin_workspace_registry import strip_workspace_runtime_tree
+        strip_workspace_runtime_tree(final_source)
         shutil.move(str(final_source), str(profile_dir))
     return profile_dir
 

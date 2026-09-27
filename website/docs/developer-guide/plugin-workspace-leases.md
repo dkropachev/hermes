@@ -131,14 +131,19 @@ path from a handle or accept a caller-provided substitute.
 
 ## Paths, profiles, and permissions
 
-Hermes allocates workspaces under the active profile's plugin-data directory:
+Hermes keeps public workspace names under plugin data, but stores ownership state in a
+host-private registry directly below the profile root:
 
 ```text
-$HERMES_HOME/plugin-data/<plugin-namespace>/
-├── workspace-leases.db
-├── workspaces/
-│   └── <workspace-id>/
-└── workspace-quarantine/
+$HERMES_HOME/
+├── .plugin-workspace-roots-v1.json
+├── .plugin-workspace-roots.lock
+├── .plugin-workspace-leases/
+│   ├── .plugin-binding-<identity>.json
+│   └── plugin-<identity>/workspace-leases.db
+└── plugin-data/<plugin-namespace>/
+    ├── workspaces/<workspace-id>/
+    └── workspace-quarantine/
 ```
 
 For PR Review, a run named `run-01` is therefore exactly:
@@ -147,34 +152,61 @@ For PR Review, a run named `run-01` is therefore exactly:
 $HERMES_HOME/plugin-data/pr-review/workspaces/run-01
 ```
 
-Runtime data never belongs in an installed plugin directory. The facade remains bound to the
+Runtime data never belongs in an installed plugin directory. An outer marker binds the private
+registry and public plugin-data roots. A final per-plugin binding, published only after an empty
+initialized database and empty roots exist, binds the database, namespace, and workspace roots;
+its public mirror supports fail-closed recovery. Removing or replacing a bound subtree cannot
+reset a live lease to a new generation-1 database.
+
+The facade remains bound to the
 `PluginContext` profile that created it even if a multiplexed process later changes ambient profile
-scope. Plugin namespaces isolate unrelated plugins, while profile paths isolate tenants.
+scope. A random stable profile identity plus relative persisted locators lets supported
+same-filesystem profile renames retain handles and operation replays. Plugin namespaces isolate
+unrelated plugins, while profile roots isolate tenants.
 The `agent-plugin-*` and host-generated `hermes-native-*` families are reserved. A native plugin
 whose literal ID uses either prefix is hashed again into a distinct namespace, and every lease also
 persists an independent canonical plugin-identity digest. The native ID `pr-review` keeps the exact
 readable path shown above.
 
 On POSIX hosts Hermes enforces mode `0700` on host-owned data/workspace directories and `0600` on
-the lease database. It rejects symlinked or aliased namespace, workspace, and database paths rather
-than following them. The lease service creates an empty directory; cloning or otherwise
+markers, the lock, database, and SQLite auxiliaries. On Windows it uses a protected
+owner-and-SYSTEM-only DACL and 128-bit file IDs. It rejects symlinks, junctions, hard links, and
+aliased namespace, workspace, marker, database, and auxiliary paths rather than following them.
+Every generation also persists the workspace leaf identity, so replacement by another regular
+directory is fenced. The lease service creates an empty directory; cloning or otherwise
 materializing repository content remains the plugin's responsibility.
 
 Filesystem mutations are relative to verified parent handles held through mutation and strict
 metadata flush. POSIX uses `O_DIRECTORY | O_NOFOLLOW` descriptors plus `dir_fd` rename/mkdir/stat;
 Windows holds reparse-point-safe directory handles without delete sharing, verifies file IDs, and
-uses write-through moves. Replacing `workspaces/` or `workspace-quarantine/` during an operation
+requests write-through moves. That request plus identity-based recovery is the strongest portable
+boundary here; it is not documented as a directory-`fsync` equivalent. Replacing `workspaces/` or
+`workspace-quarantine/` during an operation
 therefore fails closed instead of redirecting work outside plugin data.
-The SQLite connection likewise owns a held `plugin-data/<namespace>/` handle for its full lifetime;
-on POSIX the main database is pre-opened with `O_NOFOLLOW` and SQLite reopens that held leaf through
-the descriptor filesystem while sidecars remain beneath the held parent. On Windows the held
-no-delete-sharing file and parent handles prevent replacement while SQLite is live.
+The SQLite connection owns the bootstrap lock and authenticated root chain for its full lifetime.
+On POSIX the main database is pre-opened with `O_NOFOLLOW` and SQLite reopens that held leaf through
+the descriptor filesystem. Hermes validates the main file plus `-wal`, `-shm`, and `-journal`
+before and after use; Windows no-delete-sharing handles prevent replacement while SQLite is live.
+The connection denies `ATTACH` and `DETACH`.
 
-The lease database upgrades additively. Before backfilling a legacy row's canonical plugin identity,
-Hermes verifies every legacy row already names this plugin namespace and profile, has a valid
-workspace ID, and stores the exact canonical path beneath this plugin's `workspaces/` directory.
-Any conflicting or malformed row aborts the upgrade without claiming it; operator repair is
-required rather than guessing ownership.
+The lease schema upgrades additively inside the authenticated registry. A legacy public
+`plugin-data/<namespace>/workspace-leases.db` or any auxiliary name is refused before markers or
+private state are created. Stop possible old writers and perform an explicit offline migration;
+never delete or guess ownership. Conflicting or malformed private rows also abort without being
+claimed.
+
+Lease markers, the registry, legacy lease database names, and active/quarantined workspace trees
+are non-portable ownership artifacts. Clone-all, profile export/import, full backup/import, and
+quick snapshots exclude them while preserving ordinary plugin data. Preserve important active or
+quarantined work separately before those operations.
+
+:::caution Trusted host boundary
+The registry is trusted host-private state. Workspace-bound dispatch must never expose it to a
+plugin job; that confinement is the separate H2 capability. Arbitrary uncooperative same-user
+mutation of canonical `HERMES_HOME` itself is equivalent to replacing the trusted profile root and
+is outside this lifecycle contract. Cooperative lifecycle processes serialize on the bound OS
+lock; public plugin-data paths remain treated as replaceable and hostile.
+:::
 
 ## Cleanup and recovery
 
@@ -195,7 +227,7 @@ generation, rotates the handle, and fences the predecessor.
 Release and stale-generation reclamation first rename the old directory away from its public
 workspace name. That atomic detach prevents delayed cleanup from deleting a successor that has
 already acquired the same `workspace_id`. Hermes treats the filesystem transition as durable only
-after a strict directory-metadata flush succeeds: POSIX uses directory `fsync`; Windows uses
+after a strict directory-metadata flush succeeds: POSIX uses directory `fsync`; Windows requests
 write-through `MoveFileEx` namespace transitions (staged creation and tombstoned removal), because
 Windows does not support `FlushFileBuffers` on directory handles. A durability error fails the
 operation before its success state commits, while the

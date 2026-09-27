@@ -13,7 +13,6 @@ import hmac
 import json
 import math
 import os
-import re
 import secrets
 import socket
 import sqlite3
@@ -34,56 +33,69 @@ from hermes_cli.plugin_workspace_errors import (
     WorkspaceLeaseError, WorkspaceLeaseExpiredError, WorkspaceOwnershipError,
     WorkspacePathError,
 )
+from hermes_cli.plugin_workspace_contract import (
+    DEFAULT_TTL_SECONDS, HANDLE_VERSION, MAX_TTL_SECONDS, MIN_TTL_SECONDS,
+    capability_hash as _capability_hash, handle as _handle, intent as _intent,
+    native_hashed_namespace as _native_hashed_namespace,
+    operation_fingerprint as _operation_fingerprint, parse_handle as _parse_handle,
+    parse_intent as _parse_intent, plugin_identity as _plugin_identity,
+    plugin_namespace as _plugin_namespace, ttl as _ttl,
+    validate_operation as _validate_operation,
+    validated_workspace_id as _validated_workspace_id,
+)
+from hermes_cli.plugin_workspace_cleanup import (
+    classify_workspace as _classify_workspace, planned_name as _planned_detached_name,
+    render_cleanup_paths as _cleanup_paths,
+)
 from hermes_cli.plugin_workspace_fs import (
     HeldDirectory as _HeldDirectory, HeldRegularFile as _HeldRegularFile,
-    safe_child as _safe_child,
-    workspace_roots as _workspace_roots,
 )
-from hermes_cli.plugins_manifest import _portable_skill_namespace
+from hermes_cli.plugin_workspace_registry import (
+    OUTER_MARKER_NAME, inner_marker_name, open_storage_anchors,
+    registry_binding_name, registry_paths,
+)
 from hermes_cli.process_identity import _pid_alive_matches, _process_create_time
 from hermes_cli.sqlite_util import add_column_if_missing, transaction
 
 
 HOST_FEATURE = "workspace_leases.v1"
-HANDLE_VERSION = 1
-DEFAULT_TTL_SECONDS = 300.0
-MIN_TTL_SECONDS = 1.0
-MAX_TTL_SECONDS = 24 * 60 * 60.0
-
-_WORKSPACE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
-_PLUGIN_NAMESPACE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
-_WINDOWS_RESERVED = {
-    "con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)),
-    *(f"lpt{i}" for i in range(1, 10)),
-}
 _WORKSPACE_LOCKS: dict[str, threading.RLock] = {}
 _WORKSPACE_LOCKS_GUARD = threading.Lock()
 _PROCESS_OBSERVER_NONCE = secrets.token_hex(16)
 
 
-@dataclass(frozen=True)
+@dataclass
 class _Layout:
     home: Path
     profile_key: str
     plugin_namespace: str
     plugin_identity: str
+    plugin_data_dir: Path
     data_dir: Path
+    registry_root: Path
+    registry_dir: Path
     workspaces_dir: Path
     quarantine_dir: Path
     db_path: Path
+    outer_marker_path: Path
+    inner_marker_path: Path
+    registry_binding_path: Path
 
 
 class _AnchoredConnection:
     """SQLite connection retaining the held data root and no-follow DB leaf until close."""
 
-    def __init__(self, conn, held_data: _HeldDirectory, held_db: _HeldRegularFile,
-                 held_roots_cm) -> None:
+    def __init__(self, conn, anchors, held_db: _HeldRegularFile, close_validator) -> None:
         self._conn = conn
-        self._held_data = held_data
+        self._anchors = anchors
         self._held_db = held_db
-        self._held_roots_cm = held_roots_cm
-        self.storage_data_identity = held_data.identity_json()
+        self._close_validator = close_validator
+        self.storage_data_identity = anchors.data.identity_json()
         self.storage_db_identity = [int(part) for part in held_db.identity]
+        self.storage_roots = (anchors.workspaces, anchors.quarantine)
+        self.storage_root_identities = anchors.identities()
+        self.workspace_base = anchors.layout.workspaces_dir
+        self.layout = anchors.layout
 
     def __getattr__(self, name):
         return getattr(self._conn, name)
@@ -96,111 +108,23 @@ class _AnchoredConnection:
         return self._conn.__exit__(exc_type, exc, tb)
 
     def close(self) -> None:
+        failure = None
         try:
             self._conn.close()
+        except BaseException as exc:
+            failure = exc
+        try:
+            self._close_validator()
+        except BaseException as exc:
+            if failure is None:
+                failure = exc
         finally:
             try:
                 self._held_db.close()
             finally:
-                try:
-                    self._held_roots_cm.__exit__(None, None, None)
-                finally:
-                    self._held_data.__exit__(None, None, None)
-
-
-def _native_hashed_namespace(plugin_id: str) -> str:
-    slug = "".join(
-        ch if ch.isascii() and (ch.isalnum() or ch in "_-") else "-"
-        for ch in plugin_id.casefold()
-    ).strip("-_") or "plugin"
-    digest = hashlib.sha256(plugin_id.encode("utf-8")).hexdigest()[:12]
-    return f"hermes-native-{slug[:96]}-{digest}"
-
-
-def _plugin_namespace(plugin_id: str, skill_namespace: str) -> str:
-    if skill_namespace:
-        # Portable namespaces are host-generated, collision-resistant, and intentionally use the
-        # reserved agent-plugin-* family. Malformed callers get a freshly generated portable name.
-        return (
-            skill_namespace
-            if skill_namespace.startswith("agent-plugin-")
-            and _PLUGIN_NAMESPACE_RE.fullmatch(skill_namespace)
-            and ".." not in skill_namespace
-            and not skill_namespace.endswith(".")
-            else _portable_skill_namespace(plugin_id)
-        )
-    candidate = plugin_id
-    folded = candidate.casefold()
-    if (
-        candidate == folded
-        and _PLUGIN_NAMESPACE_RE.fullmatch(candidate)
-        and ".." not in candidate
-        and not candidate.endswith(".")
-        and candidate.split(".", 1)[0] not in _WINDOWS_RESERVED
-        and not candidate.startswith(("agent-plugin-", "hermes-native-"))
-    ):
-        return candidate
-    return _native_hashed_namespace(candidate)
-
-
-def _plugin_identity(plugin_id: str, skill_namespace: str) -> str:
-    kind = "portable" if skill_namespace else "native"
-    material = json.dumps(
-        [kind, plugin_id, skill_namespace], ensure_ascii=True, separators=(",", ":"),
-    )
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()
-
-
-def _validated_workspace_id(workspace_id: str) -> str:
-    if (
-        not isinstance(workspace_id, str)
-        or not _WORKSPACE_ID_RE.fullmatch(workspace_id)
-        or ".." in workspace_id
-        or workspace_id.endswith(".")
-        or workspace_id.split(".", 1)[0] in _WINDOWS_RESERVED
-    ):
-        raise ValueError(
-            "workspace_id must be 1-128 lowercase ASCII letters, numbers, '.', '_', or '-' "
-            "(without '..', a trailing '.', or a reserved device name)"
-        )
-    return workspace_id
-
-
-def _ttl(value: Any) -> float:
-    try:
-        ttl = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("ttl_seconds must be a finite number from 1 through 86400") from exc
-    if not math.isfinite(ttl) or not MIN_TTL_SECONDS <= ttl <= MAX_TTL_SECONDS:
-        raise ValueError("ttl_seconds must be a finite number from 1 through 86400")
-    return ttl
-
-
-def _intent() -> dict[str, Any]:
-    return {
-        "contract_version": HANDLE_VERSION,
-        "operation_id": str(uuid.uuid4()),
-        "capability": secrets.token_urlsafe(32),
-    }
-
-
-def _parse_intent(intent: Mapping[str, Any]) -> tuple[str, str]:
-    if not isinstance(intent, Mapping) or set(intent) != {
-        "contract_version", "operation_id", "capability",
-    }:
-        raise InvalidWorkspaceHandleError("malformed workspace operation intent")
-    if intent.get("contract_version") != HANDLE_VERSION:
-        raise InvalidWorkspaceHandleError("unsupported workspace operation intent version")
-    operation_id, capability = intent.get("operation_id"), intent.get("capability")
-    try:
-        parsed = uuid.UUID(str(operation_id))
-    except (ValueError, AttributeError, TypeError) as exc:
-        raise InvalidWorkspaceHandleError("malformed workspace operation intent") from exc
-    if str(parsed) != str(operation_id) or not isinstance(capability, str) or not 32 <= len(
-        capability
-    ) <= 256:
-        raise InvalidWorkspaceHandleError("malformed workspace operation intent")
-    return str(operation_id), capability
+                self._anchors.__exit__(None, None, None)
+        if failure is not None:
+            raise failure
 
 
 @contextmanager
@@ -221,20 +145,32 @@ def _layout(plugin_id: str, skill_namespace: str, home_path: Path | None = None)
         raise WorkspacePathError(f"cannot resolve HERMES_HOME {raw_home}: {exc}") from exc
     namespace = _plugin_namespace(plugin_id, skill_namespace)
     identity = _plugin_identity(plugin_id, skill_namespace)
-    plugin_data = _safe_child(home, "plugin-data")
-    data_dir = _safe_child(plugin_data, namespace)
-    workspaces = _safe_child(data_dir, "workspaces")
-    quarantine = _safe_child(data_dir, "workspace-quarantine")
-    return _Layout(
+    plugin_data = home / "plugin-data"
+    data_dir = plugin_data / namespace
+    registry_root, registry_dir, db_path = registry_paths(home, identity)
+    layout = _Layout(
         home=home,
         profile_key=hermes_home_key(home),
         plugin_namespace=namespace,
         plugin_identity=identity,
+        plugin_data_dir=plugin_data,
         data_dir=data_dir,
-        workspaces_dir=workspaces,
-        quarantine_dir=quarantine,
-        db_path=data_dir / "workspace-leases.db",
+        registry_root=registry_root,
+        registry_dir=registry_dir,
+        workspaces_dir=data_dir / "workspaces",
+        quarantine_dir=data_dir / "workspace-quarantine",
+        db_path=db_path,
+        outer_marker_path=home / OUTER_MARKER_NAME,
+        inner_marker_path=plugin_data / inner_marker_name(identity),
+        registry_binding_path=registry_root / registry_binding_name(identity),
     )
+    return layout
+
+
+@contextmanager
+def _workspace_roots(layout: _Layout):
+    with open_storage_anchors(layout, include_roots=True, publish=False) as anchors:
+        yield anchors.workspaces, anchors.quarantine
 
 
 def _validate_legacy_rows(conn, layout: _Layout) -> None:
@@ -250,12 +186,13 @@ def _validate_legacy_rows(conn, layout: _Layout) -> None:
         except ValueError:
             invalid.append(f"workspace_id={workspace_id!r}")
             continue
-        expected_path = str(layout.workspaces_dir / workspace_id)
+        expected_path = f"workspaces/{workspace_id}"
+        legacy_path = str(layout.workspaces_dir / workspace_id)
         identity = row["plugin_identity"]
         if (
             row["plugin_namespace"] != layout.plugin_namespace
-            or row["profile_key"] != layout.profile_key
-            or row["workspace_path"] != expected_path
+            or row["profile_key"] not in (layout.profile_key, hermes_home_key(layout.home))
+            or row["workspace_path"] not in (expected_path, legacy_path)
             or identity not in (None, layout.plugin_identity)
         ):
             invalid.append(f"workspace_id={workspace_id!r}")
@@ -265,8 +202,9 @@ def _validate_legacy_rows(conn, layout: _Layout) -> None:
             f"plugin/profile/layout: {', '.join(invalid[:5])}"
         )
     conn.execute(
-        "UPDATE workspace_leases SET plugin_identity=? WHERE plugin_identity IS NULL",
-        (layout.plugin_identity,),
+        """UPDATE workspace_leases SET plugin_identity=COALESCE(plugin_identity, ?),
+           profile_key=?, workspace_path='workspaces/' || workspace_id""",
+        (layout.plugin_identity, layout.profile_key),
     )
 
 
@@ -300,6 +238,7 @@ def _initialize(conn, layout: _Layout, root_identities: Mapping[str, Any]) -> No
             generation INTEGER NOT NULL,
             acquire_intent_id TEXT,
             root_identities_json TEXT,
+            workspace_identity_json TEXT,
             cleanup_json TEXT,
             updated_at REAL NOT NULL
         );
@@ -353,6 +292,7 @@ def _initialize(conn, layout: _Layout, root_identities: Mapping[str, Any]) -> No
             "owner_machine_identity": "owner_machine_identity TEXT",
             "acquire_intent_id": "acquire_intent_id TEXT",
             "root_identities_json": "root_identities_json TEXT",
+            "workspace_identity_json": "workspace_identity_json TEXT",
             "heartbeat_monotonic": "heartbeat_monotonic REAL",
             "expires_monotonic": "expires_monotonic REAL",
             "expiry_observer": "expiry_observer TEXT",
@@ -362,12 +302,47 @@ def _initialize(conn, layout: _Layout, root_identities: Mapping[str, Any]) -> No
             if column not in columns:
                 add_column_if_missing(conn, "workspace_leases", column, ddl)
         _validate_legacy_rows(conn, layout)
+        for operation in conn.execute(
+            """SELECT operation_id, kind, workspace_id, ttl_seconds, input_lease_id
+               FROM workspace_lease_operations"""
+        ).fetchall():
+            conn.execute(
+                """UPDATE workspace_lease_operations SET request_fingerprint=?
+                   WHERE operation_id=?""",
+                (
+                    _operation_fingerprint(
+                        layout, operation["kind"], operation["workspace_id"],
+                        float(operation["ttl_seconds"]), operation["input_lease_id"],
+                    ),
+                    operation["operation_id"],
+                ),
+            )
         legacy_roots = json.dumps(dict(root_identities), sort_keys=True)
         conn.execute(
             """UPDATE workspace_leases SET root_identities_json=?
                WHERE root_identities_json IS NULL""",
             (legacy_roots,),
         )
+        legacy_leaves = conn.execute(
+            """SELECT workspace_id, state FROM workspace_leases
+               WHERE workspace_identity_json IS NULL AND state='active'"""
+        ).fetchall()
+        for legacy in legacy_leaves:
+            workspace_id = str(legacy["workspace_id"])
+            if not conn.storage_roots[0].exists(workspace_id):
+                if legacy["state"] == "active":
+                    raise WorkspacePathError(
+                        f"active legacy workspace path is missing: {workspace_id}"
+                    )
+                continue
+            identity = _validate_workspace_entry(
+                layout, workspace_id, conn.storage_roots[0],
+            )
+            conn.execute(
+                """UPDATE workspace_leases SET workspace_identity_json=?
+                   WHERE workspace_id=? AND workspace_identity_json IS NULL""",
+                (json.dumps(identity), workspace_id),
+            )
         conn.execute(
             """CREATE UNIQUE INDEX IF NOT EXISTS workspace_lease_acquire_intent
                ON workspace_leases(acquire_intent_id)"""
@@ -405,36 +380,113 @@ def _preflight_existing_root_identities(conn, current: Mapping[str, Any]) -> Non
 
 
 def _connect(layout: _Layout):
-    sidecar_names = ("workspace-leases.db", "workspace-leases.db-wal", "workspace-leases.db-shm")
-    held_data = _HeldDirectory(layout.data_dir)
-    held_data.__enter__()
-    held_roots_cm = _workspace_roots(layout)
-    held_roots = held_roots_cm.__enter__()
-    held_db = _HeldRegularFile(held_data, "workspace-leases.db")
-    try:
-        for name in sidecar_names:
+    database_names = (
+        "workspace-leases.db", "workspace-leases.db-wal",
+        "workspace-leases.db-shm", "workspace-leases.db-journal",
+    )
+    anchors_cm = open_storage_anchors(layout, include_roots=False, publish=False)
+    anchors = anchors_cm.__enter__()
+    held_db = _HeldRegularFile(
+        anchors.registry_namespace, "workspace-leases.db",
+        create=anchors.binding_missing,
+    )
+
+    def validate_database_files(*, secure_modes: bool) -> None:
+        for name in database_names:
             try:
-                info = held_data.stat(name)
+                info = anchors.registry_namespace.stat(name)
             except FileNotFoundError:
                 continue
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                 raise WorkspacePathError(
-                    f"workspace lease database sidecar is unsafe: {layout.data_dir / name}"
+                    f"workspace lease database file is unsafe: {layout.registry_dir / name}"
                 )
+            if os.name == "nt":  # pragma: no cover - exercised on Windows CI
+                anchors.registry_namespace.secure_regular_file(
+                    name, writable=True,
+                )
+            elif secure_modes:
+                anchors.registry_namespace.chmod(name, 0o600)
+        anchors.home.verify()
+        anchors.plugin_data.verify()
+        anchors.data.verify()
+        anchors.registry.verify()
+        anchors.registry_namespace.verify()
+
+    try:
+        validate_database_files(secure_modes=False)
+        if anchors.binding_missing:
+            unexpected = set(anchors.registry_namespace.list_names()) - set(database_names)
+            if unexpected:
+                raise WorkspacePathError(
+                    "unbound workspace registry namespace contains unexpected state: "
+                    + ", ".join(sorted(unexpected)[:5])
+                )
+        if anchors.outer_missing:
+            existing = [
+                name for name in database_names if anchors.registry_namespace.exists(name)
+            ]
+            if existing:
+                raise WorkspacePathError(
+                    "unbound workspace registry database requires offline operator recovery; "
+                    f"refusing to open while present: {', '.join(existing)}"
+                )
+        if anchors.outer_missing:
+            anchors.publish_outer()
+        anchors.ensure_roots()
+        if anchors.binding_missing and (
+            anchors.workspaces.list_names() or anchors.quarantine.list_names()
+        ):
+            raise WorkspacePathError(
+                "unbound workspace registry roots are nonempty; "
+                "offline operator recovery is required"
+            )
+        if not anchors.binding_missing and not anchors.registry_namespace.exists(
+            "workspace-leases.db"
+        ):
+            raise WorkspacePathError("workspace registry bound database is missing")
         held_db.__enter__()
+        expected_database_identity = anchors.expected_database_identity()
+        if expected_database_identity is not None and (
+            expected_database_identity != [int(part) for part in held_db.identity]
+        ):
+            raise WorkspacePathError("workspace registry ready database identity changed")
 
         db_open_path, _nofollow = held_db.open_path()
         raw_conn = sqlite3.connect(db_open_path, timeout=5.0)
         raw_conn.row_factory = sqlite3.Row
         raw_conn.execute("PRAGMA busy_timeout=5000")
+        raw_conn.set_authorizer(
+            lambda action, _arg1, _arg2, _db, _source: (
+                sqlite3.SQLITE_DENY
+                if action in (sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH)
+                else sqlite3.SQLITE_OK
+            )
+        )
+        if anchors.binding_missing:
+            known_tables = {
+                "workspace_leases", "workspace_lease_events",
+                "workspace_cleanup_receipts", "workspace_lease_operations",
+            }
+            existing_tables = {
+                str(row[0]) for row in raw_conn.execute(
+                    """SELECT name FROM sqlite_master
+                       WHERE type='table' AND name NOT LIKE 'sqlite_%'"""
+                )
+            }
+            if existing_tables - known_tables or any(
+                raw_conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
+                for table in existing_tables
+            ):
+                raise WorkspacePathError(
+                    "unbound workspace registry database contains state; "
+                    "offline operator recovery is required"
+                )
         held_db.verify()
-        conn = _AnchoredConnection(raw_conn, held_data, held_db, held_roots_cm)
-        conn.storage_root_identities = {
-            "version": 1,
-            "data": held_data.identity_json(),
-            "workspaces": held_roots[0].identity_json(),
-            "quarantine": held_roots[1].identity_json(),
-        }
+        conn = _AnchoredConnection(
+            raw_conn, anchors_cm, held_db,
+            lambda: (validate_database_files(secure_modes=True), held_db.verify()),
+        )
         _preflight_existing_root_identities(conn, conn.storage_root_identities)
         from hermes_state_wal import apply_wal_with_fallback
 
@@ -451,16 +503,11 @@ def _connect(layout: _Layout):
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA synchronous=FULL")
         _initialize(conn, layout, conn.storage_root_identities)
-        held_data.verify()
-        if os.name != "nt":
-            for name in sidecar_names:
-                if held_data.exists(name):
-                    if not held_data.is_regular_file(name):
-                        raise WorkspacePathError(
-                            f"workspace lease database sidecar is unsafe: {layout.data_dir / name}"
-                        )
-                    held_data.chmod(name, 0o600)
-        held_data.verify()
+        if anchors.binding_missing:
+            anchors.commit_binding([int(part) for part in held_db.identity])
+        elif anchors.inner_missing:
+            anchors.commit_binding([int(part) for part in held_db.identity])
+        validate_database_files(secure_modes=True)
         held_db.verify()
         return conn
     except BaseException:
@@ -470,8 +517,7 @@ def _connect(layout: _Layout):
             if "raw_conn" in locals():
                 raw_conn.close()
             held_db.close(strict=False)
-            held_roots_cm.__exit__(*sys.exc_info())
-            held_data.__exit__(*sys.exc_info())
+            anchors_cm.__exit__(*sys.exc_info())
         raise
 
 
@@ -650,66 +696,9 @@ def _lease_expired(conn, row: Mapping[str, Any]) -> bool:
     return now - float(observed_at) >= float(row["ttl_seconds"])
 
 
-def _handle(lease_id: str, capability: str) -> dict[str, Any]:
-    return {"contract_version": HANDLE_VERSION, "lease_id": lease_id, "capability": capability}
-
-
 def _response_handle(lease_id: str, capability: str) -> dict[str, Any]:
     """Response boundary kept separate so crash-after-commit behavior is fault-testable."""
     return _handle(lease_id, capability)
-
-
-def _parse_handle(handle: Mapping[str, Any]) -> tuple[str, str]:
-    if not isinstance(handle, Mapping) or set(handle) != {"contract_version", "lease_id", "capability"}:
-        raise InvalidWorkspaceHandleError("malformed workspace lease handle")
-    if handle.get("contract_version") != HANDLE_VERSION:
-        raise InvalidWorkspaceHandleError("unsupported workspace lease handle version")
-    lease_id, capability = handle.get("lease_id"), handle.get("capability")
-    try:
-        uuid.UUID(str(lease_id))
-    except (ValueError, AttributeError, TypeError) as exc:
-        raise InvalidWorkspaceHandleError("malformed workspace lease handle") from exc
-    if not isinstance(capability, str) or not 32 <= len(capability) <= 256:
-        raise InvalidWorkspaceHandleError("malformed workspace lease handle")
-    return str(lease_id), capability
-
-
-def _capability_hash(capability: str) -> str:
-    return hashlib.sha256(capability.encode("utf-8")).hexdigest()
-
-
-def _operation_fingerprint(
-    layout: _Layout, kind: str, workspace_id: str, ttl: float,
-    input_lease_id: str | None = None,
-) -> str:
-    encoded = json.dumps(
-        [
-            kind, layout.plugin_identity, layout.profile_key, workspace_id,
-            float(ttl), input_lease_id,
-        ],
-        ensure_ascii=True, separators=(",", ":"),
-    )
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-
-def _validate_operation(
-    row: Mapping[str, Any], *, kind: str, workspace_id: str, fingerprint: str,
-    output_capability_hash: str, input_lease_id: str | None = None,
-    input_capability_hash: str | None = None,
-) -> None:
-    valid = (
-        row["kind"] == kind
-        and row["workspace_id"] == workspace_id
-        and hmac.compare_digest(row["request_fingerprint"], fingerprint)
-        and hmac.compare_digest(row["output_capability_hash"], output_capability_hash)
-        and row["input_lease_id"] == input_lease_id
-    )
-    if input_capability_hash is not None:
-        valid = valid and row["input_capability_hash"] is not None and hmac.compare_digest(
-            row["input_capability_hash"], input_capability_hash,
-        )
-    if not valid:
-        raise InvalidWorkspaceHandleError("workspace operation intent does not match its request")
 
 
 def _supersede_lease_operations(conn, lease_id: str, now: float) -> None:
@@ -733,41 +722,45 @@ def _validated_row(
         or row["profile_key"] != layout.profile_key
     ):
         raise InvalidWorkspaceHandleError("workspace lease handle belongs to another plugin or profile")
-    expected = layout.workspaces_dir / str(row["workspace_id"])
-    if os.path.normcase(str(expected)) != os.path.normcase(str(row["workspace_path"])):
+    expected = f"workspaces/{row['workspace_id']}"
+    if row["workspace_path"] != expected:
         raise InvalidWorkspaceHandleError("workspace lease has an invalid persisted path")
     if validate_path:
-        _validate_workspace_entry(layout, str(row["workspace_id"]))
+        _validate_workspace_entry(
+            layout, str(row["workspace_id"]), conn.storage_roots[0],
+            row["workspace_identity_json"],
+        )
     _validate_row_roots(row, layout, current_identities=conn.storage_root_identities)
     return row
 
 
-def _validate_workspace_path(expected: Path) -> None:
+def _validate_workspace_entry(
+    layout: _Layout, workspace_id: str, workspaces: _HeldDirectory,
+    expected_identity_json: str | None = None,
+) -> list[int]:
     try:
-        info = expected.lstat()
-        resolved = expected.resolve(strict=True)
+        info = workspaces.stat(workspace_id)
     except OSError as exc:
-        raise WorkspacePathError(f"workspace path is unavailable: {expected}") from exc
+        raise WorkspacePathError(
+            f"workspace path is unavailable: {layout.workspaces_dir / workspace_id}"
+        ) from exc
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-        raise WorkspacePathError(f"workspace path is not a regular directory: {expected}")
-    if os.path.normcase(str(resolved)) != os.path.normcase(str(expected.absolute())):
-        raise WorkspacePathError(f"workspace path resolves through an alias: {expected}")
-
-
-def _validate_workspace_entry(layout: _Layout, workspace_id: str) -> None:
-    with _HeldDirectory(layout.workspaces_dir) as workspaces:
+        raise WorkspacePathError(
+            f"workspace path is not a regular directory: "
+            f"{layout.workspaces_dir / workspace_id}"
+        )
+    with workspaces.child_directory(workspace_id) as workspace:
+        identity = workspace.identity_json()
+    if expected_identity_json is not None:
         try:
-            info = workspaces.stat(workspace_id)
-        except OSError as exc:
-            raise WorkspacePathError(
-                f"workspace path is unavailable: {layout.workspaces_dir / workspace_id}"
-            ) from exc
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-            raise WorkspacePathError(
-                f"workspace path is not a regular directory: "
-                f"{layout.workspaces_dir / workspace_id}"
-            )
-        workspaces.verify()
+            expected_identity = json.loads(expected_identity_json)
+        except (TypeError, ValueError) as exc:
+            raise WorkspacePathError("workspace leaf identity is malformed") from exc
+        if identity != expected_identity:
+            raise WorkspacePathError("workspace leaf identity changed")
+    workspace.harden_security()
+    workspaces.verify()
+    return identity
 
 
 def _event(conn, row: Mapping[str, Any], event_type: str, details: Mapping[str, Any] | None = None) -> None:
@@ -812,7 +805,12 @@ def _cleanup_history(conn, workspace_id: str) -> list[dict[str, Any]]:
         {
             "leaseId": row["lease_id"], "generation": int(row["generation"]),
             "operation": row["operation"], "phase": row["phase"],
-            "at": float(row["recorded_at"]), "details": json.loads(row["details_json"]),
+            "at": float(row["recorded_at"]),
+            "details": _cleanup_paths(
+                conn.layout, workspace_id, json.loads(row["details_json"]),
+                lease_id=str(row["lease_id"]), generation=int(row["generation"]),
+                operation=str(row["operation"]),
+            ),
         }
         for row in reversed(rows)
     ]
@@ -831,114 +829,45 @@ def _event_history(conn, workspace_id: str) -> list[dict[str, Any]]:
             "type": row["event_type"], "at": float(row["occurred_at"]),
             "leaseId": row["lease_id"], "generation": int(row["generation"]),
             "actorPid": int(row["actor_pid"]), "actorCreateTime": row["actor_create_time"],
-            "details": json.loads(row["details_json"]),
+            "details": _cleanup_paths(
+                conn.layout, workspace_id, json.loads(row["details_json"]),
+                lease_id=str(row["lease_id"]), generation=int(row["generation"]),
+            ),
         }
         for row in reversed(rows)
     ]
 
 
-def _git(workspace: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    allowed = ("PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC", "TMPDIR", "TEMP", "TMP")
-    env = {key: os.environ[key] for key in allowed if key in os.environ}
-    env.update({"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1", "LC_ALL": "C"})
-    pass_fds: tuple[int, ...] = ()
-    if os.name != "nt":
-        match = re.match(r"^/(?:proc/self|dev)/fd/(\d+)(?:/|$)", str(workspace))
-        if match:
-            pass_fds = (int(match.group(1)),)
-    return subprocess.run(
-        ["git", "-c", "core.fsmonitor=false", "-C", str(workspace), *args],
-        capture_output=True, text=True,
-        encoding="utf-8", errors="replace", timeout=5, env=env, check=False,
-        pass_fds=pass_fds,
-    )
-
-
-def _classify_workspace(path: Path) -> dict[str, Any]:
-    checked_at = time.time()
-    if path.is_symlink():
-        return {"classification": "symlink", "safe_to_delete": False, "checked_at": checked_at}
-    if not path.exists():
-        return {"classification": "missing", "safe_to_delete": True, "checked_at": checked_at}
-    if not path.is_dir():
-        if not path.exists():
-            return {"classification": "missing", "safe_to_delete": True, "checked_at": checked_at}
-        return {"classification": "non_directory", "safe_to_delete": False, "checked_at": checked_at}
-    try:
-        if next(path.iterdir(), None) is None:
-            return {"classification": "clean_empty", "safe_to_delete": True, "checked_at": checked_at}
-        status = _git(
-            path, "status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching",
-        )
-        if status.returncode != 0:
-            return {
-                "classification": "uncertain", "safe_to_delete": False,
-                "checked_at": checked_at, "reason": "git_status_failed",
-            }
-        lines = [line for line in status.stdout.splitlines() if line]
-        if lines:
-            untracked = any(line.startswith("??") for line in lines)
-            ignored = any(line.startswith("!!") for line in lines)
-            tracked = any(not line.startswith(("??", "!!")) for line in lines)
-            classification = "dirty" if tracked else "untracked" if untracked else "ignored"
-            return {
-                "classification": classification,
-                "safe_to_delete": False, "checked_at": checked_at,
-                "dirty": tracked, "untracked": untracked, "ignored": ignored,
-                "changed_paths": len(lines),
-            }
-        contains = _git(path, "branch", "-r", "--contains", "HEAD", "--format=%(refname)")
-        if contains.returncode == 0 and contains.stdout.strip():
-            # A clean current tree says nothing about commits reachable only through another local
-            # branch, tag, or reflog. Preserve every non-empty repository rather than attempting a
-            # lossy whole-object-graph proof.
-            return {"classification": "clean_git", "safe_to_delete": False, "checked_at": checked_at}
-        head = _git(path, "rev-parse", "--verify", "HEAD")
-        if head.returncode == 0:
-            return {
-                "classification": "unpushed", "safe_to_delete": False,
-                "checked_at": checked_at, "head": head.stdout.strip()[:64],
-            }
-        return {
-            "classification": "uncertain", "safe_to_delete": False,
-            "checked_at": checked_at, "reason": "git_head_unverifiable",
-        }
-    except FileNotFoundError:
-        return {"classification": "missing", "safe_to_delete": True, "checked_at": checked_at}
-    except (OSError, subprocess.SubprocessError) as exc:
-        return {
-            "classification": "uncertain", "safe_to_delete": False,
-            "checked_at": checked_at, "reason": type(exc).__name__,
-        }
-
-
 def _planned_detached_path(
     layout: _Layout, workspace_id: str, lease_id: str, generation: int, operation: str,
 ) -> Path:
-    return layout.quarantine_dir / (
-        f".{operation}-{workspace_id}-g{int(generation)}-{lease_id}"
+    return layout.quarantine_dir / _planned_detached_name(
+        workspace_id, lease_id, generation, operation,
     )
 
 
+def _preparing_cleanup(
+    workspace_id: str, planned_detached: Path, root_identities: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "operation": "acquire", "classification": "pending",
+        "disposition": "preparing", "original_path": f"workspaces/{workspace_id}",
+        "planned_detached_name": planned_detached.name,
+        "root_identities": dict(root_identities),
+    }
+
+
 def _root_identities(layout: _Layout) -> dict[str, Any]:
-    with _HeldDirectory(layout.data_dir) as data, _workspace_roots(layout) as roots:
-        return {
-            "version": 1,
-            "data": data.identity_json(),
-            "workspaces": roots[0].identity_json(),
-            "quarantine": roots[1].identity_json(),
-        }
+    with open_storage_anchors(layout, include_roots=True, publish=False) as anchors:
+        return anchors.identities()
 
 
 def _held_root_identities(
     conn, roots: tuple[_HeldDirectory, _HeldDirectory],
 ) -> dict[str, Any]:
-    return {
-        "version": 1,
-        "data": list(conn.storage_data_identity),
-        "workspaces": roots[0].identity_json(),
-        "quarantine": roots[1].identity_json(),
-    }
+    if roots != conn.storage_roots:
+        raise WorkspacePathError("workspace roots are not bound to this registry connection")
+    return dict(conn.storage_root_identities)
 
 
 def _row_root_identities(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -946,7 +875,7 @@ def _row_root_identities(row: Mapping[str, Any]) -> dict[str, Any]:
         identities = json.loads(row["root_identities_json"] or "null")
     except (TypeError, ValueError, KeyError) as exc:
         raise WorkspacePathError("workspace lease root identities are malformed") from exc
-    if not isinstance(identities, dict) or identities.get("version") != 1:
+    if not isinstance(identities, dict) or identities.get("version") != 2:
         raise WorkspacePathError("workspace lease has no durable root identities")
     return identities
 
@@ -963,12 +892,7 @@ def _validate_row_roots(
     elif roots is None:
         current = _root_identities(layout)
     else:
-        current = {
-            "version": 1,
-            "data": data_identity if data_identity is not None else _root_identities(layout)["data"],
-            "workspaces": roots[0].identity_json(),
-            "quarantine": roots[1].identity_json(),
-        }
+        raise WorkspacePathError("full workspace registry identity is required for validation")
     if expected != current:
         raise WorkspacePathError(
             "workspace storage root identity changed; refusing lease mutation "
@@ -1016,16 +940,18 @@ def _detach_workspace(
             if quarantine.exists(detached.name):
                 return detached, {
                     "classification": "pending", "disposition": "detached",
-                    "original_path": str(path), "detached_path": str(detached),
+                    "original_path": f"workspaces/{workspace_id}",
+                    "detached_name": detached.name,
                 }
             return None, {
                 "classification": "missing", "disposition": "absent",
-                "original_path": str(path),
+                "original_path": f"workspaces/{workspace_id}",
             }
         if quarantine.exists(detached.name):
             return None, {
                 "classification": "uncertain", "disposition": "preserved",
-                "original_path": str(path), "detached_path": str(detached),
+                "original_path": f"workspaces/{workspace_id}",
+                "detached_name": detached.name,
                 "cleanup_error": "both canonical and planned detached paths exist",
             }
         try:
@@ -1033,11 +959,13 @@ def _detach_workspace(
         except OSError as exc:
             return None, {
                 "classification": "uncertain", "disposition": "preserved",
-                "original_path": str(path), "cleanup_error": f"{type(exc).__name__}: {exc}",
+                "original_path": f"workspaces/{workspace_id}",
+                "cleanup_error": f"{type(exc).__name__}: {exc}",
             }
         return detached, {
             "classification": "pending", "disposition": "detached",
-            "original_path": str(path), "detached_path": str(detached),
+            "original_path": f"workspaces/{workspace_id}",
+            "detached_name": detached.name,
         }
 
     if roots is not None:
@@ -1073,26 +1001,26 @@ def _finish_detached_cleanup_held(
                     late = _classify_workspace(held_path)
                     finished.update({
                         **late, "safe_to_delete": False, "disposition": "quarantined",
-                        "quarantine_path": str(detached), "cleanup_race": "late_content",
+                        "quarantine_name": detached.name, "cleanup_race": "late_content",
                     })
-                    finished.pop("detached_path", None)
+                    finished.pop("detached_name", None)
                     return finished
                 raise
             finished["disposition"] = "removed"
-            finished.pop("detached_path", None)
+            finished.pop("detached_name", None)
         else:
-            finished.update({"disposition": "quarantined", "quarantine_path": str(detached)})
-            finished.pop("detached_path", None)
+            finished.update({"disposition": "quarantined", "quarantine_name": detached.name})
+            finished.pop("detached_name", None)
     except OSError as exc:
         if exc.errno == errno.ENOENT:
             finished.update({
                 "classification": "missing", "safe_to_delete": True,
                 "disposition": "removed", "cleanup_race": "already_removed",
             })
-            finished.pop("detached_path", None)
+            finished.pop("detached_name", None)
             return finished
         finished.update({
-            "disposition": "preserved", "quarantine_path": str(detached),
+            "disposition": "preserved", "quarantine_name": detached.name,
             "cleanup_error": f"{type(exc).__name__}: {exc}",
         })
     return finished
@@ -1122,11 +1050,10 @@ def _reconcile_pending_generation(
 ) -> None:
     """Preserve names left by a crashed transition before the current row is replaced."""
     if roots is None:
-        with _workspace_roots(layout) as held:
-            return _reconcile_pending_generation(conn, layout, row, held)
+        roots = conn.storage_roots
     workspaces, quarantine = roots
     identities = _validate_row_roots(
-        row, layout, roots, list(conn.storage_data_identity),
+        row, layout, current_identities=conn.storage_root_identities,
     )
     operation = _pending_operation(row)
     if operation is None:
@@ -1151,10 +1078,10 @@ def _reconcile_pending_generation(
         return [layout.quarantine_dir / name for name in sorted(names)]
 
     def remember(source: str, path: Path) -> None:
-        if not any(item.get("quarantine_path") == str(path) for item in preserved):
+        if not any(item.get("quarantine_name") == path.name for item in preserved):
             preserved.append({
                 "source": source, "disposition": "quarantined",
-                "quarantine_path": str(path),
+                "quarantine_name": path.name,
             })
 
     # A previous retry may have crashed after moving the canonical name to recovery but before its
@@ -1193,11 +1120,17 @@ def _reconcile_pending_generation(
 
 def _public_snapshot(conn, row: Mapping[str, Any]) -> dict[str, Any]:
     cleanup = json.loads(row["cleanup_json"]) if row["cleanup_json"] else None
+    if cleanup is not None:
+        cleanup = _cleanup_paths(
+            conn.layout, str(row["workspace_id"]), cleanup,
+            lease_id=str(row["lease_id"]), generation=int(row["generation"]),
+            operation=str(cleanup.get("operation") or ""),
+        )
     return {
         "contractVersion": int(row["contract_version"]),
         "leaseId": row["lease_id"],
         "workspaceId": row["workspace_id"],
-        "path": row["workspace_path"],
+        "path": str(Path(conn.workspace_base) / row["workspace_id"]),
         "state": row["state"],
         "generation": int(row["generation"]),
         "owner": {
@@ -1252,16 +1185,12 @@ class PluginWorkspaces:
         operation_id: str, capability: str,
     ) -> dict[str, Any]:
         capability_hash = _capability_hash(capability)
-        request_fingerprint = _operation_fingerprint(
-            layout, "acquire", workspace_id, ttl,
-        )
         pid, created, host, instance = _owner_stamp()
         machine = _machine_identity()
         reclaimed: str | None = None
-
-        with _workspace_roots(layout) as recovery_roots, transaction(
-            _connect(layout), immediate=True,
-        ) as conn:
+        with transaction(_connect(layout), immediate=True) as conn:
+            recovery_roots = conn.storage_roots
+            request_fingerprint = _operation_fingerprint(layout, "acquire", workspace_id, ttl)
             now, expires_wall, heartbeat_mono, expires_mono, observer, observed_mono = (
                 _fresh_expiry(ttl)
             )
@@ -1300,8 +1229,8 @@ class PluginWorkspaces:
                 ):
                     raise InvalidWorkspaceHandleError("workspace acquire intent scope is invalid")
                 _validate_row_roots(
-                    intent_row, layout, recovery_roots,
-                    list(conn.storage_data_identity),
+                    intent_row, layout,
+                    current_identities=conn.storage_root_identities,
                 )
                 state = intent_row["state"]
                 owner_status = _owner_status(intent_row)
@@ -1315,7 +1244,10 @@ class PluginWorkspaces:
                         raise InvalidWorkspaceHandleError(
                             "workspace acquire receipt is not committed"
                         )
-                    _validate_workspace_entry(layout, workspace_id)
+                    _validate_workspace_entry(
+                        layout, workspace_id, conn.storage_roots[0],
+                        intent_row["workspace_identity_json"],
+                    )
                     changed = conn.execute(
                         """UPDATE workspace_leases SET owner_pid=?, owner_create_time=?,
                            owner_host=?, owner_machine_identity=?, owner_instance=?,
@@ -1362,13 +1294,9 @@ class PluginWorkspaces:
                 planned_detached = _planned_detached_path(
                     layout, workspace_id, lease_id, generation, "acquire",
                 )
-                cleanup = {
-                    "operation": "acquire", "classification": "pending",
-                    "disposition": "preparing",
-                    "original_path": str(layout.workspaces_dir / workspace_id),
-                    "planned_detached_path": str(planned_detached),
-                    "root_identities": storage_roots,
-                }
+                cleanup = _preparing_cleanup(
+                    workspace_id, planned_detached, storage_roots,
+                )
                 changed = conn.execute(
                     """UPDATE workspace_leases SET lease_id=?, state='preparing', owner_pid=?,
                        owner_create_time=?, owner_host=?, owner_machine_identity=?, owner_instance=?,
@@ -1429,13 +1357,9 @@ class PluginWorkspaces:
                 planned_detached = _planned_detached_path(
                     layout, workspace_id, lease_id, generation, "acquire",
                 )
-                cleanup = {
-                    "operation": "acquire", "classification": "pending",
-                    "disposition": "preparing",
-                    "original_path": str(layout.workspaces_dir / workspace_id),
-                    "planned_detached_path": str(planned_detached),
-                    "root_identities": storage_roots,
-                }
+                cleanup = _preparing_cleanup(
+                    workspace_id, planned_detached, storage_roots,
+                )
                 conn.execute(
                     """INSERT INTO workspace_lease_operations
                        (operation_id, kind, workspace_id, request_fingerprint, input_lease_id,
@@ -1455,15 +1379,17 @@ class PluginWorkspaces:
                         ttl_seconds, acquired_at,
                         heartbeat_at, expires_at, heartbeat_monotonic, expires_monotonic,
                         expiry_observer, expiry_observed_monotonic, released_at, generation,
-                        acquire_intent_id, root_identities_json, cleanup_json, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        acquire_intent_id, root_identities_json, workspace_identity_json,
+                        cleanup_json, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         workspace_id, lease_id, capability_hash, HANDLE_VERSION, "preparing",
                         layout.plugin_namespace, layout.plugin_identity, layout.profile_key,
-                        str(layout.workspaces_dir / workspace_id), pid, created, host, machine, instance,
+                        f"workspaces/{workspace_id}", pid, created, host, machine, instance,
                         ttl, now, now, expires_wall, heartbeat_mono, expires_mono,
                         observer, observed_mono, None, generation, operation_id,
                         json.dumps(storage_roots, sort_keys=True),
+                        None,
                         json.dumps(cleanup, sort_keys=True), now,
                     ),
                 )
@@ -1481,7 +1407,7 @@ class PluginWorkspaces:
         if detached is not None:
             finished_cleanup = _finish_detached_cleanup(layout, detached, cleanup)
             finished_cleanup.update({
-                "operation": "acquire", "planned_detached_path": str(planned_detached),
+                "operation": "acquire", "planned_detached_name": planned_detached.name,
             })
             with transaction(_connect(layout), immediate=True) as conn:
                 changed = conn.execute(
@@ -1521,15 +1447,18 @@ class PluginWorkspaces:
                 or current["acquire_intent_id"] != operation_id
             ):
                 raise InvalidWorkspaceHandleError("workspace activation lost its fence")
-            _validate_workspace_entry(layout, str(current["workspace_id"]))
+            workspace_identity = _validate_workspace_entry(
+                layout, str(current["workspace_id"]), conn.storage_roots[0],
+            )
             changed = conn.execute(
                 """UPDATE workspace_leases SET state='active', heartbeat_at=?, expires_at=?,
                    heartbeat_monotonic=?, expires_monotonic=?, expiry_observer=?,
-                   expiry_observed_monotonic=?, updated_at=? WHERE lease_id=?
+                   expiry_observed_monotonic=?, workspace_identity_json=?, updated_at=? WHERE lease_id=?
                    AND state='preparing' AND generation=? AND acquire_intent_id=?""",
                 (
                     ready_at, ready_expires_wall, ready_mono, ready_expires_mono,
-                    ready_observer, ready_observed_mono, ready_at, lease_id,
+                    ready_observer, ready_observed_mono,
+                    json.dumps(workspace_identity), ready_at, lease_id,
                     generation, operation_id,
                 ),
             ).rowcount
@@ -1555,9 +1484,8 @@ class PluginWorkspaces:
         operation_id: str, capability: str, planned_detached: Path,
     ) -> tuple[Path | None, dict[str, Any]]:
         preparation_error: WorkspacePathError | None = None
-        with _workspace_roots(layout) as roots, transaction(
-            _connect(layout), immediate=True,
-        ) as conn:
+        with transaction(_connect(layout), immediate=True) as conn:
+            roots = conn.storage_roots
             current = _validated_row(
                 conn, layout, _handle(lease_id, capability), validate_path=False,
             )
@@ -1572,10 +1500,10 @@ class PluginWorkspaces:
                 planned=planned_detached, roots=roots,
             )
             plan_roots = _validate_row_roots(
-                current, layout, roots, list(conn.storage_data_identity),
+                current, layout, current_identities=conn.storage_root_identities,
             )
             cleanup.update({
-                "operation": "acquire", "planned_detached_path": str(planned_detached),
+                "operation": "acquire", "planned_detached_name": planned_detached.name,
                 "root_identities": plan_roots,
             })
             _cleanup_receipt(conn, current, "acquire", "detached", cleanup)
@@ -1653,7 +1581,10 @@ class PluginWorkspaces:
             row = _validated_row(conn, layout, handle, validate_path=False)
             if row["state"] != "active":
                 raise InvalidWorkspaceHandleError("workspace lease has been released")
-            _validate_workspace_entry(layout, str(row["workspace_id"]))
+            _validate_workspace_entry(
+                layout, str(row["workspace_id"]), conn.storage_roots[0],
+                row["workspace_identity_json"],
+            )
             if _lease_expired(conn, row):
                 raise WorkspaceLeaseExpiredError("workspace lease expired; reconnect it before use")
             if _owner_state(row) is not True:
@@ -1735,7 +1666,10 @@ class PluginWorkspaces:
                     raise WorkspaceOwnershipError(
                         "workspace lease still belongs to another live process"
                     )
-                _validate_workspace_entry(layout, str(row["workspace_id"]))
+                _validate_workspace_entry(
+                    layout, str(row["workspace_id"]), conn.storage_roots[0],
+                    row["workspace_identity_json"],
+                )
                 (
                     fresh_wall, fresh_expires_wall, fresh_mono, fresh_expires_mono,
                     fresh_observer, fresh_observed_mono,
@@ -1772,7 +1706,10 @@ class PluginWorkspaces:
                 )
                 if row["state"] != "active":
                     raise InvalidWorkspaceHandleError("workspace lease has been released")
-                _validate_workspace_entry(layout, str(row["workspace_id"]))
+                _validate_workspace_entry(
+                    layout, str(row["workspace_id"]), conn.storage_roots[0],
+                    row["workspace_identity_json"],
+                )
                 owner_status = _owner_status(row)
                 expired = _lease_expired(conn, row)
                 if owner_status in {"live", "unknown"} and not expired:
@@ -1834,7 +1771,10 @@ class PluginWorkspaces:
             row = _validated_row(conn, layout, handle, validate_path=False)
             if row["state"] != "active":
                 raise InvalidWorkspaceHandleError("workspace lease has been released")
-            _validate_workspace_entry(layout, str(row["workspace_id"]))
+            _validate_workspace_entry(
+                layout, str(row["workspace_id"]), conn.storage_roots[0],
+                row["workspace_identity_json"],
+            )
             if _lease_expired(conn, row):
                 raise WorkspaceLeaseExpiredError("workspace lease expired; reconnect it before use")
             return _public_snapshot(conn, row)
@@ -1844,9 +1784,8 @@ class PluginWorkspaces:
         detached: Path | None = None
         released_snapshot: dict[str, Any] | None = None
         release_error: WorkspacePathError | None = None
-        with _workspace_roots(layout) as release_roots, transaction(
-            _connect(layout), immediate=True,
-        ) as conn:
+        with transaction(_connect(layout), immediate=True) as conn:
+            release_roots = conn.storage_roots
             now = time.time()
             row = _validated_row(conn, layout, handle, validate_path=False)
             if row["state"] == "released":
@@ -1864,7 +1803,7 @@ class PluginWorkspaces:
                         **cleanup, "classification": "missing", "safe_to_delete": True,
                         "disposition": "removed",
                         "reconciled_reason": "detached_target_absent",
-                        "planned_detached_path": str(planned),
+                        "planned_detached_name": planned.name,
                     }
                     changed = conn.execute(
                         """UPDATE workspace_leases SET cleanup_json=?, updated_at=?
@@ -1900,8 +1839,9 @@ class PluginWorkspaces:
                 if row["state"] == "active":
                     cleanup = {
                         "operation": "release", "classification": "pending",
-                        "disposition": "releasing", "original_path": row["workspace_path"],
-                        "planned_detached_path": str(planned),
+                        "disposition": "releasing",
+                        "original_path": f"workspaces/{row['workspace_id']}",
+                        "planned_detached_name": planned.name,
                         "root_identities": _row_root_identities(row),
                     }
                     changed = conn.execute(
@@ -1924,9 +1864,8 @@ class PluginWorkspaces:
         if row["state"] != "released":
             # Releasing + deterministic rename are durable before mutation. A retry after process
             # death resumes the same name; a DB rollback cannot resurrect an active predecessor.
-            with _workspace_roots(layout) as detach_roots, transaction(
-                _connect(layout), immediate=True,
-            ) as conn:
+            with transaction(_connect(layout), immediate=True) as conn:
+                detach_roots = conn.storage_roots
                 current = _validated_row(conn, layout, handle, validate_path=False)
                 if current["state"] == "released":
                     released_snapshot = _public_snapshot(conn, current)
@@ -1936,13 +1875,18 @@ class PluginWorkspaces:
                         or current["generation"] != row["generation"]
                     ):
                         raise InvalidWorkspaceHandleError("workspace lease changed during release")
+                    if detach_roots[0].exists(str(current["workspace_id"])):
+                        _validate_workspace_entry(
+                            layout, str(current["workspace_id"]), detach_roots[0],
+                            current["workspace_identity_json"],
+                        )
                     detached, cleanup = _detach_workspace(
                         layout, current["workspace_id"], current["lease_id"],
                         current["generation"], "release", planned=planned,
                         roots=detach_roots,
                     )
                     cleanup["operation"] = "release"
-                    cleanup["planned_detached_path"] = str(planned)
+                    cleanup["planned_detached_name"] = planned.name
                     cleanup["root_identities"] = _row_root_identities(current)
                     _cleanup_receipt(conn, current, "release", "detached", cleanup)
                     finished_at = time.time()
@@ -1966,7 +1910,8 @@ class PluginWorkspaces:
                         _cleanup_receipt(conn, failed, "release", "detach_failed", cleanup)
                         _event(conn, failed, "release_detach_failed", {"cleanup": cleanup})
                         release_error = WorkspacePathError(
-                            f"workspace release could not detach {current['workspace_path']}; "
+                            f"workspace release could not detach "
+                            f"{layout.workspaces_dir / current['workspace_id']}; "
                             "contents were preserved and the same handle can retry"
                         )
                     else:
@@ -1999,7 +1944,7 @@ class PluginWorkspaces:
             return released_snapshot
         cleanup = _finish_detached_cleanup(layout, detached, cleanup)
         cleanup["operation"] = "release"
-        cleanup["planned_detached_path"] = str(planned)
+        cleanup["planned_detached_name"] = planned.name
         finished = time.time()
         with transaction(_connect(layout), immediate=True) as conn:
             # Receipt/event ownership is immutable per generation and does not depend on the mutable
