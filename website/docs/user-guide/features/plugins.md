@@ -114,6 +114,7 @@ Every `ctx.*` API below is available inside a plugin's `register(ctx)` function.
 | Register a context-compression engine | `ctx.register_context_engine(engine)` — see [Context Engine Plugins](../../developer-guide/context-engine-plugin.md) |
 | Register a terminal execution backend (cloud sandbox) | `ctx.register_terminal_environment_provider(provider)` — see [Terminal Environment Plugins](../../developer-guide/terminal-environment-plugin.md) |
 | Coordinate Kanban Git workspaces | `ctx.register_workspace_provider(provider)` — see [Workspace Provider Plugins](../../developer-guide/workspace-provider-plugin.md) |
+| Reserve a durable private plugin workspace | Probe `workspace_leases.v1`, then use `ctx.workspaces` — see [Durable Plugin Workspace Leases](../../developer-guide/plugin-workspace-leases.md) |
 | Route human approval prompts | `ctx.register_approval_transport(name, present_fn)` — see [Approval transports](#approval-transports) |
 | Register a memory backend | Subclass `MemoryProvider` in `plugins/memory/<name>/__init__.py` — see [Memory Provider Plugins](../../developer-guide/memory-provider-plugin.md) (uses a separate discovery system) |
 | Run a host-owned LLM call | `ctx.llm.complete(...)` / `ctx.llm.complete_structured(...)` — borrow the user's active model + auth for a one-shot completion with optional JSON schema validation. See [Plugin LLM Access](../../developer-guide/plugin-llm-access.md) |
