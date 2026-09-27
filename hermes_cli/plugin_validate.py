@@ -230,6 +230,11 @@ class RecordingContext:
         # plugins do `int(ctx.get_config("timeout", 180))` in register().
         return default
 
+    def has_host_feature(self, feature):
+        # Validation runs without host services.  A correctly capability-gated
+        # plugin therefore takes the same fallback path it takes on older Hermes.
+        return False
+
     def __getattr__(self, name):
         # Any other REAL registration surface (platforms, providers, skills,
         # context engines, ...) is accepted as a no-op — the probe only audits
