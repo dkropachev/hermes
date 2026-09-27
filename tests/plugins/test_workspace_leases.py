@@ -232,7 +232,7 @@ def test_reconnect_intent_replays_successor_after_lost_response(tmp_path: Path) 
     db = tmp_path / "home/plugin-data/pr-review/workspace-leases.db"
     with sqlite3.connect(db) as conn:
         conn.execute(
-            "UPDATE workspace_lease_operations SET ttl_seconds_provided=NULL "
+            "UPDATE workspace_lease_operations SET ttl_argument_mode=NULL "
             "WHERE operation_id=?",
             (explicit_intent["operation_id"],),
         )
@@ -259,8 +259,8 @@ def test_legacy_operation_receipts_gain_ttl_presence_column(tmp_path: Path) -> N
         columns = {
             row[1]: row for row in conn.execute("PRAGMA table_info(workspace_lease_operations)")
         }
-    assert columns["ttl_seconds_provided"][3] == 0
-    assert columns["ttl_seconds_provided"][4] is None
+    assert columns["ttl_argument_mode"][3] == 0
+    assert columns["ttl_argument_mode"][4] is None
 
 
 def test_fresh_database_identity_binding_is_serialized(tmp_path: Path) -> None:
