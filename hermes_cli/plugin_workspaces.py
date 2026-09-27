@@ -7,6 +7,7 @@ reconnect, inspect, or release a lease after a host restart.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import hmac
 import json
@@ -14,12 +15,13 @@ import math
 import os
 import re
 import secrets
-import shutil
 import socket
 import stat
 import subprocess
+import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -28,6 +30,7 @@ from hermes_constants import get_hermes_home, hermes_home_key, mkdir_under_herme
 from hermes_cli.plugins_manifest import _portable_skill_namespace
 from hermes_cli.process_identity import _pid_alive_matches, _process_create_time
 from hermes_cli.sqlite_util import open_db, transaction
+from utils import fsync_directory
 
 
 HOST_FEATURE = "workspace_leases.v1"
@@ -42,6 +45,8 @@ _WINDOWS_RESERVED = {
     "con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)),
     *(f"lpt{i}" for i in range(1, 10)),
 }
+_WORKSPACE_LOCKS: dict[str, threading.RLock] = {}
+_WORKSPACE_LOCKS_GUARD = threading.Lock()
 
 
 class WorkspaceLeaseError(RuntimeError):
@@ -145,6 +150,47 @@ def _ttl(value: Any) -> float:
     return ttl
 
 
+def _intent() -> dict[str, Any]:
+    return {
+        "contract_version": HANDLE_VERSION,
+        "operation_id": str(uuid.uuid4()),
+        "capability": secrets.token_urlsafe(32),
+    }
+
+
+def _parse_intent(intent: Mapping[str, Any]) -> tuple[str, str]:
+    if not isinstance(intent, Mapping) or set(intent) != {
+        "contract_version", "operation_id", "capability",
+    }:
+        raise InvalidWorkspaceHandleError("malformed workspace operation intent")
+    if intent.get("contract_version") != HANDLE_VERSION:
+        raise InvalidWorkspaceHandleError("unsupported workspace operation intent version")
+    operation_id, capability = intent.get("operation_id"), intent.get("capability")
+    try:
+        parsed = uuid.UUID(str(operation_id))
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise InvalidWorkspaceHandleError("malformed workspace operation intent") from exc
+    if str(parsed) != str(operation_id) or not isinstance(capability, str) or not 32 <= len(
+        capability
+    ) <= 256:
+        raise InvalidWorkspaceHandleError("malformed workspace operation intent")
+    return str(operation_id), capability
+
+
+@contextmanager
+def _workspace_lock(layout: _Layout, workspace_id: str):
+    key = os.path.normcase(str(layout.workspaces_dir / workspace_id))
+    with _WORKSPACE_LOCKS_GUARD:
+        lock = _WORKSPACE_LOCKS.setdefault(key, threading.RLock())
+    with lock:
+        yield
+
+
+def _sync_dirs(*paths: Path) -> None:
+    for path in dict.fromkeys(paths):
+        fsync_directory(path)
+
+
 def _safe_child(parent: Path, name: str) -> Path:
     """Create one host-owned directory component and reject aliases/junctions/symlinks."""
     candidate = parent / name
@@ -219,6 +265,7 @@ def _initialize(conn) -> None:
             expires_at REAL NOT NULL,
             released_at REAL,
             generation INTEGER NOT NULL,
+            acquire_intent_id TEXT,
             cleanup_json TEXT,
             updated_at REAL NOT NULL
         );
@@ -247,7 +294,31 @@ def _initialize(conn) -> None:
         );
         CREATE INDEX IF NOT EXISTS workspace_cleanup_receipts_lookup
             ON workspace_cleanup_receipts(workspace_id, receipt_id);
+        CREATE TABLE IF NOT EXISTS workspace_lease_operations (
+            operation_id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL CHECK (kind IN ('acquire', 'reconnect')),
+            workspace_id TEXT NOT NULL,
+            request_fingerprint TEXT NOT NULL,
+            input_lease_id TEXT,
+            input_capability_hash TEXT,
+            output_lease_id TEXT NOT NULL,
+            output_capability_hash TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            ttl_seconds REAL NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('preparing', 'committed', 'failed', 'superseded')),
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
         """
+    )
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(workspace_leases)")}
+    if "plugin_identity" not in columns:
+        conn.execute("ALTER TABLE workspace_leases ADD COLUMN plugin_identity TEXT")
+    if "acquire_intent_id" not in columns:
+        conn.execute("ALTER TABLE workspace_leases ADD COLUMN acquire_intent_id TEXT")
+    conn.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS workspace_lease_acquire_intent
+           ON workspace_leases(acquire_intent_id)"""
     )
 
 
@@ -285,18 +356,14 @@ def _connect(layout: _Layout):
 
 
 def _host_instance() -> str:
-    """Boot/container witness; paired with pid/create-time to survive persisted rows across reboot."""
+    """Stable OS boot witness where available; never synthesize one from wall-clock time."""
     try:
         boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
         if boot_id:
             return f"boot-id:{boot_id}"
     except OSError:
         pass
-    try:
-        import psutil
-        return f"boot-time:{float(psutil.boot_time()):.6f}"
-    except Exception:
-        return "unverified"
+    return "unverified"
 
 
 def _owner_stamp() -> tuple[int, float | None, str, str]:
@@ -353,6 +420,11 @@ def _handle(lease_id: str, capability: str) -> dict[str, Any]:
     return {"contract_version": HANDLE_VERSION, "lease_id": lease_id, "capability": capability}
 
 
+def _response_handle(lease_id: str, capability: str) -> dict[str, Any]:
+    """Response boundary kept separate so crash-after-commit behavior is fault-testable."""
+    return _handle(lease_id, capability)
+
+
 def _parse_handle(handle: Mapping[str, Any]) -> tuple[str, str]:
     if not isinstance(handle, Mapping) or set(handle) != {"contract_version", "lease_id", "capability"}:
         raise InvalidWorkspaceHandleError("malformed workspace lease handle")
@@ -370,6 +442,48 @@ def _parse_handle(handle: Mapping[str, Any]) -> tuple[str, str]:
 
 def _capability_hash(capability: str) -> str:
     return hashlib.sha256(capability.encode("utf-8")).hexdigest()
+
+
+def _operation_fingerprint(
+    layout: _Layout, kind: str, workspace_id: str, ttl: float,
+    input_lease_id: str | None = None,
+) -> str:
+    encoded = json.dumps(
+        [
+            kind, layout.plugin_identity, layout.profile_key, workspace_id,
+            float(ttl), input_lease_id,
+        ],
+        ensure_ascii=True, separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _validate_operation(
+    row: Mapping[str, Any], *, kind: str, workspace_id: str, fingerprint: str,
+    output_capability_hash: str, input_lease_id: str | None = None,
+    input_capability_hash: str | None = None,
+) -> None:
+    valid = (
+        row["kind"] == kind
+        and row["workspace_id"] == workspace_id
+        and hmac.compare_digest(row["request_fingerprint"], fingerprint)
+        and hmac.compare_digest(row["output_capability_hash"], output_capability_hash)
+        and row["input_lease_id"] == input_lease_id
+    )
+    if input_capability_hash is not None:
+        valid = valid and row["input_capability_hash"] is not None and hmac.compare_digest(
+            row["input_capability_hash"], input_capability_hash,
+        )
+    if not valid:
+        raise InvalidWorkspaceHandleError("workspace operation intent does not match its request")
+
+
+def _supersede_lease_operations(conn, lease_id: str, now: float) -> None:
+    conn.execute(
+        """UPDATE workspace_lease_operations SET state='superseded', updated_at=?
+           WHERE output_lease_id=? AND state IN ('preparing', 'committed', 'failed')""",
+        (now, lease_id),
+    )
 
 
 def _validated_row(
@@ -550,6 +664,7 @@ def _detach_workspace(
         }
     try:
         os.replace(path, detached)
+        _sync_dirs(layout.workspaces_dir, layout.quarantine_dir)
     except OSError as exc:
         return None, {
             "classification": "uncertain", "disposition": "preserved",
@@ -566,16 +681,24 @@ def _finish_detached_cleanup(detached: Path, receipt: dict[str, Any]) -> dict[st
     finished = {**receipt, **assessment}
     try:
         if assessment["safe_to_delete"]:
-            if detached.is_dir() and not detached.is_symlink():
-                shutil.rmtree(detached)
-            else:
-                detached.unlink()
+            # The only existing safe-to-delete tree is empty. Atomic rmdir refuses a late file;
+            # recursive deletion would race classification and destroy newly-created content.
+            detached.rmdir()
+            _sync_dirs(detached.parent)
             finished["disposition"] = "removed"
             finished.pop("detached_path", None)
         else:
             finished.update({"disposition": "quarantined", "quarantine_path": str(detached)})
             finished.pop("detached_path", None)
     except OSError as exc:
+        if exc.errno in {errno.ENOTEMPTY, errno.EEXIST}:
+            late = _classify_workspace(detached)
+            finished.update({
+                **late, "safe_to_delete": False, "disposition": "quarantined",
+                "quarantine_path": str(detached), "cleanup_race": "late_content",
+            })
+            finished.pop("detached_path", None)
+            return finished
         finished.update({
             "disposition": "preserved", "quarantine_path": str(detached),
             "cleanup_error": f"{type(exc).__name__}: {exc}",
@@ -593,10 +716,11 @@ def _pending_operation(row: Mapping[str, Any]) -> str | None:
     except (TypeError, ValueError):
         return None
     operation = cleanup.get("operation")
-    if row["state"] == "released" and operation == "release" and cleanup.get(
-        "disposition"
-    ) in {"releasing", "detached"}:
-        return "release"
+    if row["state"] == "released":
+        if operation == "release" and cleanup.get("disposition") in {"releasing", "detached"}:
+            return "release"
+        if operation == "acquire":
+            return "acquire"
     return None
 
 
@@ -644,6 +768,7 @@ def _reconcile_pending_generation(conn, layout: _Layout, row: Mapping[str, Any])
                 suffix += 1
         try:
             os.replace(canonical, target)
+            _sync_dirs(layout.workspaces_dir, layout.quarantine_dir)
             remember("canonical", target)
         except OSError as exc:
             raise WorkspacePathError(
@@ -713,91 +838,242 @@ class PluginWorkspaces:
     def _layout(self) -> _Layout:
         return _layout(self._plugin_id, self._skill_namespace, self._home_path)
 
+    def new_intent(self) -> dict[str, Any]:
+        """Return a caller-persisted intent for one retryable acquire or reconnect operation."""
+        return _intent()
+
     def acquire(
-        self, workspace_id: str, *, ttl_seconds: float = DEFAULT_TTL_SECONDS,
+        self, workspace_id: str, *, intent: Mapping[str, Any],
+        ttl_seconds: float = DEFAULT_TTL_SECONDS,
     ) -> dict[str, Any]:
         workspace_id, ttl = _validated_workspace_id(workspace_id), _ttl(ttl_seconds)
+        operation_id, capability = _parse_intent(intent)
         layout = self._layout()
-        lease_id, capability = str(uuid.uuid4()), secrets.token_urlsafe(32)
+        with _workspace_lock(layout, workspace_id):
+            return self._acquire_locked(
+                layout, workspace_id, ttl, operation_id, capability,
+            )
+
+    def _acquire_locked(
+        self, layout: _Layout, workspace_id: str, ttl: float,
+        operation_id: str, capability: str,
+    ) -> dict[str, Any]:
+        capability_hash = _capability_hash(capability)
+        request_fingerprint = _operation_fingerprint(
+            layout, "acquire", workspace_id, ttl,
+        )
         pid, created, host, instance = _owner_stamp()
         detached: Path | None = None
         preparation_error: WorkspacePathError | None = None
-        with transaction(_connect(layout), immediate=True) as conn:
-            # Expiry is evaluated only after BEGIN IMMEDIATE succeeds. A waiter must not reclaim a
-            # lease based on a wall-clock sample taken before it queued behind another writer.
-            now = time.time()
-            old = conn.execute(
-                "SELECT * FROM workspace_leases WHERE workspace_id=?", (workspace_id,)
-            ).fetchone()
-            generation, reclaimed = 1, None
-            if old is not None:
-                generation = int(old["generation"]) + 1
-                if (
-                    old["plugin_namespace"] != layout.plugin_namespace
-                    or old["plugin_identity"] != layout.plugin_identity
-                    or old["profile_key"] != layout.profile_key
-                ):
-                    raise WorkspacePathError("workspace lease database belongs to another plugin or profile")
-                if old["state"] in {"active", "preparing", "releasing"}:
-                    owner_status = _owner_status(old)
-                    expired = float(old["expires_at"]) <= now
-                    # A live preparation is never reclaimed on its short TTL boundary: the process may
-                    # be between the rename and mkdir below. Active generations use normal heartbeat TTL.
-                    live_transition = old["state"] in {"preparing", "releasing"}
-                    if owner_status in {"self", "live"} and live_transition:
-                        raise WorkspaceInUseError(
-                            f"workspace {workspace_id!r} is being transitioned by a live owner"
-                        )
-                    if owner_status != "dead" and not expired:
-                        raise WorkspaceInUseError(
-                            f"workspace {workspace_id!r} is already leased until {old['expires_at']}"
-                        )
-                    reclaimed = "owner_dead" if owner_status == "dead" else "ttl_expired"
-                _reconcile_pending_generation(conn, layout, old)
-            planned_detached = _planned_detached_path(
-                layout, workspace_id, lease_id, generation, "acquire",
-            )
-            cleanup = {
-                "operation": "acquire", "classification": "pending", "disposition": "preparing",
-                "original_path": str(layout.workspaces_dir / workspace_id),
-                "planned_detached_path": str(planned_detached),
-            }
-            row_values = (
-                workspace_id, lease_id, _capability_hash(capability), HANDLE_VERSION, "preparing",
-                layout.plugin_namespace, layout.plugin_identity, layout.profile_key,
-                str(layout.workspaces_dir / workspace_id), pid, created, host, instance, ttl,
-                now, now, now + ttl, None, generation, json.dumps(cleanup, sort_keys=True), now,
-            )
-            conn.execute(
-                """INSERT OR REPLACE INTO workspace_leases
-                   (workspace_id, lease_id, capability_hash, contract_version, state,
-                    plugin_namespace, plugin_identity, profile_key, workspace_path, owner_pid,
-                    owner_create_time, owner_host, owner_instance, ttl_seconds, acquired_at,
-                    heartbeat_at, expires_at, released_at,
-                    generation, cleanup_json, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                row_values,
-            )
-            row = conn.execute("SELECT * FROM workspace_leases WHERE lease_id=?", (lease_id,)).fetchone()
-            _cleanup_receipt(conn, row, "acquire", "planned", cleanup)
-            _event(conn, row, "preparing", {"reclaimed": reclaimed, "cleanup": cleanup})
+        reclaimed: str | None = None
 
-        # The preparing row is now durable.  Hold another IMMEDIATE transaction across the
-        # canonical-name handoff; a crash/commit failure leaves a reclaimable preparing generation,
-        # never the predecessor row pointing at a replacement directory.
+        with transaction(_connect(layout), immediate=True) as conn:
+            now = time.time()
+            operation = conn.execute(
+                "SELECT * FROM workspace_lease_operations WHERE operation_id=?",
+                (operation_id,),
+            ).fetchone()
+            if operation is not None:
+                _validate_operation(
+                    operation, kind="acquire", workspace_id=workspace_id,
+                    fingerprint=request_fingerprint,
+                    output_capability_hash=capability_hash,
+                )
+                if operation["state"] == "superseded":
+                    raise InvalidWorkspaceHandleError("workspace acquire intent was superseded")
+                intent_row = conn.execute(
+                    "SELECT * FROM workspace_leases WHERE lease_id=?",
+                    (operation["output_lease_id"],),
+                ).fetchone()
+                if intent_row is None or int(intent_row["generation"]) != int(
+                    operation["generation"]
+                ):
+                    conn.execute(
+                        """UPDATE workspace_lease_operations SET state='superseded', updated_at=?
+                           WHERE operation_id=?""",
+                        (now, operation_id),
+                    )
+                    raise InvalidWorkspaceHandleError("workspace acquire intent no longer owns a lease")
+                if (
+                    intent_row["workspace_id"] != workspace_id
+                    or intent_row["plugin_namespace"] != layout.plugin_namespace
+                    or intent_row["plugin_identity"] != layout.plugin_identity
+                    or intent_row["profile_key"] != layout.profile_key
+                    or not hmac.compare_digest(intent_row["capability_hash"], capability_hash)
+                ):
+                    raise InvalidWorkspaceHandleError("workspace acquire intent scope is invalid")
+                state = intent_row["state"]
+                owner_status = _owner_status(intent_row)
+                expired = float(intent_row["expires_at"]) <= now
+                if owner_status in {"live", "unknown"} and not expired:
+                    raise WorkspaceInUseError(
+                        f"workspace {workspace_id!r} intent is owned by another live process"
+                    )
+                if state == "active":
+                    if operation["state"] != "committed":
+                        raise InvalidWorkspaceHandleError(
+                            "workspace acquire receipt is not committed"
+                        )
+                    _validate_workspace_path(Path(intent_row["workspace_path"]))
+                    changed = conn.execute(
+                        """UPDATE workspace_leases SET owner_pid=?, owner_create_time=?,
+                           owner_host=?, owner_instance=?, heartbeat_at=?, expires_at=?, updated_at=?
+                           WHERE lease_id=? AND generation=? AND state='active'
+                           AND acquire_intent_id=?""",
+                        (
+                            pid, created, host, instance, now, now + ttl, now,
+                            intent_row["lease_id"], intent_row["generation"], operation_id,
+                        ),
+                    ).rowcount
+                    if changed != 1:
+                        raise InvalidWorkspaceHandleError("workspace acquire replay lost its fence")
+                    replayed = conn.execute(
+                        "SELECT * FROM workspace_leases WHERE lease_id=?",
+                        (intent_row["lease_id"],),
+                    ).fetchone()
+                    _event(conn, replayed, "acquire_replayed", {"operation_id": operation_id})
+                    return _response_handle(replayed["lease_id"], capability)
+                if state == "released":
+                    cleanup = json.loads(intent_row["cleanup_json"] or "{}")
+                    if cleanup.get("operation") != "acquire" or operation["state"] == "committed":
+                        conn.execute(
+                            """UPDATE workspace_lease_operations SET state='superseded', updated_at=?
+                               WHERE operation_id=?""",
+                            (now, operation_id),
+                        )
+                        raise InvalidWorkspaceHandleError("workspace acquire intent was already released")
+                    _reconcile_pending_generation(conn, layout, intent_row)
+                    generation = int(intent_row["generation"]) + 1
+                    lease_id = str(uuid.uuid4())
+                elif state == "preparing":
+                    generation = int(intent_row["generation"])
+                    lease_id = str(intent_row["lease_id"])
+                    _reconcile_pending_generation(conn, layout, intent_row)
+                else:
+                    raise WorkspaceInUseError(
+                        f"workspace {workspace_id!r} is in a release transition"
+                    )
+                reclaimed = "intent_retry"
+                planned_detached = _planned_detached_path(
+                    layout, workspace_id, lease_id, generation, "acquire",
+                )
+                cleanup = {
+                    "operation": "acquire", "classification": "pending",
+                    "disposition": "preparing",
+                    "original_path": str(layout.workspaces_dir / workspace_id),
+                    "planned_detached_path": str(planned_detached),
+                }
+                changed = conn.execute(
+                    """UPDATE workspace_leases SET lease_id=?, state='preparing', owner_pid=?,
+                       owner_create_time=?, owner_host=?, owner_instance=?, ttl_seconds=?,
+                       heartbeat_at=?, expires_at=?, released_at=NULL, generation=?, cleanup_json=?,
+                       updated_at=? WHERE workspace_id=? AND acquire_intent_id=?""",
+                    (
+                        lease_id, pid, created, host, instance, ttl, now, now + ttl, generation,
+                        json.dumps(cleanup, sort_keys=True), now, workspace_id, operation_id,
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise InvalidWorkspaceHandleError("workspace acquire retry lost its fence")
+                conn.execute(
+                    """UPDATE workspace_lease_operations SET output_lease_id=?, generation=?,
+                       state='preparing', updated_at=? WHERE operation_id=?""",
+                    (lease_id, generation, now, operation_id),
+                )
+                row = conn.execute(
+                    "SELECT * FROM workspace_leases WHERE lease_id=?", (lease_id,),
+                ).fetchone()
+                _cleanup_receipt(conn, row, "acquire", "retry_planned", cleanup)
+                _event(conn, row, "preparing", {"reclaimed": reclaimed, "cleanup": cleanup})
+            else:
+                old = conn.execute(
+                    "SELECT * FROM workspace_leases WHERE workspace_id=?", (workspace_id,),
+                ).fetchone()
+                generation = 1
+                if old is not None:
+                    generation = int(old["generation"]) + 1
+                    if (
+                        old["plugin_namespace"] != layout.plugin_namespace
+                        or old["plugin_identity"] != layout.plugin_identity
+                        or old["profile_key"] != layout.profile_key
+                    ):
+                        raise WorkspacePathError(
+                            "workspace lease database belongs to another plugin or profile"
+                        )
+                    if old["state"] in {"active", "preparing", "releasing"}:
+                        owner_status = _owner_status(old)
+                        expired = float(old["expires_at"]) <= now
+                        live_transition = old["state"] in {"preparing", "releasing"}
+                        if owner_status in {"self", "live"} and live_transition:
+                            raise WorkspaceInUseError(
+                                f"workspace {workspace_id!r} is being transitioned by a live owner"
+                            )
+                        if owner_status != "dead" and not expired:
+                            raise WorkspaceInUseError(
+                                f"workspace {workspace_id!r} is leased until {old['expires_at']}"
+                            )
+                        reclaimed = "owner_dead" if owner_status == "dead" else "ttl_expired"
+                    _reconcile_pending_generation(conn, layout, old)
+                    _supersede_lease_operations(conn, old["lease_id"], now)
+                lease_id = str(uuid.uuid4())
+                planned_detached = _planned_detached_path(
+                    layout, workspace_id, lease_id, generation, "acquire",
+                )
+                cleanup = {
+                    "operation": "acquire", "classification": "pending",
+                    "disposition": "preparing",
+                    "original_path": str(layout.workspaces_dir / workspace_id),
+                    "planned_detached_path": str(planned_detached),
+                }
+                conn.execute(
+                    """INSERT INTO workspace_lease_operations
+                       (operation_id, kind, workspace_id, request_fingerprint, input_lease_id,
+                        input_capability_hash, output_lease_id, output_capability_hash,
+                        generation, ttl_seconds, state, created_at, updated_at)
+                       VALUES (?, 'acquire', ?, ?, NULL, NULL, ?, ?, ?, ?, 'preparing', ?, ?)""",
+                    (
+                        operation_id, workspace_id, request_fingerprint, lease_id,
+                        capability_hash, generation, ttl, now, now,
+                    ),
+                )
+                conn.execute(
+                    """INSERT OR REPLACE INTO workspace_leases
+                       (workspace_id, lease_id, capability_hash, contract_version, state,
+                        plugin_namespace, plugin_identity, profile_key, workspace_path, owner_pid,
+                        owner_create_time, owner_host, owner_instance, ttl_seconds, acquired_at,
+                        heartbeat_at, expires_at, released_at, generation, acquire_intent_id,
+                        cleanup_json, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        workspace_id, lease_id, capability_hash, HANDLE_VERSION, "preparing",
+                        layout.plugin_namespace, layout.plugin_identity, layout.profile_key,
+                        str(layout.workspaces_dir / workspace_id), pid, created, host, instance,
+                        ttl, now, now, now + ttl, None, generation, operation_id,
+                        json.dumps(cleanup, sort_keys=True), now,
+                    ),
+                )
+                row = conn.execute(
+                    "SELECT * FROM workspace_leases WHERE lease_id=?", (lease_id,),
+                ).fetchone()
+                _cleanup_receipt(conn, row, "acquire", "planned", cleanup)
+                _event(conn, row, "preparing", {"reclaimed": reclaimed, "cleanup": cleanup})
+
         with transaction(_connect(layout), immediate=True) as conn:
             current = _validated_row(
                 conn, layout, _handle(lease_id, capability), validate_path=False,
             )
-            if current["state"] != "preparing" or int(current["generation"]) != generation:
-                raise InvalidWorkspaceHandleError(
-                    "workspace lease changed while it was being prepared"
-                )
+            if (
+                current["state"] != "preparing"
+                or int(current["generation"]) != generation
+                or current["acquire_intent_id"] != operation_id
+            ):
+                raise InvalidWorkspaceHandleError("workspace preparation lost its fence")
             detached, cleanup = _detach_workspace(
                 layout, workspace_id, lease_id, generation, "acquire", planned=planned_detached,
             )
-            cleanup["operation"] = "acquire"
-            cleanup["planned_detached_path"] = str(planned_detached)
+            cleanup.update({
+                "operation": "acquire", "planned_detached_path": str(planned_detached),
+            })
             _cleanup_receipt(conn, current, "acquire", "detached", cleanup)
             path = layout.workspaces_dir / workspace_id
             if detached is None and cleanup["disposition"] == "preserved":
@@ -809,104 +1085,112 @@ class PluginWorkspaces:
                     path.mkdir(mode=0o700)
                     if os.name != "nt":
                         os.chmod(path, 0o700)
-                    if path.is_symlink() or os.path.normcase(
-                        str(path.resolve(strict=True))
-                    ) != os.path.normcase(str(path.absolute())):
-                        raise WorkspacePathError(f"workspace path is not canonical: {path}")
+                    _validate_workspace_path(path)
+                    _sync_dirs(path, layout.workspaces_dir)
                 except (OSError, WorkspacePathError) as exc:
                     preparation_error = (
-                        exc if isinstance(exc, WorkspacePathError) else
-                        WorkspacePathError(f"cannot create canonical workspace {path}: {exc}")
+                        exc if isinstance(exc, WorkspacePathError)
+                        else WorkspacePathError(f"cannot create canonical workspace {path}: {exc}")
                     )
             if preparation_error is not None:
                 cleanup.update({
                     "disposition": "preserved",
-                    "preparation_error": (
-                        f"{type(preparation_error).__name__}: {preparation_error}"
-                    ),
+                    "preparation_error": f"{type(preparation_error).__name__}: {preparation_error}",
                 })
-                conn.execute(
+                failed_at = time.time()
+                changed = conn.execute(
                     """UPDATE workspace_leases SET state='released', released_at=?, cleanup_json=?,
-                       updated_at=? WHERE lease_id=? AND state='preparing' AND generation=?""",
+                       updated_at=? WHERE lease_id=? AND state='preparing' AND generation=?
+                       AND acquire_intent_id=?""",
                     (
-                        time.time(), json.dumps(cleanup, sort_keys=True), time.time(),
-                        lease_id, generation,
+                        failed_at, json.dumps(cleanup, sort_keys=True), failed_at,
+                        lease_id, generation, operation_id,
                     ),
+                ).rowcount
+                if changed != 1:
+                    raise InvalidWorkspaceHandleError("workspace preparation failure lost its fence")
+                conn.execute(
+                    """UPDATE workspace_lease_operations SET state='failed', updated_at=?
+                       WHERE operation_id=? AND output_lease_id=?""",
+                    (failed_at, operation_id, lease_id),
                 )
-                if conn.execute("SELECT changes()").fetchone()[0] != 1:
-                    raise InvalidWorkspaceHandleError(
-                        "workspace lease changed while preparation failed"
-                    )
                 failed = conn.execute(
-                    "SELECT * FROM workspace_leases WHERE lease_id=?", (lease_id,)
+                    "SELECT * FROM workspace_leases WHERE lease_id=?", (lease_id,),
                 ).fetchone()
                 _cleanup_receipt(conn, failed, "acquire", "failed", cleanup)
                 _event(conn, failed, "preparation_failed", {"cleanup": cleanup})
             else:
-                conn.execute(
-                    """UPDATE workspace_leases SET cleanup_json=?, updated_at=?
-                       WHERE lease_id=? AND state='preparing' AND generation=?""",
-                    (json.dumps(cleanup, sort_keys=True), time.time(), lease_id, generation),
-                )
-                if conn.execute("SELECT changes()").fetchone()[0] != 1:
-                    raise InvalidWorkspaceHandleError(
-                        "workspace lease changed while it was being prepared"
-                    )
-                prepared = conn.execute(
-                    "SELECT * FROM workspace_leases WHERE lease_id=?", (lease_id,)
-                ).fetchone()
-                _cleanup_receipt(conn, prepared, "acquire", "workspace_prepared", cleanup)
-                _event(conn, prepared, "workspace_prepared", {"cleanup": cleanup})
+                changed = conn.execute(
+                    """UPDATE workspace_leases SET cleanup_json=?, updated_at=? WHERE lease_id=?
+                       AND state='preparing' AND generation=? AND acquire_intent_id=?""",
+                    (
+                        json.dumps(cleanup, sort_keys=True), time.time(), lease_id,
+                        generation, operation_id,
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise InvalidWorkspaceHandleError("workspace preparation lost its fence")
 
         if preparation_error is not None:
             raise preparation_error
 
         if detached is not None:
             finished_cleanup = _finish_detached_cleanup(detached, cleanup)
-            finished_cleanup["operation"] = "acquire"
-            finished_cleanup["planned_detached_path"] = str(planned_detached)
+            finished_cleanup.update({
+                "operation": "acquire", "planned_detached_path": str(planned_detached),
+            })
             with transaction(_connect(layout), immediate=True) as conn:
                 changed = conn.execute(
-                    """UPDATE workspace_leases SET cleanup_json=?, updated_at=?
-                       WHERE lease_id=? AND state='preparing' AND generation=?""",
-                    (json.dumps(finished_cleanup, sort_keys=True), time.time(), lease_id, generation),
+                    """UPDATE workspace_leases SET cleanup_json=?, updated_at=? WHERE lease_id=?
+                       AND state='preparing' AND generation=? AND acquire_intent_id=?""",
+                    (
+                        json.dumps(finished_cleanup, sort_keys=True), time.time(), lease_id,
+                        generation, operation_id,
+                    ),
                 ).rowcount
                 if changed:
                     prepared = conn.execute(
-                        "SELECT * FROM workspace_leases WHERE lease_id=?", (lease_id,)
+                        "SELECT * FROM workspace_leases WHERE lease_id=?", (lease_id,),
                     ).fetchone()
                     _cleanup_receipt(
                         conn, prepared, "acquire", "predecessor_cleanup_completed",
                         finished_cleanup,
                     )
-                    _event(
-                        conn, prepared, "predecessor_cleanup_completed",
-                        {"cleanup": finished_cleanup},
-                    )
 
-        # Cleanup may be slow. Keep the generation in non-reclaimable ``preparing`` while it runs,
-        # then publish ``active`` with a fresh full TTL immediately before returning the handle.
         with transaction(_connect(layout), immediate=True) as conn:
             ready_at = time.time()
             current = _validated_row(
                 conn, layout, _handle(lease_id, capability), validate_path=False,
             )
-            if current["state"] != "preparing" or int(current["generation"]) != generation:
-                raise InvalidWorkspaceHandleError("workspace lease changed before acquisition completed")
+            if (
+                current["state"] != "preparing"
+                or int(current["generation"]) != generation
+                or current["acquire_intent_id"] != operation_id
+            ):
+                raise InvalidWorkspaceHandleError("workspace activation lost its fence")
             _validate_workspace_path(Path(current["workspace_path"]))
             changed = conn.execute(
                 """UPDATE workspace_leases SET state='active', heartbeat_at=?, expires_at=?,
-                   updated_at=? WHERE lease_id=? AND state='preparing' AND generation=?""",
-                (ready_at, ready_at + ttl, ready_at, lease_id, generation),
+                   updated_at=? WHERE lease_id=? AND state='preparing' AND generation=?
+                   AND acquire_intent_id=?""",
+                (ready_at, ready_at + ttl, ready_at, lease_id, generation, operation_id),
             ).rowcount
             if changed != 1:
-                raise InvalidWorkspaceHandleError("workspace lease changed before acquisition completed")
+                raise InvalidWorkspaceHandleError("workspace activation lost its fence")
+            operation_changed = conn.execute(
+                """UPDATE workspace_lease_operations SET state='committed', updated_at=?
+                   WHERE operation_id=? AND kind='acquire' AND output_lease_id=?
+                   AND generation=? AND state='preparing'""",
+                (ready_at, operation_id, lease_id, generation),
+            ).rowcount
+            if operation_changed != 1:
+                raise InvalidWorkspaceHandleError("workspace acquire receipt lost its fence")
             active = conn.execute(
-                "SELECT * FROM workspace_leases WHERE lease_id=?", (lease_id,)
+                "SELECT * FROM workspace_leases WHERE lease_id=?", (lease_id,),
             ).fetchone()
             _cleanup_receipt(conn, active, "acquire", "ready", json.loads(active["cleanup_json"]))
-            _event(conn, active, "acquired", {"reclaimed": reclaimed})
-        return _handle(lease_id, capability)
+            _event(conn, active, "acquired", {"reclaimed": reclaimed, "operation_id": operation_id})
+        return _response_handle(lease_id, capability)
 
     def renew(
         self, handle: Mapping[str, Any], *, ttl_seconds: float | None = None,
@@ -935,48 +1219,136 @@ class PluginWorkspaces:
             return _public_snapshot(conn, updated)
 
     def reconnect(
-        self, handle: Mapping[str, Any], *, ttl_seconds: float | None = None,
+        self, handle: Mapping[str, Any], *, intent: Mapping[str, Any],
+        ttl_seconds: float | None = None,
     ) -> dict[str, Any]:
+        predecessor_lease_id, predecessor_capability = _parse_handle(handle)
+        operation_id, successor_capability = _parse_intent(intent)
+        predecessor_hash = _capability_hash(predecessor_capability)
+        successor_hash = _capability_hash(successor_capability)
+        if hmac.compare_digest(predecessor_hash, successor_hash):
+            raise InvalidWorkspaceHandleError(
+                "reconnect intent must use a fresh successor capability"
+            )
         layout = self._layout()
         with transaction(_connect(layout), immediate=True) as conn:
             now = time.time()
-            row = _validated_row(conn, layout, handle, validate_path=False)
-            if row["state"] != "active":
-                raise InvalidWorkspaceHandleError("workspace lease has been released")
-            _validate_workspace_path(Path(row["workspace_path"]))
-            owner_status = _owner_status(row)
-            expired = float(row["expires_at"]) <= now
-            if owner_status in {"live", "unknown"} and not expired:
-                raise WorkspaceOwnershipError("workspace lease still belongs to another live process")
-            ttl = _ttl(row["ttl_seconds"] if ttl_seconds is None else ttl_seconds)
-            previous_lease_id = row["lease_id"]
-            _event(conn, row, "reconnect_started", {"expired": expired})
-            successor_lease_id, successor_capability = str(uuid.uuid4()), secrets.token_urlsafe(32)
-            pid, created, host, instance = _owner_stamp()
-            conn.execute(
-                """UPDATE workspace_leases SET owner_pid=?, owner_create_time=?, owner_host=?,
-                   owner_instance=?, ttl_seconds=?, heartbeat_at=?, expires_at=?, updated_at=?,
-                   lease_id=?, capability_hash=?, generation=generation+1
-                   WHERE lease_id=? AND state='active' AND generation=?""",
-                (
-                    pid, created, host, instance, ttl, now, now + ttl, now, successor_lease_id,
-                    _capability_hash(successor_capability), previous_lease_id, row["generation"],
-                ),
-            )
-            if conn.execute("SELECT changes()").fetchone()[0] != 1:
-                raise InvalidWorkspaceHandleError("workspace lease changed during reconnect")
-            updated = conn.execute(
-                "SELECT * FROM workspace_leases WHERE lease_id=?", (successor_lease_id,)
+            operation = conn.execute(
+                "SELECT * FROM workspace_lease_operations WHERE operation_id=?",
+                (operation_id,),
             ).fetchone()
-            _event(conn, updated, "reconnected", {
-                "predecessor_lease_id": previous_lease_id,
-                "previous_owner": "expired" if expired else owner_status,
-            })
-            return _handle(successor_lease_id, successor_capability)
+            if operation is not None:
+                ttl = _ttl(operation["ttl_seconds"] if ttl_seconds is None else ttl_seconds)
+                fingerprint = _operation_fingerprint(
+                    layout, "reconnect", operation["workspace_id"], ttl,
+                    predecessor_lease_id,
+                )
+                _validate_operation(
+                    operation, kind="reconnect", workspace_id=operation["workspace_id"],
+                    fingerprint=fingerprint, output_capability_hash=successor_hash,
+                    input_lease_id=predecessor_lease_id,
+                    input_capability_hash=predecessor_hash,
+                )
+                if operation["state"] != "committed":
+                    raise InvalidWorkspaceHandleError("workspace reconnect intent is not committed")
+                row = conn.execute(
+                    "SELECT * FROM workspace_leases WHERE lease_id=?",
+                    (operation["output_lease_id"],),
+                ).fetchone()
+                if (
+                    row is None
+                    or row["state"] != "active"
+                    or int(row["generation"]) != int(operation["generation"])
+                    or row["plugin_identity"] != layout.plugin_identity
+                    or row["profile_key"] != layout.profile_key
+                    or not hmac.compare_digest(row["capability_hash"], successor_hash)
+                ):
+                    conn.execute(
+                        """UPDATE workspace_lease_operations SET state='superseded', updated_at=?
+                           WHERE operation_id=?""",
+                        (now, operation_id),
+                    )
+                    raise InvalidWorkspaceHandleError("workspace reconnect intent was superseded")
+                owner_status = _owner_status(row)
+                expired = float(row["expires_at"]) <= now
+                if owner_status in {"live", "unknown"} and not expired:
+                    raise WorkspaceOwnershipError(
+                        "workspace lease still belongs to another live process"
+                    )
+                _validate_workspace_path(Path(row["workspace_path"]))
+                changed = conn.execute(
+                    """UPDATE workspace_leases SET owner_pid=?, owner_create_time=?, owner_host=?,
+                       owner_instance=?, ttl_seconds=?, heartbeat_at=?, expires_at=?, updated_at=?
+                       WHERE lease_id=? AND generation=? AND state='active'""",
+                    (
+                        *_owner_stamp(), ttl, now, now + ttl, now,
+                        row["lease_id"], row["generation"],
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise InvalidWorkspaceHandleError("workspace reconnect replay lost its fence")
+                updated = conn.execute(
+                    "SELECT * FROM workspace_leases WHERE lease_id=?", (row["lease_id"],),
+                ).fetchone()
+                _event(conn, updated, "reconnect_replayed", {"operation_id": operation_id})
+                successor_lease_id = str(updated["lease_id"])
+            else:
+                row = _validated_row(conn, layout, handle, validate_path=False)
+                ttl = _ttl(row["ttl_seconds"] if ttl_seconds is None else ttl_seconds)
+                fingerprint = _operation_fingerprint(
+                    layout, "reconnect", row["workspace_id"], ttl, predecessor_lease_id,
+                )
+                if row["state"] != "active":
+                    raise InvalidWorkspaceHandleError("workspace lease has been released")
+                _validate_workspace_path(Path(row["workspace_path"]))
+                owner_status = _owner_status(row)
+                expired = float(row["expires_at"]) <= now
+                if owner_status in {"live", "unknown"} and not expired:
+                    raise WorkspaceOwnershipError(
+                        "workspace lease still belongs to another live process"
+                    )
+                successor_lease_id = str(uuid.uuid4())
+                successor_generation = int(row["generation"]) + 1
+                _supersede_lease_operations(conn, predecessor_lease_id, now)
+                conn.execute(
+                    """INSERT INTO workspace_lease_operations
+                       (operation_id, kind, workspace_id, request_fingerprint, input_lease_id,
+                        input_capability_hash, output_lease_id, output_capability_hash,
+                        generation, ttl_seconds, state, created_at, updated_at)
+                       VALUES (?, 'reconnect', ?, ?, ?, ?, ?, ?, ?, ?, 'committed', ?, ?)""",
+                    (
+                        operation_id, row["workspace_id"], fingerprint,
+                        predecessor_lease_id, predecessor_hash, successor_lease_id,
+                        successor_hash, successor_generation, ttl, now, now,
+                    ),
+                )
+                pid, created, host, instance = _owner_stamp()
+                changed = conn.execute(
+                    """UPDATE workspace_leases SET owner_pid=?, owner_create_time=?, owner_host=?,
+                       owner_instance=?, ttl_seconds=?, heartbeat_at=?, expires_at=?, updated_at=?,
+                       lease_id=?, capability_hash=?, generation=?
+                       WHERE lease_id=? AND state='active' AND generation=?""",
+                    (
+                        pid, created, host, instance, ttl, now, now + ttl, now,
+                        successor_lease_id, successor_hash, successor_generation,
+                        predecessor_lease_id, row["generation"],
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise InvalidWorkspaceHandleError("workspace lease changed during reconnect")
+                updated = conn.execute(
+                    "SELECT * FROM workspace_leases WHERE lease_id=?", (successor_lease_id,),
+                ).fetchone()
+                _event(conn, updated, "reconnected", {
+                    "operation_id": operation_id,
+                    "predecessor_lease_id": predecessor_lease_id,
+                    "previous_owner": "expired" if expired else owner_status,
+                })
+        return _response_handle(successor_lease_id, successor_capability)
 
     def inspect(self, handle: Mapping[str, Any]) -> dict[str, Any]:
         layout = self._layout()
-        with transaction(_connect(layout)) as conn:
+        with transaction(_connect(layout), immediate=True) as conn:
             row = _validated_row(conn, layout, handle, validate_path=False)
             now = time.time()
             if row["state"] != "active":
@@ -1057,6 +1429,7 @@ class PluginWorkspaces:
                     ).rowcount
                     if changed != 1:
                         raise InvalidWorkspaceHandleError("workspace lease changed during release")
+                    _supersede_lease_operations(conn, row["lease_id"], now)
                     row = conn.execute(
                         "SELECT * FROM workspace_leases WHERE lease_id=?", (row["lease_id"],)
                     ).fetchone()
@@ -1110,6 +1483,11 @@ class PluginWorkspaces:
         cleanup["planned_detached_path"] = str(planned)
         finished = time.time()
         with transaction(_connect(layout), immediate=True) as conn:
+            # Receipt/event ownership is immutable per generation and does not depend on the mutable
+            # current-row CAS: a successor may already own the canonical workspace while this detached
+            # predecessor finishes its slow cleanup.
+            _cleanup_receipt(conn, row, "release", "cleanup_completed", cleanup)
+            _event(conn, row, "cleanup_completed", {"cleanup": cleanup})
             changed = conn.execute(
                 """UPDATE workspace_leases SET cleanup_json=?, updated_at=?
                    WHERE lease_id=? AND state='released' AND generation=?""",
@@ -1119,12 +1497,14 @@ class PluginWorkspaces:
                 ),
             ).rowcount
             if not changed:
-                return released_snapshot
+                assert released_snapshot is not None
+                actual = dict(released_snapshot)
+                actual["cleanup"] = cleanup
+                actual["cleanupReceipts"] = _cleanup_history(conn, row["workspace_id"])
+                return actual
             updated = conn.execute(
                 "SELECT * FROM workspace_leases WHERE lease_id=?", (row["lease_id"],)
             ).fetchone()
-            _cleanup_receipt(conn, updated, "release", "cleanup_completed", cleanup)
-            _event(conn, updated, "cleanup_completed", {"cleanup": cleanup})
             return _public_snapshot(conn, updated)
 
 

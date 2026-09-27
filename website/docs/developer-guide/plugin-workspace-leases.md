@@ -59,27 +59,41 @@ invent or infer the bound-dispatch feature name from `workspace_leases.v1`.
 
 ## Lifecycle API
 
-The facade has five methods:
+The facade exposes the five lifecycle methods plus `new_intent()`, which creates the durable
+idempotency material required by `acquire` and `reconnect`:
 
 ```python
-handle = ctx.workspaces.acquire("run-01", ttl_seconds=300)
+acquire_intent = ctx.workspaces.new_intent()
+persist_before_call("run-01.acquire", acquire_intent)
+handle = ctx.workspaces.acquire("run-01", intent=acquire_intent, ttl_seconds=300)
 snapshot = ctx.workspaces.inspect(handle)
 snapshot = ctx.workspaces.renew(handle, ttl_seconds=300)
-successor = ctx.workspaces.reconnect(handle, ttl_seconds=300)
+
+reconnect_intent = ctx.workspaces.new_intent()
+persist_before_call("run-01.reconnect", reconnect_intent)
+successor = ctx.workspaces.reconnect(
+    handle, intent=reconnect_intent, ttl_seconds=300,
+)
 released = ctx.workspaces.release(successor)
 ```
 
 | Method | Contract |
 |---|---|
-| `acquire(workspace_id, *, ttl_seconds=300)` | Exclusively reserves a canonical directory and returns a new opaque handle. A live, unexpired generation cannot be acquired twice. |
+| `new_intent()` | Returns a JSON-serializable, single-operation bearer intent. Persist it before calling `acquire` or `reconnect`; never reuse it for another operation. |
+| `acquire(workspace_id, *, intent, ttl_seconds=300)` | Exclusively reserves a canonical directory and returns a new opaque handle. Retrying the exact request with the same persisted intent returns the same committed handle. |
 | `inspect(handle)` | Validates the handle, scope, path, state, and TTL, then returns the current snapshot. It does not renew the heartbeat. |
 | `renew(handle, *, ttl_seconds=None)` | Extends the heartbeat for the current process owner and returns the updated snapshot. |
-| `reconnect(handle, *, ttl_seconds=None)` | Reclaims a lease after a process restart when ownership can be proven safe. It rotates the lease ID and bearer capability and returns a successor handle. |
+| `reconnect(handle, *, intent, ttl_seconds=None)` | Reclaims a lease after a process restart, rotating the handle. Retrying with the predecessor handle and same intent returns that exact committed successor. |
 | `release(handle)` | Atomically detaches the leased path, records the released state, and then cleans or quarantines its contents. Repeating release with the same current handle is safe. |
 
 `ttl_seconds` must be finite and between 1 second and 24 hours. A worker should renew well before
 expiry and persist the returned handle before it begins work that must survive a host restart.
 Another live process cannot renew, reconnect, or release an unexpired lease it does not own.
+The operation intent must be durable before the call: it is the only copy of the future bearer if
+the worker exits after Hermes commits but before the response reaches plugin state. Hermes stores
+only its capability digest and an immutable operation receipt. A retry must use the same workspace,
+TTL, predecessor (for reconnect), operation ID, and capability; mismatches and superseded intents
+are rejected.
 
 `workspace_id` is a stable plugin-chosen identifier: 1–128 lowercase ASCII letters, digits,
 periods, underscores, or hyphens. It must start with a letter or digit, may not contain `..`, and
@@ -96,6 +110,9 @@ A handle is a JSON-serializable bearer capability with exactly three fields:
   "capability": "opaque bearer secret"
 }
 ```
+
+An operation intent is similarly opaque and serializable, but carries `operation_id` instead of
+`lease_id`. Do not put either object in logs or model-visible data.
 
 It deliberately contains no filesystem path, plugin name, or profile path. Hermes persists only a
 digest of the bearer capability in the lease database. Treat the complete handle as secret plugin
