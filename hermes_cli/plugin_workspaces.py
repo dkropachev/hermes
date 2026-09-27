@@ -30,7 +30,6 @@ from hermes_constants import get_hermes_home, hermes_home_key, mkdir_under_herme
 from hermes_cli.plugins_manifest import _portable_skill_namespace
 from hermes_cli.process_identity import _pid_alive_matches, _process_create_time
 from hermes_cli.sqlite_util import open_db, transaction
-from utils import fsync_directory
 
 
 HOST_FEATURE = "workspace_leases.v1"
@@ -71,6 +70,14 @@ class WorkspaceOwnershipError(WorkspaceLeaseError):
 
 class WorkspacePathError(WorkspaceLeaseError):
     """The workspace layout cannot be proven safe and canonical."""
+
+
+class WorkspaceDurabilityError(WorkspacePathError):
+    """A filesystem mutation completed, but its metadata could not be durably flushed."""
+
+    def __init__(self, message: str, *, mutation_completed: bool) -> None:
+        super().__init__(message)
+        self.mutation_completed = mutation_completed
 
 
 @dataclass(frozen=True)
@@ -186,9 +193,74 @@ def _workspace_lock(layout: _Layout, workspace_id: str):
         yield
 
 
+def _strict_sync_directory(path: Path) -> None:
+    """Durably flush one directory or raise; unlike ``utils.fsync_directory``, never best-effort."""
+    if os.name == "nt":  # pragma: no cover - exercised on Windows CI
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = (
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+        )
+        create_file.restype = wintypes.HANDLE
+        flush = kernel32.FlushFileBuffers
+        flush.argtypes = (wintypes.HANDLE,)
+        flush.restype = wintypes.BOOL
+        close = kernel32.CloseHandle
+        close.argtypes = (wintypes.HANDLE,)
+        close.restype = wintypes.BOOL
+        handle = create_file(
+            str(path), 0x40000000, 0x00000001 | 0x00000002 | 0x00000004,
+            None, 3, 0x02000000 | 0x80000000, None,
+        )
+        invalid = ctypes.c_void_p(-1).value
+        if handle == invalid:
+            raise ctypes.WinError(ctypes.get_last_error())
+        error = None
+        try:
+            if not flush(handle):
+                error = ctypes.WinError(ctypes.get_last_error())
+        finally:
+            if not close(handle) and error is None:
+                error = ctypes.WinError(ctypes.get_last_error())
+        if error is not None:
+            raise error
+        return
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _sync_dirs(*paths: Path) -> None:
     for path in dict.fromkeys(paths):
-        fsync_directory(path)
+        _strict_sync_directory(path)
+
+
+def _strict_replace(source: Path, target: Path, *sync_dirs: Path) -> None:
+    """Rename with write-through semantics, then strictly flush affected directories."""
+    if os.name == "nt":  # pragma: no cover - exercised on Windows CI
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        move = kernel32.MoveFileExW
+        move.argtypes = (ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32)
+        move.restype = ctypes.c_int
+        if not move(str(source), str(target), 0x1 | 0x8):  # REPLACE_EXISTING | WRITE_THROUGH
+            raise ctypes.WinError(ctypes.get_last_error())
+    else:
+        os.replace(source, target)
+    try:
+        _sync_dirs(*sync_dirs)
+    except OSError as exc:
+        raise WorkspaceDurabilityError(
+            f"filesystem rename completed but metadata flush failed: {exc}",
+            mutation_completed=True,
+        ) from exc
 
 
 def _safe_child(parent: Path, name: str) -> Path:
@@ -567,6 +639,25 @@ def _cleanup_history(conn, workspace_id: str) -> list[dict[str, Any]]:
     ]
 
 
+def _event_history(conn, workspace_id: str) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """SELECT lease_id, generation, event_type, occurred_at, actor_pid,
+                  actor_create_time, details_json
+           FROM workspace_lease_events WHERE workspace_id=?
+           ORDER BY event_id DESC LIMIT 50""",
+        (workspace_id,),
+    ).fetchall()
+    return [
+        {
+            "type": row["event_type"], "at": float(row["occurred_at"]),
+            "leaseId": row["lease_id"], "generation": int(row["generation"]),
+            "actorPid": int(row["actor_pid"]), "actorCreateTime": row["actor_create_time"],
+            "details": json.loads(row["details_json"]),
+        }
+        for row in reversed(rows)
+    ]
+
+
 def _git(workspace: Path, *args: str) -> subprocess.CompletedProcess[str]:
     allowed = ("PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC", "TMPDIR", "TEMP", "TMP")
     env = {key: os.environ[key] for key in allowed if key in os.environ}
@@ -663,8 +754,9 @@ def _detach_workspace(
             "cleanup_error": "both canonical and planned detached paths exist",
         }
     try:
-        os.replace(path, detached)
-        _sync_dirs(layout.workspaces_dir, layout.quarantine_dir)
+        _strict_replace(
+            path, detached, layout.workspaces_dir, layout.quarantine_dir,
+        )
     except OSError as exc:
         return None, {
             "classification": "uncertain", "disposition": "preserved",
@@ -767,8 +859,9 @@ def _reconcile_pending_generation(conn, layout: _Layout, row: Mapping[str, Any])
                 target = recovery_base.with_name(f"{recovery_base.name}-{suffix}")
                 suffix += 1
         try:
-            os.replace(canonical, target)
-            _sync_dirs(layout.workspaces_dir, layout.quarantine_dir)
+            _strict_replace(
+                canonical, target, layout.workspaces_dir, layout.quarantine_dir,
+            )
             remember("canonical", target)
         except OSError as exc:
             raise WorkspacePathError(
@@ -789,12 +882,6 @@ def _reconcile_pending_generation(conn, layout: _Layout, row: Mapping[str, Any])
 
 def _public_snapshot(conn, row: Mapping[str, Any]) -> dict[str, Any]:
     cleanup = json.loads(row["cleanup_json"]) if row["cleanup_json"] else None
-    events = conn.execute(
-        """SELECT lease_id, generation, event_type, occurred_at, actor_pid,
-                  actor_create_time, details_json
-           FROM workspace_lease_events WHERE workspace_id=? ORDER BY event_id DESC LIMIT 50""",
-        (row["workspace_id"],),
-    ).fetchall()
     return {
         "contractVersion": int(row["contract_version"]),
         "leaseId": row["lease_id"],
@@ -813,15 +900,7 @@ def _public_snapshot(conn, row: Mapping[str, Any]) -> dict[str, Any]:
         "ttlSeconds": float(row["ttl_seconds"]),
         "cleanup": cleanup,
         "cleanupReceipts": _cleanup_history(conn, row["workspace_id"]),
-        "events": [
-            {
-                "type": event["event_type"], "at": float(event["occurred_at"]),
-                "leaseId": event["lease_id"], "generation": int(event["generation"]),
-                "actorPid": int(event["actor_pid"]), "actorCreateTime": event["actor_create_time"],
-                "details": json.loads(event["details_json"]),
-            }
-            for event in reversed(events)
-        ],
+        "events": _event_history(conn, row["workspace_id"]),
     }
 
 
@@ -1501,6 +1580,7 @@ class PluginWorkspaces:
                 actual = dict(released_snapshot)
                 actual["cleanup"] = cleanup
                 actual["cleanupReceipts"] = _cleanup_history(conn, row["workspace_id"])
+                actual["events"] = _event_history(conn, row["workspace_id"])
                 return actual
             updated = conn.execute(
                 "SELECT * FROM workspace_leases WHERE lease_id=?", (row["lease_id"],)
@@ -1511,5 +1591,6 @@ class PluginWorkspaces:
 __all__ = [
     "DEFAULT_TTL_SECONDS", "HANDLE_VERSION", "HOST_FEATURE", "PluginWorkspaces",
     "InvalidWorkspaceHandleError", "WorkspaceInUseError", "WorkspaceLeaseError",
-    "WorkspaceLeaseExpiredError", "WorkspaceOwnershipError", "WorkspacePathError",
+    "WorkspaceDurabilityError", "WorkspaceLeaseExpiredError", "WorkspaceOwnershipError",
+    "WorkspacePathError",
 ]

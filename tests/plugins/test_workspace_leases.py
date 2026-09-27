@@ -939,19 +939,27 @@ def test_detach_sync_fault_is_retryable_with_same_intent(
             (predecessor["lease_id"],),
         )
     intent = ctx.workspaces.new_intent()
-    original = plugin_workspaces._sync_dirs
+    original = plugin_workspaces._strict_sync_directory
     fail_once = [True]
 
-    def fail_after_rename(*paths):
+    def fail_after_rename(path):
         if fail_once[0]:
             fail_once[0] = False
-            raise RuntimeError("power loss after rename")
-        return original(*paths)
+            raise OSError("power loss after rename")
+        return original(path)
 
-    monkeypatch.setattr(plugin_workspaces, "_sync_dirs", fail_after_rename)
-    with pytest.raises(RuntimeError, match="power loss"):
+    monkeypatch.setattr(plugin_workspaces, "_strict_sync_directory", fail_after_rename)
+    with pytest.raises(plugin_workspaces.WorkspaceDurabilityError) as raised:
         _acquire(ctx, "detach-fault", intent=intent)
-    monkeypatch.setattr(plugin_workspaces, "_sync_dirs", original)
+    assert raised.value.mutation_completed is True
+    with sqlite3.connect(db) as conn:
+        state, cleanup_json = conn.execute(
+            "SELECT state, cleanup_json FROM workspace_leases WHERE workspace_id='detach-fault'"
+        ).fetchone()
+    assert state == "preparing"
+    deterministic = Path(json.loads(cleanup_json)["planned_detached_path"])
+    assert (deterministic / "preserve.txt").read_text(encoding="utf-8") == "old"
+    monkeypatch.setattr(plugin_workspaces, "_strict_sync_directory", original)
 
     successor = _acquire(ctx, "detach-fault", intent=intent)
     snapshot = ctx.workspaces.inspect(successor)
@@ -969,6 +977,48 @@ def test_detach_sync_fault_is_retryable_with_same_intent(
         path and Path(path, "preserve.txt").exists()
         for path in quarantine_paths
     )
+
+
+def test_mkdir_strict_flush_failure_never_commits_active_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import plugin_workspaces
+
+    home = tmp_path / "home"
+    ctx = _context(home)
+    intent = ctx.workspaces.new_intent()
+    original = plugin_workspaces._strict_sync_directory
+    fail_once = [True]
+
+    def fail_workspace_dir(path):
+        if path.name == "mkdir-flush" and fail_once[0]:
+            fail_once[0] = False
+            raise OSError("strict directory flush failed")
+        return original(path)
+
+    monkeypatch.setattr(plugin_workspaces, "_strict_sync_directory", fail_workspace_dir)
+    with pytest.raises(plugin_workspaces.WorkspacePathError, match="flush failed"):
+        _acquire(ctx, "mkdir-flush", intent=intent)
+    db = home / "plugin-data/pr-review/workspace-leases.db"
+    with sqlite3.connect(db) as conn:
+        state = conn.execute(
+            "SELECT state FROM workspace_leases WHERE workspace_id='mkdir-flush'"
+        ).fetchone()[0]
+    assert state == "released"
+    monkeypatch.setattr(plugin_workspaces, "_strict_sync_directory", original)
+    assert ctx.workspaces.inspect(_acquire(ctx, "mkdir-flush", intent=intent))["state"] == "active"
+
+
+@pytest.mark.windows_only
+def test_windows_strict_metadata_flush_and_write_through_move(tmp_path: Path) -> None:
+    from hermes_cli import plugin_workspaces
+
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.mkdir()
+    plugin_workspaces._strict_sync_directory(source)
+    plugin_workspaces._strict_replace(source, target, tmp_path)
+    assert target.is_dir() and not source.exists()
 
 
 def test_live_pid_is_not_killed_by_unstable_wall_clock_boot_time(
@@ -1025,6 +1075,11 @@ def test_slow_release_cleanup_records_old_generation_after_successor_acquires(
         receipt["leaseId"] == old["lease_id"]
         and receipt["phase"] == "cleanup_completed"
         for receipt in receipts
+    )
+    assert any(
+        event["leaseId"] == old["lease_id"]
+        and event["type"] == "cleanup_completed"
+        for event in released["events"]
     )
 
 

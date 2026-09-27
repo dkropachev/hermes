@@ -170,7 +170,11 @@ generation, rotates the handle, and fences the predecessor.
 
 Release and stale-generation reclamation first rename the old directory away from its public
 workspace name. That atomic detach prevents delayed cleanup from deleting a successor that has
-already acquired the same `workspace_id`.
+already acquired the same `workspace_id`. Hermes treats the filesystem transition as durable only
+after a strict directory-metadata flush succeeds: POSIX uses directory `fsync`; Windows uses
+write-through `MoveFileEx` plus directory handles opened with backup semantics and
+`FlushFileBuffers`. A flush error fails the operation before its success state commits, while the
+deterministic detached name lets the same intent reconcile a rename that physically completed.
 
 Hermes removes only work it can prove disposable:
 
@@ -207,6 +211,7 @@ if getattr(ctx, "has_host_feature", lambda _name: False)("workspace_leases.v1"):
 | `WorkspaceLeaseExpiredError` | The handle expired and must be reconnected before direct use. |
 | `WorkspaceOwnershipError` | A different live or unverifiable process owns the lease. |
 | `InvalidWorkspaceHandleError` | The handle is malformed, stale, released, tampered with, or belongs to another plugin/profile. |
+| `WorkspaceDurabilityError` | A filesystem mutation completed but its strict metadata flush failed; retry the same persisted intent so Hermes reconciles its deterministic name. |
 | `WorkspacePathError` | Hermes cannot prove the on-disk path or lease database is canonical and safe. |
 
 Fail closed on all of these. In particular, never fall back to an arbitrary temporary directory
