@@ -226,6 +226,20 @@ def test_reconnect_intent_replays_successor_after_lost_response(tmp_path: Path) 
     with pytest.raises(InvalidWorkspaceIntentError, match="TTL mode"):
         ctx.workspaces.reconnect(explicit_predecessor, intent=explicit_intent)
 
+    # Receipts created before the argument-presence column cannot prove whether
+    # their original call omitted TTL.  Migration preserves replayability by
+    # representing that mode as unknown rather than guessing false.
+    db = tmp_path / "home/plugin-data/pr-review/workspace-leases.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE workspace_lease_operations SET ttl_seconds_provided=NULL "
+            "WHERE operation_id=?",
+            (explicit_intent["operation_id"],),
+        )
+    assert ctx.workspaces.reconnect(
+        explicit_predecessor, intent=explicit_intent, ttl_seconds=123,
+    ) == explicit_successor
+
 
 def test_legacy_operation_receipts_gain_ttl_presence_column(tmp_path: Path) -> None:
     import hermes_cli.plugin_workspaces as workspace_module
@@ -245,8 +259,8 @@ def test_legacy_operation_receipts_gain_ttl_presence_column(tmp_path: Path) -> N
         columns = {
             row[1]: row for row in conn.execute("PRAGMA table_info(workspace_lease_operations)")
         }
-    assert columns["ttl_seconds_provided"][3] == 1
-    assert columns["ttl_seconds_provided"][4] == "0"
+    assert columns["ttl_seconds_provided"][3] == 0
+    assert columns["ttl_seconds_provided"][4] is None
 
 
 def test_fresh_database_identity_binding_is_serialized(tmp_path: Path) -> None:

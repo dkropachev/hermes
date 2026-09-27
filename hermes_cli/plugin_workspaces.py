@@ -213,7 +213,7 @@ def _initialize(conn) -> None:
             output_capability_hash TEXT NOT NULL,
             plugin_identity_digest TEXT NOT NULL,
             ttl_seconds REAL NOT NULL,
-            ttl_seconds_provided INTEGER NOT NULL DEFAULT 0
+            ttl_seconds_provided INTEGER
                 CHECK (ttl_seconds_provided IN (0, 1)),
             result_generation INTEGER,
             state TEXT NOT NULL CHECK (state IN ('planned', 'committed', 'failed')),
@@ -243,7 +243,7 @@ def _initialize(conn) -> None:
             conn,
             "workspace_lease_operations",
             "ttl_seconds_provided",
-            "ttl_seconds_provided INTEGER NOT NULL DEFAULT 0 "
+            "ttl_seconds_provided INTEGER "
             "CHECK (ttl_seconds_provided IN (0, 1))",
         )
 
@@ -456,9 +456,11 @@ def _validate_operation(
         str(operation["plugin_identity_digest"]), layout.plugin_identity_digest,
     ):
         raise InvalidWorkspaceIntentError("workspace operation intent belongs to another plugin")
+    stored_ttl_mode = operation["ttl_seconds_provided"]
     if (
         ttl_seconds_provided is not None
-        and bool(operation["ttl_seconds_provided"]) != ttl_seconds_provided
+        and stored_ttl_mode is not None
+        and bool(stored_ttl_mode) != ttl_seconds_provided
     ):
         raise InvalidWorkspaceIntentError(
             "workspace operation intent was reused with another TTL mode"
