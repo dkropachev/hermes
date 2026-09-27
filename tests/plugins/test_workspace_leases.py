@@ -1668,7 +1668,10 @@ def test_simultaneous_release_of_empty_workspace_converges_on_removed(
     barrier = threading.Barrier(2)
 
     def synchronize_cleanup(path, receipt):
-        barrier.wait(timeout=10)
+        # The full suite runs 64 isolated pytest processes concurrently on this
+        # host, so the sibling release may be descheduled for well over ten
+        # seconds even though the synchronization itself is healthy.
+        barrier.wait(timeout=60)
         return original(path, receipt)
 
     monkeypatch.setattr(plugin_workspaces, "_finish_detached_cleanup", synchronize_cleanup)
@@ -1677,7 +1680,7 @@ def test_simultaneous_release_of_empty_workspace_converges_on_removed(
             pool.submit(ctx.workspaces.release, handle),
             pool.submit(ctx.workspaces.release, handle),
         ]
-        released = [future.result(timeout=10) for future in outcomes]
+        released = [future.result(timeout=60) for future in outcomes]
 
     assert {snapshot["cleanup"]["disposition"] for snapshot in released} == {"removed"}
     final = ctx.workspaces.release(handle)
