@@ -72,6 +72,30 @@ class _Layout:
     db_path: Path
 
 
+class _AnchoredConnection:
+    """SQLite connection whose descriptor/reparse-safe data root stays held until close."""
+
+    def __init__(self, conn, held_data: _HeldDirectory) -> None:
+        self._conn = conn
+        self._held_data = held_data
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def __enter__(self):
+        self._conn.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return self._conn.__exit__(exc_type, exc, tb)
+
+    def close(self) -> None:
+        try:
+            self._conn.close()
+        finally:
+            self._held_data.__exit__(None, None, None)
+
+
 def _native_hashed_namespace(plugin_id: str) -> str:
     slug = "".join(
         ch if ch.isascii() and (ch.isalnum() or ch in "_-") else "-"
@@ -336,39 +360,44 @@ def _initialize(conn, layout: _Layout) -> None:
 
 
 def _connect(layout: _Layout):
-    sidecars = (
-        layout.db_path,
-        Path(str(layout.db_path) + "-wal"),
-        Path(str(layout.db_path) + "-shm"),
-    )
-    if any(path.is_symlink() for path in sidecars):
-        raise WorkspacePathError(f"workspace lease database files cannot be symlinks: {layout.db_path}")
-    with _HeldDirectory(layout.data_dir) as held_data:
+    sidecar_names = ("workspace-leases.db", "workspace-leases.db-wal", "workspace-leases.db-shm")
+    held_data = _HeldDirectory(layout.data_dir)
+    held_data.__enter__()
+    try:
+        for name in sidecar_names:
+            try:
+                info = held_data.stat(name)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                raise WorkspacePathError(
+                    f"workspace lease database sidecar is unsafe: {layout.data_dir / name}"
+                )
+        db_open_path = held_data.child_path("workspace-leases.db")
         conn = open_db(
-            layout.db_path,
+            db_open_path,
             db_label=f"plugin-data/{layout.plugin_namespace}/workspace-leases.db",
             foreign_keys=True,
             synchronous_full=True,
             wal_lock_retries=5,
             initialize=lambda conn: _initialize(conn, layout),
         )
-        try:
-            held_data.verify()
-            if layout.db_path.is_symlink() or layout.db_path.resolve(strict=True).parent != layout.data_dir:
-                raise WorkspacePathError("workspace lease database resolved outside its plugin namespace")
-            if os.name != "nt":
-                for path in sidecars:
-                    if path.exists():
-                        if path.is_symlink() or not path.is_file():
-                            raise WorkspacePathError(
-                                f"workspace lease database sidecar is unsafe: {path}"
-                            )
-                        os.chmod(path, 0o600)
-            held_data.verify()
-        except BaseException:
+        held_data.verify()
+        if os.name != "nt":
+            for name in sidecar_names:
+                if held_data.exists(name):
+                    if not held_data.is_regular_file(name):
+                        raise WorkspacePathError(
+                            f"workspace lease database sidecar is unsafe: {layout.data_dir / name}"
+                        )
+                    held_data.chmod(name, 0o600)
+        held_data.verify()
+        return _AnchoredConnection(conn, held_data)
+    except BaseException:
+        if "conn" in locals():
             conn.close()
-            raise
-    return conn
+        held_data.__exit__(*sys.exc_info())
+        raise
 
 
 def _host_instance() -> str:
@@ -440,6 +469,16 @@ def _owner_status(row: Mapping[str, Any]) -> str:
         return "dead"
     if pid <= 0:
         return "dead"
+    recorded_create = _row_value(row, "owner_create_time")
+    if pid == os.getpid() and recorded_create is not None:
+        current_create = _process_create_time()
+        if current_create is None:
+            return "unknown"
+        return (
+            "self"
+            if abs(float(current_create) - float(recorded_create)) < 2.0
+            else "dead"
+        )
     recorded_machine = str(
         _row_value(row, "owner_machine_identity") or "unverified"
     )
@@ -461,16 +500,7 @@ def _owner_status(row: Mapping[str, Any]) -> str:
         return "dead"
     if alive is None:
         return "unknown"
-    current_pid, current_create, _host, _instance = _owner_stamp()
-    if pid != current_pid:
-        return "live"
-    if current_create is None or _row_value(row, "owner_create_time") is None:
-        return "self"
-    return (
-        "self"
-        if abs(float(current_create) - float(row["owner_create_time"])) < 2.0
-        else "dead"
-    )
+    return "live"
 
 
 def _owner_state(row: Mapping[str, Any]) -> bool | None:
@@ -749,6 +779,8 @@ def _classify_workspace(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"classification": "missing", "safe_to_delete": True, "checked_at": checked_at}
     if not path.is_dir():
+        if not path.exists():
+            return {"classification": "missing", "safe_to_delete": True, "checked_at": checked_at}
         return {"classification": "non_directory", "safe_to_delete": False, "checked_at": checked_at}
     try:
         if next(path.iterdir(), None) is None:
@@ -789,6 +821,8 @@ def _classify_workspace(path: Path) -> dict[str, Any]:
             "classification": "uncertain", "safe_to_delete": False,
             "checked_at": checked_at, "reason": "git_head_unverifiable",
         }
+    except FileNotFoundError:
+        return {"classification": "missing", "safe_to_delete": True, "checked_at": checked_at}
     except (OSError, subprocess.SubprocessError) as exc:
         return {
             "classification": "uncertain", "safe_to_delete": False,
@@ -888,6 +922,13 @@ def _finish_detached_cleanup_held(
             finished.update({"disposition": "quarantined", "quarantine_path": str(detached)})
             finished.pop("detached_path", None)
     except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            finished.update({
+                "classification": "missing", "safe_to_delete": True,
+                "disposition": "removed", "cleanup_race": "already_removed",
+            })
+            finished.pop("detached_path", None)
+            return finished
         finished.update({
             "disposition": "preserved", "quarantine_path": str(detached),
             "cleanup_error": f"{type(exc).__name__}: {exc}",

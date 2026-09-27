@@ -98,6 +98,20 @@ class HeldDirectory:
         self.verify()
         return self.path / name
 
+    def chmod(self, name: str, mode: int) -> None:
+        if self.fd is not None:
+            os.chmod(name, mode, dir_fd=self.fd, follow_symlinks=False)
+        else:  # pragma: no cover - exercised on Windows CI
+            self.verify()
+            os.chmod(self.path / name, mode)
+
+    def is_regular_file(self, name: str) -> bool:
+        try:
+            info = self.stat(name)
+        except FileNotFoundError:
+            return False
+        return stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode)
+
     def sync(self) -> None:
         if self.fd is not None:
             os.fsync(self.fd)

@@ -165,6 +165,9 @@ metadata flush. POSIX uses `O_DIRECTORY | O_NOFOLLOW` descriptors plus `dir_fd` 
 Windows holds reparse-point-safe directory handles without delete sharing, verifies file IDs, and
 uses write-through moves. Replacing `workspaces/` or `workspace-quarantine/` during an operation
 therefore fails closed instead of redirecting work outside plugin data.
+The SQLite connection likewise owns a held `plugin-data/<namespace>/` handle for its full lifetime;
+on POSIX the database and WAL/SHM are opened through that descriptor, and on Windows the held
+no-delete-sharing handle prevents parent replacement while SQLite is live.
 
 The lease database upgrades additively. Before backfilling a legacy row's canonical plugin identity,
 Hermes verifies every legacy row already names this plugin namespace and profile, has a valid

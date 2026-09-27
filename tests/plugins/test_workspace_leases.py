@@ -508,9 +508,10 @@ def test_same_hostname_foreign_machine_is_unknown_but_same_machine_reboot_is_dea
     rebooted = _acquire(ctx, "same-machine-reboot", ttl_seconds=300)
     with sqlite3.connect(db) as conn:
         conn.execute(
-            """UPDATE workspace_leases SET owner_machine_identity=?, owner_instance='boot-id:old'
+            """UPDATE workspace_leases SET owner_pid=?, owner_machine_identity=?,
+               owner_instance='boot-id:old'
                WHERE lease_id=?""",
-            (machine[0], rebooted["lease_id"]),
+            (os.getpid() + 100_000, machine[0], rebooted["lease_id"]),
         )
     with sqlite3.connect(db) as conn:
         conn.row_factory = sqlite3.Row
@@ -1177,6 +1178,38 @@ def test_database_wal_and_shm_are_private_under_permissive_umask(tmp_path: Path)
         os.umask(previous_umask)
 
 
+@pytest.mark.linux_only
+def test_database_connection_remains_anchored_after_parent_swap(tmp_path: Path) -> None:
+    from hermes_cli import plugin_workspaces
+
+    home, external = tmp_path / "home", tmp_path / "outside"
+    external.mkdir()
+    (external / "sentinel").write_text("outside", encoding="utf-8")
+    ctx = _context(home)
+    layout = ctx.workspaces._layout()
+    conn = plugin_workspaces._connect(layout)
+    backup = _swap_root_to_symlink(layout.data_dir, external)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """INSERT INTO workspace_lease_events
+               VALUES (NULL, 'anchored', 'lease', 1, 'test', 0, 1, NULL, '{}')"""
+        )
+        conn.commit()
+        assert (external / "sentinel").read_text(encoding="utf-8") == "outside"
+        assert not (external / "workspace-leases.db").exists()
+        assert not (external / "workspace-leases.db-wal").exists()
+        assert not (external / "workspace-leases.db-shm").exists()
+    finally:
+        _restore_swapped_root(layout.data_dir, backup)
+        conn.close()
+
+    with sqlite3.connect(layout.db_path) as verify:
+        assert verify.execute(
+            "SELECT COUNT(*) FROM workspace_lease_events WHERE workspace_id='anchored'"
+        ).fetchone()[0] == 1
+
+
 def test_original_h1_database_upgrades_without_stranding_handle(tmp_path: Path) -> None:
     home = tmp_path / "home"
     handle, workspace = _seed_original_h1_database(home)
@@ -1560,6 +1593,26 @@ def test_live_pid_is_not_killed_by_unstable_wall_clock_boot_time(
     monkeypatch.setattr(plugin_workspaces, "_pid_alive_matches", lambda *_args: True)
     monkeypatch.setattr(plugin_workspaces, "_process_create_time", lambda: created)
     assert plugin_workspaces._host_instance() == "unverified"
+    assert plugin_workspaces._owner_status(row) == "self"
+
+
+def test_unverified_machine_still_recognizes_exact_current_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import plugin_workspaces
+
+    monkeypatch.setattr(plugin_workspaces, "_machine_identity", lambda: "unverified")
+    ctx = _context(tmp_path / "home")
+    handle = _acquire(ctx, "unverified-self")
+    assert ctx.workspaces.renew(handle)["state"] == "active"
+    assert ctx.workspaces.release(handle)["state"] == "released"
+
+    row = {
+        "owner_pid": os.getpid() + 100_000,
+        "owner_create_time": plugin_workspaces._process_create_time(),
+        "owner_machine_identity": "unverified", "owner_instance": "unverified",
+    }
+    monkeypatch.setattr(plugin_workspaces, "_pid_alive_matches", lambda *_args: True)
     assert plugin_workspaces._owner_status(row) == "unknown"
 
 
@@ -1602,6 +1655,34 @@ def test_slow_release_cleanup_records_old_generation_after_successor_acquires(
         and event["type"] == "cleanup_completed"
         for event in released["events"]
     )
+
+
+def test_simultaneous_release_of_empty_workspace_converges_on_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import plugin_workspaces
+
+    ctx = _context(tmp_path / "home")
+    handle = _acquire(ctx, "simultaneous-release")
+    original = plugin_workspaces._finish_detached_cleanup
+    barrier = threading.Barrier(2)
+
+    def synchronize_cleanup(path, receipt):
+        barrier.wait(timeout=10)
+        return original(path, receipt)
+
+    monkeypatch.setattr(plugin_workspaces, "_finish_detached_cleanup", synchronize_cleanup)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = [
+            pool.submit(ctx.workspaces.release, handle),
+            pool.submit(ctx.workspaces.release, handle),
+        ]
+        released = [future.result(timeout=10) for future in outcomes]
+
+    assert {snapshot["cleanup"]["disposition"] for snapshot in released} == {"removed"}
+    final = ctx.workspaces.release(handle)
+    assert final["cleanup"]["disposition"] == "removed"
+    assert not Path(final["path"]).exists()
 
 
 def test_empty_cleanup_race_quarantines_late_file(
