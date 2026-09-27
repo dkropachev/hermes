@@ -32,12 +32,18 @@ def register(ctx):
     if workspaces is None:
         register_review_only_surfaces(ctx)
         return
+    # Lease-only imports also belong after the probe. Older hosts do not ship
+    # this module but must still load the plugin's review-only surfaces.
+    from hermes_cli.plugin_workspaces import WorkspaceLeaseError
+
     register_development_surfaces(ctx, workspaces)
 ```
 
 The `hermes plugins validate` registration probe reports host features as unavailable. Keep the
 fallback path importable and functional; do not fail plugin registration merely because the
-validator or an older host does not offer leases.
+validator or an older host does not offer leases. Never import `hermes_cli.plugin_workspaces` at
+module scope: facade access and lease exception/type imports both belong after the successful
+`getattr`-based probe.
 
 :::caution Lifecycle is not workspace-bound execution
 `workspace_leases.v1` covers only acquisition, ownership fencing, heartbeat/reconnect, inspection,
@@ -126,6 +132,10 @@ $HERMES_HOME/plugin-data/pr-review/workspaces/run-01
 Runtime data never belongs in an installed plugin directory. The facade remains bound to the
 `PluginContext` profile that created it even if a multiplexed process later changes ambient profile
 scope. Plugin namespaces isolate unrelated plugins, while profile paths isolate tenants.
+The `agent-plugin-*` family is reserved for portable packages. A native plugin whose ID uses that
+prefix receives a separate `hermes-native-*` hashed namespace, and every lease also persists an
+independent canonical plugin-identity digest. The native ID `pr-review` keeps the exact readable
+path shown above.
 
 On POSIX hosts Hermes enforces mode `0700` on host-owned data/workspace directories and `0600` on
 the lease database. It rejects symlinked or aliased namespace, workspace, and database paths rather
@@ -136,8 +146,10 @@ materializing repository content remains the plugin's responsibility.
 
 Acquisition records the owner PID, process creation time, host, host-instance witness, generation,
 heartbeat, and expiry. After a worker restart, call `reconnect` with its persisted handle. A dead
-owner or expired generation can be reclaimed; a live foreign owner is refused. Successful
-reconnect increments the generation and fences the predecessor.
+owner can be reclaimed before expiry; an unexpired live or unverifiable foreign owner is refused.
+After expiry, the bearer may take over even if the previous PID still appears live or its liveness
+is unknown, because the TTL is the durable fencing boundary. Successful reconnect increments the
+generation, rotates the handle, and fences the predecessor.
 
 Release and stale-generation reclamation first rename the old directory away from its public
 workspace name. That atomic detach prevents delayed cleanup from deleting a successor that has
@@ -146,18 +158,31 @@ already acquired the same `workspace_id`.
 Hermes removes only work it can prove disposable:
 
 - an empty directory is removed;
-- a clean Git checkout whose `HEAD` is contained by a remote-tracking ref is removed;
+- every nonempty Git checkout is preserved, even when its current tree is clean and `HEAD` is on a
+  remote-tracking ref, because another branch, tag, or reflog may contain unique commits;
 - dirty, untracked, ignored, unpushed, non-Git, or otherwise uncertain content is moved to
   `workspace-quarantine/` and reported in the cleanup receipt.
 
+Cleanup intent and outcomes also enter an append-only, generation-keyed receipt ledger. Its
+deterministic detached names let a retry reconcile a crash after rename but before the lease-row
+transition commits; replacing the current lease row does not erase predecessor receipts.
 Snapshots include current ownership and timing fields, the canonical path, generation, bounded
-lifecycle events, and the latest cleanup receipt. Surface quarantine receipts to an operator and
-make retention an explicit plugin policy; do not silently delete quarantined work.
+lifecycle events, the latest cleanup receipt, and recent `cleanupReceipts`. Surface quarantine
+receipts to an operator and make retention an explicit plugin policy; do not silently delete
+quarantined work.
 
 ## Failures to handle
 
-Import the exception classes from `hermes_cli.plugin_workspaces` when a workflow needs distinct
-recovery paths:
+Only after the host-feature probe succeeds, import exception classes from
+`hermes_cli.plugin_workspaces` when a workflow needs distinct recovery paths:
+
+```python
+if getattr(ctx, "has_host_feature", lambda _name: False)("workspace_leases.v1"):
+    from hermes_cli.plugin_workspaces import (
+        InvalidWorkspaceHandleError,
+        WorkspaceLeaseError,
+    )
+```
 
 | Exception | Meaning |
 |---|---|

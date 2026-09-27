@@ -9,6 +9,7 @@ import stat
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,7 @@ from hermes_cli.plugin_workspaces import (
     InvalidWorkspaceHandleError,
     WorkspaceInUseError,
     WorkspaceLeaseExpiredError,
+    WorkspaceOwnershipError,
     WorkspacePathError,
 )
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
@@ -27,10 +29,12 @@ from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _context(home: Path, plugin_id: str = "pr-review") -> PluginContext:
+def _context(
+    home: Path, plugin_id: str = "pr-review", *, skill_namespace: str = "",
+) -> PluginContext:
     home.mkdir(parents=True, exist_ok=True)
     return PluginContext(
-        PluginManifest(name=plugin_id, key=plugin_id),
+        PluginManifest(name=plugin_id, key=plugin_id, skill_namespace=skill_namespace),
         PluginManager(scope_key=hermes_home_key(home)),
     )
 
@@ -346,12 +350,8 @@ def test_cleanup_receipts_preserve_every_uncertain_or_unique_tree(tmp_path: Path
         setup(path)
         cleanup = ctx.workspaces.release(handle)["cleanup"]
         assert cleanup["classification"] == expected
-        if expected == "clean_git":
-            assert cleanup["disposition"] == "removed"
-            assert not path.exists()
-        else:
-            assert cleanup["disposition"] == "quarantined"
-            assert Path(cleanup["quarantine_path"]).exists()
+        assert cleanup["disposition"] == "quarantined"
+        assert Path(cleanup["quarantine_path"]).exists()
 
     empty = ctx.workspaces.acquire("empty")
     empty_path = Path(ctx.workspaces.inspect(empty)["path"])
@@ -359,6 +359,246 @@ def test_cleanup_receipts_preserve_every_uncertain_or_unique_tree(tmp_path: Path
     assert cleanup["classification"] == "clean_empty"
     assert cleanup["disposition"] == "removed"
     assert not empty_path.exists()
+
+
+@pytest.mark.parametrize("hidden_ref", ["branch", "tag", "reflog"])
+def test_clean_current_tree_preserves_hidden_git_history(
+    tmp_path: Path, hidden_ref: str,
+) -> None:
+    ctx = _context(tmp_path / "home")
+    handle = ctx.workspaces.acquire(f"hidden-{hidden_ref}")
+    path = Path(ctx.workspaces.inspect(handle)["path"])
+    _run_git(path, "init")
+    _commit(path)
+    base_branch = subprocess.run(
+        ["git", "-C", str(path), "branch", "--show-current"], check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    _run_git(path, "update-ref", "refs/remotes/origin/main", "HEAD")
+    _run_git(path, "checkout", "-b", "hidden-work")
+    (path / "unique.txt").write_text(hidden_ref, encoding="utf-8")
+    _run_git(path, "add", "unique.txt")
+    _run_git(
+        path, "-c", "user.name=Hermes Tests", "-c", "user.email=tests@invalid",
+        "commit", "-m", "unique hidden work",
+    )
+    unique = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "HEAD"], check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    if hidden_ref == "tag":
+        _run_git(path, "tag", "hidden-tag", unique)
+    _run_git(path, "checkout", base_branch)
+    if hidden_ref != "branch":
+        _run_git(path, "branch", "-D", "hidden-work")
+
+    cleanup = ctx.workspaces.release(handle)["cleanup"]
+    assert cleanup["classification"] == "clean_git"
+    assert cleanup["disposition"] == "quarantined"
+    quarantine = Path(cleanup["quarantine_path"])
+    _run_git(quarantine, "cat-file", "-e", f"{unique}^{{commit}}")
+
+
+def test_native_reserved_namespace_cannot_collide_with_portable_plugin(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    portable_namespace = "agent-plugin-collision-deadbeef"
+    portable = _context(
+        home, "portable-source", skill_namespace=portable_namespace,
+    )
+    native = _context(home, portable_namespace)
+    portable_handle = portable.workspaces.acquire("run")
+    native_handle = native.workspaces.acquire("run")
+    portable_path = Path(portable.workspaces.inspect(portable_handle)["path"])
+    native_path = Path(native.workspaces.inspect(native_handle)["path"])
+
+    assert portable_path.parent.parent.name == portable_namespace
+    assert native_path.parent.parent.name.startswith("hermes-native-")
+    assert portable_path != native_path
+    assert _context(home).workspaces.acquire("exact-pr-review")
+    assert (home / "plugin-data/pr-review/workspaces/exact-pr-review").is_dir()
+    portable_db = portable_path.parents[1] / "workspace-leases.db"
+    with sqlite3.connect(portable_db) as conn:
+        conn.execute(
+            "UPDATE workspace_leases SET plugin_identity='forged' WHERE lease_id=?",
+            (portable_handle["lease_id"],),
+        )
+    with pytest.raises(InvalidWorkspaceHandleError):
+        portable.workspaces.inspect(portable_handle)
+
+
+def test_unverified_current_boot_witness_does_not_mark_verified_owner_dead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import plugin_workspaces
+
+    created = plugin_workspaces._process_create_time()
+    row = {
+        "owner_pid": os.getpid(), "owner_create_time": created,
+        "owner_host": plugin_workspaces.socket.gethostname(),
+        "owner_instance": "boot-id:recorded",
+    }
+    monkeypatch.setattr(plugin_workspaces, "_host_instance", lambda: "unverified")
+    monkeypatch.setattr(plugin_workspaces, "_pid_alive_matches", lambda _pid, _created: True)
+    monkeypatch.setattr(plugin_workspaces, "_process_create_time", lambda: created)
+    assert plugin_workspaces._owner_status(row) == "self"
+
+
+def test_acquire_samples_after_lock_and_refreshes_after_slow_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import plugin_workspaces
+
+    ctx = _context(tmp_path / "home")
+    old = ctx.workspaces.acquire("slow", ttl_seconds=60)
+    old_path = Path(ctx.workspaces.inspect(old)["path"])
+    (old_path / "preserve.txt").write_text("old", encoding="utf-8")
+    db = tmp_path / "home/plugin-data/pr-review/workspace-leases.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE workspace_leases SET expires_at=5 WHERE lease_id=?", (old["lease_id"],))
+
+    clock = [0.0]
+    real_transaction = plugin_workspaces.transaction
+    first_write = [True]
+
+    @contextmanager
+    def contended_transaction(conn, *, immediate=False):
+        with real_transaction(conn, immediate=immediate) as locked:
+            if immediate and first_write[0]:
+                first_write[0] = False
+                clock[0] = 10.0  # the waiter obtains BEGIN IMMEDIATE after the old TTL elapsed
+            yield locked
+
+    real_finish = plugin_workspaces._finish_detached_cleanup
+
+    def slow_finish(path, receipt):
+        clock[0] += 10.0
+        return real_finish(path, receipt)
+
+    monkeypatch.setattr(plugin_workspaces.time, "time", lambda: clock[0])
+    monkeypatch.setattr(plugin_workspaces, "transaction", contended_transaction)
+    monkeypatch.setattr(plugin_workspaces, "_finish_detached_cleanup", slow_finish)
+    successor = ctx.workspaces.acquire("slow", ttl_seconds=1)
+    snapshot = ctx.workspaces.inspect(successor)
+    assert snapshot["heartbeatAt"] == 20.0
+    assert snapshot["expiresAt"] == 21.0
+    assert snapshot["generation"] == 2
+
+
+def test_crashed_acquire_reconciles_both_names_and_keeps_receipts(tmp_path: Path) -> None:
+    from hermes_cli import plugin_workspaces
+
+    home = tmp_path / "home"
+    ctx = _context(home)
+    failed = ctx.workspaces.acquire("crash-acquire")
+    failed_path = Path(ctx.workspaces.inspect(failed)["path"])
+    (failed_path / "predecessor.txt").write_text("preserve", encoding="utf-8")
+    db = home / "plugin-data/pr-review/workspace-leases.db"
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT lease_id, generation FROM workspace_leases WHERE workspace_id='crash-acquire'"
+        ).fetchone()
+        planned = plugin_workspaces._planned_detached_path(
+            ctx.workspaces._layout(), "crash-acquire", row[0], row[1], "acquire",
+        )
+        conn.execute(
+            """UPDATE workspace_leases SET state='preparing', owner_pid=-1, expires_at=0,
+               cleanup_json=? WHERE workspace_id='crash-acquire'""",
+            (json.dumps({
+                "operation": "acquire", "disposition": "preparing",
+                "planned_detached_path": str(planned),
+            }),),
+        )
+    os.replace(failed_path, planned)
+    failed_path.mkdir()  # crash after rename+mkdir but before the preparation receipt commits
+
+    successor = ctx.workspaces.acquire("crash-acquire")
+    snapshot = ctx.workspaces.inspect(successor)
+    assert (planned / "predecessor.txt").read_text(encoding="utf-8") == "preserve"
+    recovery = [
+        receipt for receipt in snapshot["cleanupReceipts"]
+        if receipt["operation"] == "recovery"
+    ]
+    assert recovery and recovery[-1]["phase"] == "reconciled"
+
+
+def test_crashed_release_resumes_detached_cleanup_and_receipt(tmp_path: Path) -> None:
+    from hermes_cli import plugin_workspaces
+
+    home = tmp_path / "home"
+    ctx = _context(home)
+    handle = ctx.workspaces.acquire("crash-release")
+    path = Path(ctx.workspaces.inspect(handle)["path"])
+    (path / "unique.txt").write_text("preserve", encoding="utf-8")
+    db = home / "plugin-data/pr-review/workspace-leases.db"
+    with sqlite3.connect(db) as conn:
+        lease_id, generation = conn.execute(
+            "SELECT lease_id, generation FROM workspace_leases WHERE workspace_id='crash-release'"
+        ).fetchone()
+        planned = plugin_workspaces._planned_detached_path(
+            ctx.workspaces._layout(), "crash-release", lease_id, generation, "release",
+        )
+        conn.execute(
+            "UPDATE workspace_leases SET state='releasing', cleanup_json=? WHERE lease_id=?",
+            (json.dumps({
+                "operation": "release", "disposition": "releasing",
+                "planned_detached_path": str(planned),
+            }), lease_id),
+        )
+    os.replace(path, planned)  # crash after detach and before its receipt/state commit
+
+    released = ctx.workspaces.release(handle)
+    assert released["state"] == "released"
+    assert released["cleanup"]["disposition"] == "quarantined"
+    assert Path(released["cleanup"]["quarantine_path"], "unique.txt").exists()
+    phases = [
+        receipt["phase"] for receipt in released["cleanupReceipts"]
+        if receipt["leaseId"] == handle["lease_id"] and receipt["operation"] == "release"
+    ]
+    assert phases[-2:] == ["released", "cleanup_completed"]
+
+
+@pytest.mark.parametrize("owner_status", ["live", "unknown"])
+def test_expired_reconnect_can_fence_live_or_unknown_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, owner_status: str,
+) -> None:
+    from hermes_cli import plugin_workspaces
+
+    ctx = _context(tmp_path / "home")
+    handle = ctx.workspaces.acquire("expired-owner")
+    monkeypatch.setattr(plugin_workspaces, "_owner_status", lambda _row: owner_status)
+    with pytest.raises(WorkspaceOwnershipError, match="another live process"):
+        ctx.workspaces.reconnect(handle)
+    db = tmp_path / "home/plugin-data/pr-review/workspace-leases.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE workspace_leases SET expires_at=0 WHERE lease_id=?", (handle["lease_id"],))
+    successor = ctx.workspaces.reconnect(handle)
+    assert ctx.workspaces.inspect(successor)["generation"] == 2
+
+
+def test_database_wal_and_shm_are_private_under_permissive_umask(tmp_path: Path) -> None:
+    from hermes_cli import plugin_workspaces
+
+    ctx = _context(tmp_path / "home")
+    previous_umask = os.umask(0)
+    conn = None
+    try:
+        layout = ctx.workspaces._layout()
+        conn = plugin_workspaces._connect(layout)
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "INSERT INTO workspace_lease_events VALUES (NULL, 'w', 'l', 1, 'test', 0, 1, NULL, '{}')"
+        )
+        for path in (
+            layout.db_path, Path(str(layout.db_path) + "-wal"),
+            Path(str(layout.db_path) + "-shm"),
+        ):
+            assert path.exists()
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        conn.rollback()
+    finally:
+        if conn is not None:
+            conn.close()
+        os.umask(previous_umask)
 
 
 def test_host_feature_probe_and_validator_fallback(tmp_path: Path) -> None:
@@ -372,8 +612,11 @@ def test_host_feature_probe_and_validator_fallback(tmp_path: Path) -> None:
     plugin.mkdir()
     (plugin / "__init__.py").write_text(
         "def register(ctx):\n"
-        "    if ctx.has_host_feature('workspace_leases.v1'):\n"
-        "        raise RuntimeError('validator must report host feature unavailable')\n",
+        "    probe = getattr(ctx, 'has_host_feature', None)\n"
+        "    if not callable(probe) or not probe('workspace_leases.v1'):\n"
+        "        return\n"
+        "    from hermes_cli.plugin_workspaces import WorkspaceLeaseError\n"
+        "    raise WorkspaceLeaseError('validator must report host feature unavailable')\n",
         encoding="utf-8",
     )
     recorded, error = _run_capability_probe(plugin, {"name": "probe-plugin"})
