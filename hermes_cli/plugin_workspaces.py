@@ -18,6 +18,7 @@ import secrets
 import socket
 import stat
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -27,6 +28,16 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from hermes_constants import get_hermes_home, hermes_home_key, mkdir_under_hermes_home
+from hermes_cli.plugin_workspace_errors import (
+    InvalidWorkspaceHandleError, WorkspaceDurabilityError, WorkspaceInUseError,
+    WorkspaceLeaseError, WorkspaceLeaseExpiredError, WorkspaceOwnershipError,
+    WorkspacePathError,
+)
+from hermes_cli.plugin_workspace_fs import (
+    HeldDirectory as _HeldDirectory,
+    safe_child as _safe_child,
+    workspace_roots as _workspace_roots,
+)
 from hermes_cli.plugins_manifest import _portable_skill_namespace
 from hermes_cli.process_identity import _pid_alive_matches, _process_create_time
 from hermes_cli.sqlite_util import add_column_if_missing, open_db, transaction
@@ -46,38 +57,7 @@ _WINDOWS_RESERVED = {
 }
 _WORKSPACE_LOCKS: dict[str, threading.RLock] = {}
 _WORKSPACE_LOCKS_GUARD = threading.Lock()
-
-
-class WorkspaceLeaseError(RuntimeError):
-    """Base class for workspace lifecycle failures."""
-
-
-class InvalidWorkspaceHandleError(WorkspaceLeaseError):
-    """The handle is malformed, stale, released, or belongs to another scope."""
-
-
-class WorkspaceInUseError(WorkspaceLeaseError):
-    """A live or not-yet-expired owner already holds the workspace."""
-
-
-class WorkspaceLeaseExpiredError(InvalidWorkspaceHandleError):
-    """The lease heartbeat expired; reconnect is required before further use."""
-
-
-class WorkspaceOwnershipError(WorkspaceLeaseError):
-    """A different live process owns the lease."""
-
-
-class WorkspacePathError(WorkspaceLeaseError):
-    """The workspace layout cannot be proven safe and canonical."""
-
-
-class WorkspaceDurabilityError(WorkspacePathError):
-    """A filesystem mutation completed, but its metadata could not be durably flushed."""
-
-    def __init__(self, message: str, *, mutation_completed: bool) -> None:
-        super().__init__(message)
-        self.mutation_completed = mutation_completed
+_PROCESS_OBSERVER_NONCE = secrets.token_hex(16)
 
 
 @dataclass(frozen=True)
@@ -196,102 +176,6 @@ def _workspace_lock(layout: _Layout, workspace_id: str):
         yield
 
 
-def _strict_sync_directory(path: Path) -> None:
-    """Durably flush one directory or raise; unlike ``utils.fsync_directory``, never best-effort."""
-    if os.name == "nt":  # pragma: no cover - exercised on Windows CI
-        import ctypes
-        from ctypes import wintypes
-
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        create_file = kernel32.CreateFileW
-        create_file.argtypes = (
-            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
-            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
-        )
-        create_file.restype = wintypes.HANDLE
-        flush = kernel32.FlushFileBuffers
-        flush.argtypes = (wintypes.HANDLE,)
-        flush.restype = wintypes.BOOL
-        close = kernel32.CloseHandle
-        close.argtypes = (wintypes.HANDLE,)
-        close.restype = wintypes.BOOL
-        handle = create_file(
-            str(path), 0x40000000, 0x00000001 | 0x00000002 | 0x00000004,
-            None, 3, 0x02000000 | 0x80000000, None,
-        )
-        invalid = ctypes.c_void_p(-1).value
-        if handle == invalid:
-            raise ctypes.WinError(ctypes.get_last_error())
-        error = None
-        try:
-            if not flush(handle):
-                error = ctypes.WinError(ctypes.get_last_error())
-        finally:
-            if not close(handle) and error is None:
-                error = ctypes.WinError(ctypes.get_last_error())
-        if error is not None:
-            raise error
-        return
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-def _sync_dirs(*paths: Path) -> None:
-    for path in dict.fromkeys(paths):
-        _strict_sync_directory(path)
-
-
-def _strict_replace(source: Path, target: Path, *sync_dirs: Path) -> None:
-    """Rename with write-through semantics, then strictly flush affected directories."""
-    if os.name == "nt":  # pragma: no cover - exercised on Windows CI
-        import ctypes
-
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        move = kernel32.MoveFileExW
-        move.argtypes = (ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32)
-        move.restype = ctypes.c_int
-        if not move(str(source), str(target), 0x1 | 0x8):  # REPLACE_EXISTING | WRITE_THROUGH
-            raise ctypes.WinError(ctypes.get_last_error())
-    else:
-        os.replace(source, target)
-    try:
-        _sync_dirs(*sync_dirs)
-    except OSError as exc:
-        raise WorkspaceDurabilityError(
-            f"filesystem rename completed but metadata flush failed: {exc}",
-            mutation_completed=True,
-        ) from exc
-
-
-def _safe_child(parent: Path, name: str) -> Path:
-    """Create one host-owned directory component and reject aliases/junctions/symlinks."""
-    candidate = parent / name
-    try:
-        candidate.mkdir(mode=0o700)
-    except FileExistsError:
-        pass
-    except OSError as exc:
-        raise WorkspacePathError(f"cannot create workspace directory {candidate}: {exc}") from exc
-    try:
-        info = candidate.lstat()
-        resolved = candidate.resolve(strict=True)
-    except OSError as exc:
-        raise WorkspacePathError(f"cannot validate workspace directory {candidate}: {exc}") from exc
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-        raise WorkspacePathError(f"workspace directory is not a regular directory: {candidate}")
-    if os.path.normcase(str(resolved)) != os.path.normcase(str(candidate.absolute())):
-        raise WorkspacePathError(f"workspace directory resolves through an alias: {candidate}")
-    if os.name != "nt":
-        try:
-            os.chmod(candidate, 0o700)
-        except OSError as exc:
-            raise WorkspacePathError(f"cannot secure workspace directory {candidate}: {exc}") from exc
-    return candidate
-
-
 def _layout(plugin_id: str, skill_namespace: str, home_path: Path | None = None) -> _Layout:
     raw_home = Path(home_path if home_path is not None else get_hermes_home()).expanduser()
     mkdir_under_hermes_home(raw_home)
@@ -366,6 +250,7 @@ def _initialize(conn, layout: _Layout) -> None:
             owner_pid INTEGER NOT NULL,
             owner_create_time REAL,
             owner_host TEXT NOT NULL,
+            owner_machine_identity TEXT,
             owner_instance TEXT NOT NULL,
             ttl_seconds REAL NOT NULL,
             acquired_at REAL NOT NULL,
@@ -428,6 +313,7 @@ def _initialize(conn, layout: _Layout) -> None:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(workspace_leases)")}
         additions = {
             "plugin_identity": "plugin_identity TEXT",
+            "owner_machine_identity": "owner_machine_identity TEXT",
             "acquire_intent_id": "acquire_intent_id TEXT",
             "heartbeat_monotonic": "heartbeat_monotonic REAL",
             "expires_monotonic": "expires_monotonic REAL",
@@ -457,28 +343,31 @@ def _connect(layout: _Layout):
     )
     if any(path.is_symlink() for path in sidecars):
         raise WorkspacePathError(f"workspace lease database files cannot be symlinks: {layout.db_path}")
-    conn = open_db(
-        layout.db_path,
-        db_label=f"plugin-data/{layout.plugin_namespace}/workspace-leases.db",
-        foreign_keys=True,
-        synchronous_full=True,
-        wal_lock_retries=5,
-        initialize=lambda conn: _initialize(conn, layout),
-    )
-    try:
-        if layout.db_path.is_symlink() or layout.db_path.resolve(strict=True).parent != layout.data_dir:
-            raise WorkspacePathError("workspace lease database resolved outside its plugin namespace")
-        if os.name != "nt":
-            for path in sidecars:
-                if path.exists():
-                    if path.is_symlink() or not path.is_file():
-                        raise WorkspacePathError(
-                            f"workspace lease database sidecar is unsafe: {path}"
-                        )
-                    os.chmod(path, 0o600)
-    except BaseException:
-        conn.close()
-        raise
+    with _HeldDirectory(layout.data_dir) as held_data:
+        conn = open_db(
+            layout.db_path,
+            db_label=f"plugin-data/{layout.plugin_namespace}/workspace-leases.db",
+            foreign_keys=True,
+            synchronous_full=True,
+            wal_lock_retries=5,
+            initialize=lambda conn: _initialize(conn, layout),
+        )
+        try:
+            held_data.verify()
+            if layout.db_path.is_symlink() or layout.db_path.resolve(strict=True).parent != layout.data_dir:
+                raise WorkspacePathError("workspace lease database resolved outside its plugin namespace")
+            if os.name != "nt":
+                for path in sidecars:
+                    if path.exists():
+                        if path.is_symlink() or not path.is_file():
+                            raise WorkspacePathError(
+                                f"workspace lease database sidecar is unsafe: {path}"
+                            )
+                        os.chmod(path, 0o600)
+            held_data.verify()
+        except BaseException:
+            conn.close()
+            raise
     return conn
 
 
@@ -491,6 +380,45 @@ def _host_instance() -> str:
     except OSError:
         pass
     return "unverified"
+
+
+def _machine_identity() -> str:
+    """Hashed stable machine identity, or ``unverified`` when the OS cannot prove one."""
+    raw = ""
+    if sys.platform.startswith("linux"):
+        for path in (Path("/etc/machine-id"), Path("/var/lib/dbus/machine-id")):
+            try:
+                raw = path.read_text(encoding="ascii").strip()
+            except OSError:
+                continue
+            if raw:
+                break
+    elif sys.platform == "darwin":  # pragma: no cover - exercised on macOS CI
+        try:
+            result = subprocess.run(
+                ["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=2, check=False,
+            )
+            match = re.search(r'"IOPlatformUUID"\s*=\s*"([^"]+)"', result.stdout)
+            raw = match.group(1).strip() if match else ""
+        except (OSError, subprocess.SubprocessError):
+            raw = ""
+    elif os.name == "nt":  # pragma: no cover - exercised on Windows CI
+        try:
+            import winreg
+
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography",
+                access=winreg.KEY_READ | getattr(winreg, "KEY_WOW64_64KEY", 0),
+            ) as key:
+                raw = str(winreg.QueryValueEx(key, "MachineGuid")[0]).strip()
+        except (OSError, ImportError):
+            raw = ""
+    if not raw:
+        return "unverified"
+    digest = hashlib.sha256(raw.casefold().encode("utf-8")).hexdigest()
+    return f"machine-sha256:{digest}"
 
 
 def _owner_stamp() -> tuple[int, float | None, str, str]:
@@ -512,7 +440,13 @@ def _owner_status(row: Mapping[str, Any]) -> str:
         return "dead"
     if pid <= 0:
         return "dead"
-    if str(_row_value(row, "owner_host") or "") != socket.gethostname():
+    recorded_machine = str(
+        _row_value(row, "owner_machine_identity") or "unverified"
+    )
+    current_machine = _machine_identity()
+    if not (_verified_instance(recorded_machine) and _verified_instance(current_machine)):
+        return "unknown"
+    if recorded_machine != current_machine:
         return "unknown"
     current_instance = _host_instance()
     recorded_instance = str(_row_value(row, "owner_instance") or "unverified")
@@ -550,11 +484,10 @@ def _verified_instance(value: object) -> bool:
 
 
 def _expiry_observer_token() -> str:
-    host, instance = socket.gethostname(), _host_instance()
-    if _verified_instance(instance):
-        return f"boot:{host}:{instance}"
-    started = _process_create_time()
-    return f"process:{host}:{os.getpid()}:{started if started is not None else 'unknown'}"
+    machine, instance = _machine_identity(), _host_instance()
+    if _verified_instance(machine) and _verified_instance(instance):
+        return f"boot:{machine}:{instance}"
+    return f"process:{_PROCESS_OBSERVER_NONCE}"
 
 
 def _fresh_expiry(ttl: float) -> tuple[float, float, float, float, str, float]:
@@ -567,12 +500,16 @@ def _fresh_expiry(ttl: float) -> tuple[float, float, float, float, str, float]:
 
 def _lease_expired(conn, row: Mapping[str, Any]) -> bool:
     """Canonical expiry decision: same-boot monotonic, otherwise one full local TTL observation."""
-    current_host, current_instance = socket.gethostname(), _host_instance()
-    owner_host = str(_row_value(row, "owner_host") or "")
+    current_machine, current_instance = _machine_identity(), _host_instance()
+    owner_machine = str(
+        _row_value(row, "owner_machine_identity") or "unverified"
+    )
     owner_instance = str(_row_value(row, "owner_instance") or "unverified")
     now = time.monotonic()
     if (
-        owner_host == current_host
+        owner_machine == current_machine
+        and _verified_instance(owner_machine)
+        and _verified_instance(current_machine)
         and _verified_instance(owner_instance)
         and _verified_instance(current_instance)
     ):
@@ -689,7 +626,7 @@ def _validated_row(
     if os.path.normcase(str(expected)) != os.path.normcase(str(row["workspace_path"])):
         raise InvalidWorkspaceHandleError("workspace lease has an invalid persisted path")
     if validate_path:
-        _validate_workspace_path(expected)
+        _validate_workspace_entry(layout, str(row["workspace_id"]))
     return row
 
 
@@ -703,6 +640,22 @@ def _validate_workspace_path(expected: Path) -> None:
         raise WorkspacePathError(f"workspace path is not a regular directory: {expected}")
     if os.path.normcase(str(resolved)) != os.path.normcase(str(expected.absolute())):
         raise WorkspacePathError(f"workspace path resolves through an alias: {expected}")
+
+
+def _validate_workspace_entry(layout: _Layout, workspace_id: str) -> None:
+    with _HeldDirectory(layout.workspaces_dir) as workspaces:
+        try:
+            info = workspaces.stat(workspace_id)
+        except OSError as exc:
+            raise WorkspacePathError(
+                f"workspace path is unavailable: {layout.workspaces_dir / workspace_id}"
+            ) from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise WorkspacePathError(
+                f"workspace path is not a regular directory: "
+                f"{layout.workspaces_dir / workspace_id}"
+            )
+        workspaces.verify()
 
 
 def _event(conn, row: Mapping[str, Any], event_type: str, details: Mapping[str, Any] | None = None) -> None:
@@ -776,10 +729,16 @@ def _git(workspace: Path, *args: str) -> subprocess.CompletedProcess[str]:
     allowed = ("PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC", "TMPDIR", "TEMP", "TMP")
     env = {key: os.environ[key] for key in allowed if key in os.environ}
     env.update({"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1", "LC_ALL": "C"})
+    pass_fds: tuple[int, ...] = ()
+    if os.name != "nt":
+        match = re.match(r"^/(?:proc/self|dev)/fd/(\d+)(?:/|$)", str(workspace))
+        if match:
+            pass_fds = (int(match.group(1)),)
     return subprocess.run(
         ["git", "-c", "core.fsmonitor=false", "-C", str(workspace), *args],
         capture_output=True, text=True,
         encoding="utf-8", errors="replace", timeout=5, env=env, check=False,
+        pass_fds=pass_fds,
     )
 
 
@@ -848,69 +807,87 @@ def _planned_detached_path(
 def _detach_workspace(
     layout: _Layout, workspace_id: str, lease_id: str, generation: int,
     operation: str, *, planned: Path | None = None,
+    roots: tuple[_HeldDirectory, _HeldDirectory] | None = None,
 ) -> tuple[Path | None, dict[str, Any]]:
     """Atomically remove the leased name before DB unlock so a successor can never be cleaned."""
     path = layout.workspaces_dir / workspace_id
     detached = planned or _planned_detached_path(
         layout, workspace_id, lease_id, generation, operation,
     )
-    if not path.exists() and not path.is_symlink():
-        if detached.exists() or detached.is_symlink():
-            return detached, {
-                "classification": "pending", "disposition": "detached",
-                "original_path": str(path), "detached_path": str(detached),
+    if detached.parent != layout.quarantine_dir:
+        raise WorkspacePathError("detached workspace target escaped quarantine")
+
+    def mutate(held: tuple[_HeldDirectory, _HeldDirectory]):
+        workspaces, quarantine = held
+        if not workspaces.exists(workspace_id):
+            if quarantine.exists(detached.name):
+                return detached, {
+                    "classification": "pending", "disposition": "detached",
+                    "original_path": str(path), "detached_path": str(detached),
+                }
+            return None, {
+                "classification": "missing", "disposition": "absent",
+                "original_path": str(path),
             }
-        return None, {"classification": "missing", "disposition": "absent", "original_path": str(path)}
-    if detached.exists() or detached.is_symlink():
-        return None, {
-            "classification": "uncertain", "disposition": "preserved",
+        if quarantine.exists(detached.name):
+            return None, {
+                "classification": "uncertain", "disposition": "preserved",
+                "original_path": str(path), "detached_path": str(detached),
+                "cleanup_error": "both canonical and planned detached paths exist",
+            }
+        try:
+            workspaces.rename_to(workspace_id, quarantine, detached.name)
+        except OSError as exc:
+            return None, {
+                "classification": "uncertain", "disposition": "preserved",
+                "original_path": str(path), "cleanup_error": f"{type(exc).__name__}: {exc}",
+            }
+        return detached, {
+            "classification": "pending", "disposition": "detached",
             "original_path": str(path), "detached_path": str(detached),
-            "cleanup_error": "both canonical and planned detached paths exist",
         }
-    try:
-        _strict_replace(
-            path, detached, layout.workspaces_dir, layout.quarantine_dir,
-        )
-    except OSError as exc:
-        return None, {
-            "classification": "uncertain", "disposition": "preserved",
-            "original_path": str(path), "cleanup_error": f"{type(exc).__name__}: {exc}",
-        }
-    return detached, {
-        "classification": "pending", "disposition": "detached",
-        "original_path": str(path), "detached_path": str(detached),
-    }
+
+    if roots is not None:
+        return mutate(roots)
+    with _workspace_roots(layout) as held:
+        return mutate(held)
 
 
 def _finish_detached_cleanup(detached: Path, receipt: dict[str, Any]) -> dict[str, Any]:
-    assessment = _classify_workspace(detached)
+    with _HeldDirectory(detached.parent) as quarantine:
+        return _finish_detached_cleanup_held(detached, receipt, quarantine)
+
+
+def _finish_detached_cleanup_held(
+    detached: Path, receipt: dict[str, Any], quarantine: _HeldDirectory,
+) -> dict[str, Any]:
+    if detached.parent != quarantine.path:
+        raise WorkspacePathError("detached cleanup escaped the held quarantine root")
+    held_path = quarantine.child_path(detached.name)
+    assessment = _classify_workspace(held_path)
     finished = {**receipt, **assessment}
     try:
         if assessment["safe_to_delete"]:
             # The only existing safe-to-delete tree is empty. Atomic rmdir refuses a late file;
             # recursive deletion would race classification and destroy newly-created content.
-            detached.rmdir()
             try:
-                _sync_dirs(detached.parent)
+                quarantine.rmdir(detached.name)
             except OSError as exc:
-                raise WorkspaceDurabilityError(
-                    f"workspace removal completed but metadata flush failed: {exc}",
-                    mutation_completed=True,
-                ) from exc
+                if exc.errno in {errno.ENOTEMPTY, errno.EEXIST}:
+                    late = _classify_workspace(held_path)
+                    finished.update({
+                        **late, "safe_to_delete": False, "disposition": "quarantined",
+                        "quarantine_path": str(detached), "cleanup_race": "late_content",
+                    })
+                    finished.pop("detached_path", None)
+                    return finished
+                raise
             finished["disposition"] = "removed"
             finished.pop("detached_path", None)
         else:
             finished.update({"disposition": "quarantined", "quarantine_path": str(detached)})
             finished.pop("detached_path", None)
     except OSError as exc:
-        if exc.errno in {errno.ENOTEMPTY, errno.EEXIST}:
-            late = _classify_workspace(detached)
-            finished.update({
-                **late, "safe_to_delete": False, "disposition": "quarantined",
-                "quarantine_path": str(detached), "cleanup_race": "late_content",
-            })
-            finished.pop("detached_path", None)
-            return finished
         finished.update({
             "disposition": "preserved", "quarantine_path": str(detached),
             "cleanup_error": f"{type(exc).__name__}: {exc}",
@@ -936,8 +913,15 @@ def _pending_operation(row: Mapping[str, Any]) -> str | None:
     return None
 
 
-def _reconcile_pending_generation(conn, layout: _Layout, row: Mapping[str, Any]) -> None:
+def _reconcile_pending_generation(
+    conn, layout: _Layout, row: Mapping[str, Any],
+    roots: tuple[_HeldDirectory, _HeldDirectory] | None = None,
+) -> None:
     """Preserve names left by a crashed transition before the current row is replaced."""
+    if roots is None:
+        with _workspace_roots(layout) as held:
+            return _reconcile_pending_generation(conn, layout, row, held)
+    workspaces, quarantine = roots
     operation = _pending_operation(row)
     if operation is None:
         return
@@ -954,9 +938,11 @@ def _reconcile_pending_generation(conn, layout: _Layout, row: Mapping[str, Any])
     preserved: list[dict[str, Any]] = []
 
     def recovery_paths() -> list[Path]:
-        candidates = [recovery_base]
-        candidates.extend(sorted(recovery_base.parent.glob(f"{recovery_base.name}-*")))
-        return [path for path in candidates if path.exists() or path.is_symlink()]
+        names = [
+            name for name in quarantine.list_names()
+            if name == recovery_base.name or name.startswith(f"{recovery_base.name}-")
+        ]
+        return [layout.quarantine_dir / name for name in sorted(names)]
 
     def remember(source: str, path: Path) -> None:
         if not any(item.get("quarantine_path") == str(path) for item in preserved):
@@ -970,24 +956,22 @@ def _reconcile_pending_generation(conn, layout: _Layout, row: Mapping[str, Any])
     for existing in recovery_paths():
         remember("recovery", existing)
 
-    if canonical.exists() or canonical.is_symlink():
+    if workspaces.exists(workspace_id):
         target = planned
-        if target.exists() or target.is_symlink():
+        if quarantine.exists(target.name):
             target = recovery_base
             suffix = 2
-            while target.exists() or target.is_symlink():
+            while quarantine.exists(target.name):
                 target = recovery_base.with_name(f"{recovery_base.name}-{suffix}")
                 suffix += 1
         try:
-            _strict_replace(
-                canonical, target, layout.workspaces_dir, layout.quarantine_dir,
-            )
+            workspaces.rename_to(workspace_id, quarantine, target.name)
             remember("canonical", target)
         except OSError as exc:
             raise WorkspacePathError(
                 f"cannot preserve interrupted workspace generation at {canonical}: {exc}"
             ) from exc
-    if planned.exists() or planned.is_symlink():
+    if quarantine.exists(planned.name):
         remember("detached", planned)
     for existing in recovery_paths():
         remember("recovery", existing)
@@ -1011,7 +995,8 @@ def _public_snapshot(conn, row: Mapping[str, Any]) -> dict[str, Any]:
         "generation": int(row["generation"]),
         "owner": {
             "pid": int(row["owner_pid"]), "createTime": row["owner_create_time"],
-            "host": row["owner_host"], "instance": row["owner_instance"],
+            "host": row["owner_host"], "machineIdentity": row["owner_machine_identity"],
+            "instance": row["owner_instance"],
         },
         "acquiredAt": float(row["acquired_at"]),
         "heartbeatAt": float(row["heartbeat_at"]),
@@ -1064,11 +1049,14 @@ class PluginWorkspaces:
             layout, "acquire", workspace_id, ttl,
         )
         pid, created, host, instance = _owner_stamp()
+        machine = _machine_identity()
         detached: Path | None = None
         preparation_error: WorkspacePathError | None = None
         reclaimed: str | None = None
 
-        with transaction(_connect(layout), immediate=True) as conn:
+        with _workspace_roots(layout) as recovery_roots, transaction(
+            _connect(layout), immediate=True,
+        ) as conn:
             now, expires_wall, heartbeat_mono, expires_mono, observer, observed_mono = (
                 _fresh_expiry(ttl)
             )
@@ -1117,16 +1105,17 @@ class PluginWorkspaces:
                         raise InvalidWorkspaceHandleError(
                             "workspace acquire receipt is not committed"
                         )
-                    _validate_workspace_path(Path(intent_row["workspace_path"]))
+                    _validate_workspace_entry(layout, workspace_id)
                     changed = conn.execute(
                         """UPDATE workspace_leases SET owner_pid=?, owner_create_time=?,
-                           owner_host=?, owner_instance=?, heartbeat_at=?, expires_at=?,
+                           owner_host=?, owner_machine_identity=?, owner_instance=?,
+                           heartbeat_at=?, expires_at=?,
                            heartbeat_monotonic=?, expires_monotonic=?, expiry_observer=?,
                            expiry_observed_monotonic=?, updated_at=?
                            WHERE lease_id=? AND generation=? AND state='active'
                            AND acquire_intent_id=?""",
                         (
-                            pid, created, host, instance, now, expires_wall,
+                            pid, created, host, machine, instance, now, expires_wall,
                             heartbeat_mono, expires_mono, observer, observed_mono, now,
                             intent_row["lease_id"], intent_row["generation"], operation_id,
                         ),
@@ -1148,13 +1137,13 @@ class PluginWorkspaces:
                             (now, operation_id),
                         )
                         raise InvalidWorkspaceHandleError("workspace acquire intent was already released")
-                    _reconcile_pending_generation(conn, layout, intent_row)
+                    _reconcile_pending_generation(conn, layout, intent_row, recovery_roots)
                     generation = int(intent_row["generation"]) + 1
                     lease_id = str(uuid.uuid4())
                 elif state == "preparing":
                     generation = int(intent_row["generation"])
                     lease_id = str(intent_row["lease_id"])
-                    _reconcile_pending_generation(conn, layout, intent_row)
+                    _reconcile_pending_generation(conn, layout, intent_row, recovery_roots)
                 else:
                     raise WorkspaceInUseError(
                         f"workspace {workspace_id!r} is in a release transition"
@@ -1171,13 +1160,14 @@ class PluginWorkspaces:
                 }
                 changed = conn.execute(
                     """UPDATE workspace_leases SET lease_id=?, state='preparing', owner_pid=?,
-                       owner_create_time=?, owner_host=?, owner_instance=?, ttl_seconds=?,
+                       owner_create_time=?, owner_host=?, owner_machine_identity=?, owner_instance=?,
+                       ttl_seconds=?,
                        heartbeat_at=?, expires_at=?, heartbeat_monotonic=?, expires_monotonic=?,
                        expiry_observer=?, expiry_observed_monotonic=?, released_at=NULL,
                        generation=?, cleanup_json=?, updated_at=?
                        WHERE workspace_id=? AND acquire_intent_id=?""",
                     (
-                        lease_id, pid, created, host, instance, ttl, now, expires_wall,
+                        lease_id, pid, created, host, machine, instance, ttl, now, expires_wall,
                         heartbeat_mono, expires_mono, observer, observed_mono, generation,
                         json.dumps(cleanup, sort_keys=True), now, workspace_id, operation_id,
                     ),
@@ -1222,7 +1212,7 @@ class PluginWorkspaces:
                                 f"workspace {workspace_id!r} is leased until {old['expires_at']}"
                             )
                         reclaimed = "owner_dead" if owner_status == "dead" else "ttl_expired"
-                    _reconcile_pending_generation(conn, layout, old)
+                    _reconcile_pending_generation(conn, layout, old, recovery_roots)
                     _supersede_lease_operations(conn, old["lease_id"], now)
                 lease_id = str(uuid.uuid4())
                 planned_detached = _planned_detached_path(
@@ -1249,15 +1239,16 @@ class PluginWorkspaces:
                     """INSERT OR REPLACE INTO workspace_leases
                        (workspace_id, lease_id, capability_hash, contract_version, state,
                         plugin_namespace, plugin_identity, profile_key, workspace_path, owner_pid,
-                        owner_create_time, owner_host, owner_instance, ttl_seconds, acquired_at,
+                        owner_create_time, owner_host, owner_machine_identity, owner_instance,
+                        ttl_seconds, acquired_at,
                         heartbeat_at, expires_at, heartbeat_monotonic, expires_monotonic,
                         expiry_observer, expiry_observed_monotonic, released_at, generation,
                         acquire_intent_id, cleanup_json, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         workspace_id, lease_id, capability_hash, HANDLE_VERSION, "preparing",
                         layout.plugin_namespace, layout.plugin_identity, layout.profile_key,
-                        str(layout.workspaces_dir / workspace_id), pid, created, host, instance,
+                        str(layout.workspaces_dir / workspace_id), pid, created, host, machine, instance,
                         ttl, now, now, expires_wall, heartbeat_mono, expires_mono,
                         observer, observed_mono, None, generation, operation_id,
                         json.dumps(cleanup, sort_keys=True), now,
@@ -1269,7 +1260,9 @@ class PluginWorkspaces:
                 _cleanup_receipt(conn, row, "acquire", "planned", cleanup)
                 _event(conn, row, "preparing", {"reclaimed": reclaimed, "cleanup": cleanup})
 
-        with transaction(_connect(layout), immediate=True) as conn:
+        with _workspace_roots(layout) as roots, transaction(
+            _connect(layout), immediate=True,
+        ) as conn:
             current = _validated_row(
                 conn, layout, _handle(lease_id, capability), validate_path=False,
             )
@@ -1280,7 +1273,8 @@ class PluginWorkspaces:
             ):
                 raise InvalidWorkspaceHandleError("workspace preparation lost its fence")
             detached, cleanup = _detach_workspace(
-                layout, workspace_id, lease_id, generation, "acquire", planned=planned_detached,
+                layout, workspace_id, lease_id, generation, "acquire",
+                planned=planned_detached, roots=roots,
             )
             cleanup.update({
                 "operation": "acquire", "planned_detached_path": str(planned_detached),
@@ -1293,11 +1287,18 @@ class PluginWorkspaces:
                 )
             if preparation_error is None:
                 try:
-                    path.mkdir(mode=0o700)
+                    roots[0].mkdir(workspace_id, 0o700)
                     if os.name != "nt":
-                        os.chmod(path, 0o700)
-                    _validate_workspace_path(path)
-                    _sync_dirs(path, layout.workspaces_dir)
+                        os.chmod(
+                            workspace_id, 0o700, dir_fd=roots[0].fd,
+                            follow_symlinks=False,
+                        )
+                    child_info = roots[0].stat(workspace_id)
+                    if stat.S_ISLNK(child_info.st_mode) or not stat.S_ISDIR(child_info.st_mode):
+                        raise WorkspacePathError(
+                            f"workspace path is not a regular directory: {path}"
+                        )
+                    roots[0].verify()
                 except (OSError, WorkspacePathError) as exc:
                     preparation_error = (
                         exc if isinstance(exc, WorkspacePathError)
@@ -1382,7 +1383,7 @@ class PluginWorkspaces:
                 or current["acquire_intent_id"] != operation_id
             ):
                 raise InvalidWorkspaceHandleError("workspace activation lost its fence")
-            _validate_workspace_path(Path(current["workspace_path"]))
+            _validate_workspace_entry(layout, str(current["workspace_id"]))
             changed = conn.execute(
                 """UPDATE workspace_leases SET state='active', heartbeat_at=?, expires_at=?,
                    heartbeat_monotonic=?, expires_monotonic=?, expiry_observer=?,
@@ -1419,7 +1420,7 @@ class PluginWorkspaces:
             row = _validated_row(conn, layout, handle, validate_path=False)
             if row["state"] != "active":
                 raise InvalidWorkspaceHandleError("workspace lease has been released")
-            _validate_workspace_path(Path(row["workspace_path"]))
+            _validate_workspace_entry(layout, str(row["workspace_id"]))
             if _lease_expired(conn, row):
                 raise WorkspaceLeaseExpiredError("workspace lease expired; reconnect it before use")
             if _owner_state(row) is not True:
@@ -1501,19 +1502,23 @@ class PluginWorkspaces:
                     raise WorkspaceOwnershipError(
                         "workspace lease still belongs to another live process"
                     )
-                _validate_workspace_path(Path(row["workspace_path"]))
+                _validate_workspace_entry(layout, str(row["workspace_id"]))
                 (
                     fresh_wall, fresh_expires_wall, fresh_mono, fresh_expires_mono,
                     fresh_observer, fresh_observed_mono,
                 ) = _fresh_expiry(ttl)
+                replay_pid, replay_created, replay_host, replay_instance = _owner_stamp()
+                replay_machine = _machine_identity()
                 changed = conn.execute(
                     """UPDATE workspace_leases SET owner_pid=?, owner_create_time=?, owner_host=?,
-                       owner_instance=?, ttl_seconds=?, heartbeat_at=?, expires_at=?,
+                       owner_machine_identity=?, owner_instance=?, ttl_seconds=?, heartbeat_at=?, expires_at=?,
                        heartbeat_monotonic=?, expires_monotonic=?, expiry_observer=?,
                        expiry_observed_monotonic=?, updated_at=?
                        WHERE lease_id=? AND generation=? AND state='active'""",
                     (
-                        *_owner_stamp(), ttl, fresh_wall, fresh_expires_wall,
+                        replay_pid, replay_created, replay_host, replay_machine,
+                        replay_instance, ttl,
+                        fresh_wall, fresh_expires_wall,
                         fresh_mono, fresh_expires_mono, fresh_observer,
                         fresh_observed_mono, fresh_wall,
                         row["lease_id"], row["generation"],
@@ -1534,7 +1539,7 @@ class PluginWorkspaces:
                 )
                 if row["state"] != "active":
                     raise InvalidWorkspaceHandleError("workspace lease has been released")
-                _validate_workspace_path(Path(row["workspace_path"]))
+                _validate_workspace_entry(layout, str(row["workspace_id"]))
                 owner_status = _owner_status(row)
                 expired = _lease_expired(conn, row)
                 if owner_status in {"live", "unknown"} and not expired:
@@ -1557,19 +1562,21 @@ class PluginWorkspaces:
                     ),
                 )
                 pid, created, host, instance = _owner_stamp()
+                machine = _machine_identity()
                 (
                     fresh_wall, fresh_expires_wall, fresh_mono, fresh_expires_mono,
                     fresh_observer, fresh_observed_mono,
                 ) = _fresh_expiry(ttl)
                 changed = conn.execute(
                     """UPDATE workspace_leases SET owner_pid=?, owner_create_time=?, owner_host=?,
-                       owner_instance=?, ttl_seconds=?, heartbeat_at=?, expires_at=?,
+                       owner_machine_identity=?, owner_instance=?, ttl_seconds=?, heartbeat_at=?, expires_at=?,
                        heartbeat_monotonic=?, expires_monotonic=?, expiry_observer=?,
                        expiry_observed_monotonic=?, updated_at=?, lease_id=?, capability_hash=?,
                        generation=?
                        WHERE lease_id=? AND state='active' AND generation=?""",
                     (
-                        pid, created, host, instance, ttl, fresh_wall, fresh_expires_wall,
+                        pid, created, host, machine, instance, ttl,
+                        fresh_wall, fresh_expires_wall,
                         fresh_mono, fresh_expires_mono, fresh_observer,
                         fresh_observed_mono, fresh_wall,
                         successor_lease_id, successor_hash, successor_generation,
@@ -1594,7 +1601,7 @@ class PluginWorkspaces:
             row = _validated_row(conn, layout, handle, validate_path=False)
             if row["state"] != "active":
                 raise InvalidWorkspaceHandleError("workspace lease has been released")
-            _validate_workspace_path(Path(row["workspace_path"]))
+            _validate_workspace_entry(layout, str(row["workspace_id"]))
             if _lease_expired(conn, row):
                 raise WorkspaceLeaseExpiredError("workspace lease expired; reconnect it before use")
             return _public_snapshot(conn, row)
@@ -1604,7 +1611,9 @@ class PluginWorkspaces:
         detached: Path | None = None
         released_snapshot: dict[str, Any] | None = None
         release_error: WorkspacePathError | None = None
-        with transaction(_connect(layout), immediate=True) as conn:
+        with _workspace_roots(layout) as release_roots, transaction(
+            _connect(layout), immediate=True,
+        ) as conn:
             now = time.time()
             row = _validated_row(conn, layout, handle, validate_path=False)
             if row["state"] == "released":
@@ -1616,7 +1625,7 @@ class PluginWorkspaces:
                 planned = _planned_detached_path(
                     layout, row["workspace_id"], row["lease_id"], row["generation"], "release",
                 )
-                detached = planned if planned.exists() or planned.is_symlink() else None
+                detached = planned if release_roots[1].exists(planned.name) else None
                 if detached is None:
                     cleanup = {
                         **cleanup, "classification": "missing", "safe_to_delete": True,
@@ -1681,7 +1690,9 @@ class PluginWorkspaces:
         if row["state"] != "released":
             # Releasing + deterministic rename are durable before mutation. A retry after process
             # death resumes the same name; a DB rollback cannot resurrect an active predecessor.
-            with transaction(_connect(layout), immediate=True) as conn:
+            with _workspace_roots(layout) as detach_roots, transaction(
+                _connect(layout), immediate=True,
+            ) as conn:
                 current = _validated_row(conn, layout, handle, validate_path=False)
                 if current["state"] == "released":
                     released_snapshot = _public_snapshot(conn, current)
@@ -1694,6 +1705,7 @@ class PluginWorkspaces:
                     detached, cleanup = _detach_workspace(
                         layout, current["workspace_id"], current["lease_id"],
                         current["generation"], "release", planned=planned,
+                        roots=detach_roots,
                     )
                     cleanup["operation"] = "release"
                     cleanup["planned_detached_path"] = str(planned)

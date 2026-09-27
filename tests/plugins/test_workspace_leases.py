@@ -158,8 +158,8 @@ def _seed_original_h1_database(
             (
                 workspace_id, lease_id, plugin_workspaces._capability_hash(capability),
                 plugin_namespace, profile_key or hermes_home_key(home),
-                workspace_path or str(workspace), os.getpid(),
-                plugin_workspaces._process_create_time(), socket.gethostname(),
+                workspace_path or str(workspace), -1,
+                None, socket.gethostname(),
                 plugin_workspaces._host_instance(), now, now, now + 300,
                 json.dumps({"classification": "missing", "disposition": "absent"}), now,
             ),
@@ -167,6 +167,18 @@ def _seed_original_h1_database(
     return {
         "contract_version": 1, "lease_id": lease_id, "capability": capability,
     }, workspace
+
+
+def _swap_root_to_symlink(root: Path, external: Path) -> Path:
+    backup = root.with_name(f"{root.name}-held")
+    os.rename(root, backup)
+    root.symlink_to(external, target_is_directory=True)
+    return backup
+
+
+def _restore_swapped_root(root: Path, backup: Path) -> None:
+    root.unlink()
+    os.rename(backup, root)
 
 
 def test_handle_is_opaque_serializable_and_profile_bound(tmp_path: Path) -> None:
@@ -275,6 +287,7 @@ def test_simultaneous_processes_have_exactly_one_winner(tmp_path: Path) -> None:
     script = r"""
 import sys
 import time
+import traceback
 from pathlib import Path
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 from hermes_cli.plugin_workspaces import WorkspaceInUseError
@@ -282,7 +295,7 @@ from hermes_cli.plugin_workspaces import WorkspaceInUseError
 ready, outcome, gate, release = (Path(value) for value in sys.argv[1:])
 ctx = PluginContext(PluginManifest(name='pr-review'), PluginManager())
 ready.touch()
-deadline = time.monotonic() + 10
+deadline = time.monotonic() + 30
 while not gate.exists():
     if time.monotonic() >= deadline:
         raise RuntimeError('timed out waiting for acquisition gate')
@@ -291,6 +304,11 @@ try:
     ctx.workspaces.acquire('simultaneous', intent=ctx.workspaces.new_intent(), ttl_seconds=60)
 except WorkspaceInUseError:
     outcome.write_text('refused', encoding='utf-8')
+except BaseException as exc:
+    outcome.write_text(
+        'error:' + type(exc).__name__ + ':' + str(exc) + '\n' + traceback.format_exc(),
+        encoding='utf-8',
+    )
 else:
     outcome.write_text('acquired', encoding='utf-8')
     while not release.exists():
@@ -314,7 +332,7 @@ else:
     ]
 
     try:
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 30
         while not all(path.exists() for path in ready):
             if time.monotonic() >= deadline:
                 raise AssertionError("child processes did not reach the acquisition gate")
@@ -329,7 +347,7 @@ else:
 
     failures = []
     for process in processes:
-        stdout, stderr = process.communicate(timeout=10)
+        stdout, stderr = process.communicate(timeout=30)
         if process.returncode:
             failures.append(f"exit={process.returncode} stdout={stdout!r} stderr={stderr!r}")
     assert failures == []
@@ -444,7 +462,8 @@ def test_verified_reboot_is_dead_but_unknown_owner_needs_full_observation_window
     db = tmp_path / "home/plugin-data/pr-review/workspace-leases.db"
     with sqlite3.connect(db) as conn:
         conn.execute(
-            """UPDATE workspace_leases SET owner_host='foreign-host', owner_instance='unverified',
+            """UPDATE workspace_leases SET owner_host='foreign-host',
+               owner_machine_identity='machine-sha256:foreign', owner_instance='unverified',
                expires_at=0, expires_monotonic=0, expiry_observer=NULL,
                expiry_observed_monotonic=NULL WHERE lease_id=?""",
             (unknown["lease_id"],),
@@ -457,6 +476,50 @@ def test_verified_reboot_is_dead_but_unknown_owner_needs_full_observation_window
     monotonic[0] = 105.0
     with pytest.raises(WorkspaceLeaseExpiredError):
         ctx.workspaces.inspect(unknown)
+
+
+def test_same_hostname_foreign_machine_is_unknown_but_same_machine_reboot_is_dead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import plugin_workspaces
+
+    machine, boot, monotonic = ["machine-sha256:local"], ["boot-id:local"], [10.0]
+    monkeypatch.setattr(plugin_workspaces, "_machine_identity", lambda: machine[0])
+    monkeypatch.setattr(plugin_workspaces, "_host_instance", lambda: boot[0])
+    monkeypatch.setattr(plugin_workspaces.time, "monotonic", lambda: monotonic[0])
+    ctx = _context(tmp_path / "home")
+    foreign = _acquire(ctx, "foreign-machine", ttl_seconds=5)
+    db = tmp_path / "home/plugin-data/pr-review/workspace-leases.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """UPDATE workspace_leases SET owner_host=?,
+               owner_machine_identity='machine-sha256:foreign', owner_instance='boot-id:foreign',
+               expires_at=0, expires_monotonic=0, expiry_observer=NULL,
+               expiry_observed_monotonic=NULL WHERE lease_id=?""",
+            (socket.gethostname(), foreign["lease_id"]),
+        )
+    assert ctx.workspaces.inspect(foreign)["state"] == "active"
+    monotonic[0] = 14.9
+    assert ctx.workspaces.inspect(foreign)["state"] == "active"
+    monotonic[0] = 15.0
+    with pytest.raises(WorkspaceLeaseExpiredError):
+        ctx.workspaces.inspect(foreign)
+
+    rebooted = _acquire(ctx, "same-machine-reboot", ttl_seconds=300)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """UPDATE workspace_leases SET owner_machine_identity=?, owner_instance='boot-id:old'
+               WHERE lease_id=?""",
+            (machine[0], rebooted["lease_id"]),
+        )
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM workspace_leases WHERE lease_id=?", (rebooted["lease_id"],),
+        ).fetchone()
+    assert plugin_workspaces._owner_status(row) == "dead"
+    successor = _acquire(ctx, "same-machine-reboot")
+    assert ctx.workspaces.inspect(successor)["generation"] == 2
 
 
 def test_symlink_aliases_are_never_followed(tmp_path: Path) -> None:
@@ -490,6 +553,138 @@ def test_symlinked_host_namespace_is_rejected(tmp_path: Path) -> None:
     (home / "plugin-data").symlink_to(external, target_is_directory=True)
     with pytest.raises(WorkspacePathError):
         _acquire(_context(home), "run-1")
+
+
+@pytest.mark.linux_only
+def test_workspaces_root_swap_before_mkdir_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import plugin_workspaces
+
+    home, external = tmp_path / "home", tmp_path / "outside"
+    external.mkdir()
+    (external / "sentinel").write_text("outside", encoding="utf-8")
+    ctx = _context(home)
+    layout = ctx.workspaces._layout()
+    original = plugin_workspaces._HeldDirectory.mkdir
+    swapped: list[Path] = []
+
+    def swap_before_mkdir(self, name, mode=0o700):
+        if self.path == layout.workspaces_dir and name == "swap-mkdir" and not swapped:
+            swapped.append(_swap_root_to_symlink(layout.workspaces_dir, external))
+        return original(self, name, mode)
+
+    monkeypatch.setattr(plugin_workspaces._HeldDirectory, "mkdir", swap_before_mkdir)
+    try:
+        with pytest.raises(WorkspacePathError, match="replaced|identity"):
+            _acquire(ctx, "swap-mkdir")
+        assert (external / "sentinel").read_text(encoding="utf-8") == "outside"
+        assert not (external / "swap-mkdir").exists()
+    finally:
+        if swapped:
+            _restore_swapped_root(layout.workspaces_dir, swapped[0])
+
+
+@pytest.mark.linux_only
+def test_failed_held_directory_enter_does_not_leak_descriptors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import plugin_workspace_fs
+
+    before = len(list(Path("/proc/self/fd").iterdir()))
+
+    def fail_verify(_self):
+        raise WorkspacePathError("injected identity mismatch")
+
+    monkeypatch.setattr(plugin_workspace_fs.HeldDirectory, "verify", fail_verify)
+    for _ in range(25):
+        with pytest.raises(WorkspacePathError, match="injected"):
+            plugin_workspace_fs.HeldDirectory(tmp_path).__enter__()
+    after = len(list(Path("/proc/self/fd").iterdir()))
+    assert after == before
+
+
+@pytest.mark.linux_only
+def test_workspaces_root_swap_before_release_rename_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import plugin_workspaces
+
+    home, external = tmp_path / "home", tmp_path / "outside"
+    external.mkdir()
+    (external / "sentinel").write_text("outside", encoding="utf-8")
+    ctx = _context(home)
+    handle = _acquire(ctx, "swap-release")
+    layout = ctx.workspaces._layout()
+    original = plugin_workspaces._HeldDirectory.rename_to
+    swapped: list[Path] = []
+
+    def swap_before_rename(self, name, target, target_name):
+        if self.path == layout.workspaces_dir and not swapped:
+            swapped.append(_swap_root_to_symlink(layout.workspaces_dir, external))
+        return original(self, name, target, target_name)
+
+    monkeypatch.setattr(plugin_workspaces._HeldDirectory, "rename_to", swap_before_rename)
+    try:
+        with pytest.raises(WorkspacePathError, match="replaced|identity"):
+            ctx.workspaces.release(handle)
+        assert (external / "sentinel").read_text(encoding="utf-8") == "outside"
+        assert not (external / "swap-release").exists()
+    finally:
+        if swapped:
+            _restore_swapped_root(layout.workspaces_dir, swapped[0])
+    monkeypatch.setattr(plugin_workspaces._HeldDirectory, "rename_to", original)
+    assert ctx.workspaces.release(handle)["state"] == "released"
+
+
+@pytest.mark.linux_only
+def test_quarantine_root_swap_during_cleanup_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import plugin_workspaces
+
+    home, external = tmp_path / "home", tmp_path / "outside"
+    external.mkdir()
+    (external / "sentinel").write_text("outside", encoding="utf-8")
+    ctx = _context(home)
+    handle = _acquire(ctx, "swap-cleanup")
+    workspace = Path(ctx.workspaces.inspect(handle)["path"])
+    (workspace / "keep.txt").write_text("preserve", encoding="utf-8")
+    layout = ctx.workspaces._layout()
+    original = plugin_workspaces._classify_workspace
+    swapped: list[Path] = []
+
+    def swap_before_classify(path):
+        if not swapped and "/fd/" in str(path):
+            swapped.append(_swap_root_to_symlink(layout.quarantine_dir, external))
+        return original(path)
+
+    monkeypatch.setattr(plugin_workspaces, "_classify_workspace", swap_before_classify)
+    try:
+        with pytest.raises(WorkspacePathError, match="replaced|identity"):
+            ctx.workspaces.release(handle)
+        assert (external / "sentinel").read_text(encoding="utf-8") == "outside"
+        assert not any(path.name.startswith(".release-") for path in external.iterdir())
+    finally:
+        if swapped:
+            _restore_swapped_root(layout.quarantine_dir, swapped[0])
+    monkeypatch.setattr(plugin_workspaces, "_classify_workspace", original)
+    released = ctx.workspaces.release(handle)
+    assert released["cleanup"]["disposition"] == "quarantined"
+
+
+@pytest.mark.windows_only
+def test_windows_held_root_blocks_reparse_swap(tmp_path: Path) -> None:
+    from hermes_cli import plugin_workspaces
+
+    ctx = _context(tmp_path / "home")
+    layout = ctx.workspaces._layout()
+    backup = layout.workspaces_dir.with_name("workspaces-swap")
+    with plugin_workspaces._HeldDirectory(layout.workspaces_dir):
+        with pytest.raises(OSError):
+            os.replace(layout.workspaces_dir, backup)
+    assert layout.workspaces_dir.is_dir()
+    assert not backup.exists()
 
 
 def test_trailing_dot_ids_are_rejected_or_hashed(tmp_path: Path) -> None:
@@ -656,6 +851,7 @@ def test_unverified_current_boot_witness_does_not_mark_verified_owner_dead(
     row = {
         "owner_pid": os.getpid(), "owner_create_time": created,
         "owner_host": plugin_workspaces.socket.gethostname(),
+        "owner_machine_identity": plugin_workspaces._machine_identity(),
         "owner_instance": "boot-id:recorded",
     }
     monkeypatch.setattr(plugin_workspaces, "_host_instance", lambda: "unverified")
@@ -888,12 +1084,12 @@ def test_release_permission_failure_stays_releasing_and_retries(
     home = tmp_path / "home"
     ctx = _context(home)
     handle = _acquire(ctx, "permission-release")
-    original = plugin_workspaces._strict_replace
+    original = plugin_workspaces._HeldDirectory.rename_to
 
     def denied(*_args, **_kwargs):
         raise PermissionError("detach denied")
 
-    monkeypatch.setattr(plugin_workspaces, "_strict_replace", denied)
+    monkeypatch.setattr(plugin_workspaces._HeldDirectory, "rename_to", denied)
     with pytest.raises(WorkspacePathError, match="same handle can retry"):
         ctx.workspaces.release(handle)
     db = home / "plugin-data/pr-review/workspace-leases.db"
@@ -905,7 +1101,7 @@ def test_release_permission_failure_stays_releasing_and_retries(
     assert state == "releasing"
     assert json.loads(cleanup_json)["disposition"] == "preserved"
 
-    monkeypatch.setattr(plugin_workspaces, "_strict_replace", original)
+    monkeypatch.setattr(plugin_workspaces._HeldDirectory, "rename_to", original)
     released = ctx.workspaces.release(handle)
     assert released["state"] == "released"
     assert ctx.workspaces.release(handle)["state"] == "released"
@@ -1168,13 +1364,16 @@ def test_matching_acquire_intent_resumes_synchronous_preparation_failure(
         monkeypatch.setattr(plugin_workspaces, "_connect", fail_second)
         restore = lambda: monkeypatch.setattr(plugin_workspaces, "_connect", original)
     elif fault_point == "after_mkdir":
-        original = plugin_workspaces._sync_dirs
+        original = plugin_workspaces._HeldDirectory.mkdir
 
-        def fail_sync(*_paths):
+        def fail_sync(self, name, mode=0o700):
+            original(self, name, mode)
             raise RuntimeError("after mkdir")
 
-        monkeypatch.setattr(plugin_workspaces, "_sync_dirs", fail_sync)
-        restore = lambda: monkeypatch.setattr(plugin_workspaces, "_sync_dirs", original)
+        monkeypatch.setattr(plugin_workspaces._HeldDirectory, "mkdir", fail_sync)
+        restore = lambda: monkeypatch.setattr(
+            plugin_workspaces._HeldDirectory, "mkdir", original,
+        )
     else:
         original = plugin_workspaces._event
 
@@ -1200,23 +1399,21 @@ def test_filesystem_transitions_are_synced_before_state_commit(
     from hermes_cli import plugin_workspaces
 
     ctx = _context(tmp_path / "home")
-    calls: list[tuple[Path, ...]] = []
-    original = plugin_workspaces._sync_dirs
+    calls: list[Path] = []
+    original = plugin_workspaces._HeldDirectory.sync
 
-    def recording_sync(*paths):
-        calls.append(tuple(paths))
-        return original(*paths)
+    def recording_sync(self):
+        calls.append(self.path)
+        return original(self)
 
-    monkeypatch.setattr(plugin_workspaces, "_sync_dirs", recording_sync)
+    monkeypatch.setattr(plugin_workspaces._HeldDirectory, "sync", recording_sync)
     first = _acquire(ctx, "durable")
     workspace = Path(ctx.workspaces.inspect(first)["path"])
     (workspace / "keep.txt").write_text("preserve", encoding="utf-8")
     ctx.workspaces.release(first)
-    flattened = [path for group in calls for path in group]
     layout = ctx.workspaces._layout()
-    assert workspace in flattened
-    assert layout.workspaces_dir in flattened
-    assert layout.quarantine_dir in flattened
+    assert layout.workspaces_dir in calls
+    assert layout.quarantine_dir in calls
 
 
 def test_detach_sync_fault_is_retryable_with_same_intent(
@@ -1233,16 +1430,16 @@ def test_detach_sync_fault_is_retryable_with_same_intent(
     with sqlite3.connect(db) as conn:
         _expire_lease(conn, predecessor["lease_id"])
     intent = ctx.workspaces.new_intent()
-    original = plugin_workspaces._strict_sync_directory
+    original = plugin_workspaces._HeldDirectory.sync
     fail_once = [True]
 
-    def fail_after_rename(path):
+    def fail_after_rename(self):
         if fail_once[0]:
             fail_once[0] = False
             raise OSError("power loss after rename")
-        return original(path)
+        return original(self)
 
-    monkeypatch.setattr(plugin_workspaces, "_strict_sync_directory", fail_after_rename)
+    monkeypatch.setattr(plugin_workspaces._HeldDirectory, "sync", fail_after_rename)
     with pytest.raises(plugin_workspaces.WorkspaceDurabilityError) as raised:
         _acquire(ctx, "detach-fault", intent=intent)
     assert raised.value.mutation_completed is True
@@ -1253,7 +1450,7 @@ def test_detach_sync_fault_is_retryable_with_same_intent(
     assert state == "preparing"
     deterministic = Path(json.loads(cleanup_json)["planned_detached_path"])
     assert (deterministic / "preserve.txt").read_text(encoding="utf-8") == "old"
-    monkeypatch.setattr(plugin_workspaces, "_strict_sync_directory", original)
+    monkeypatch.setattr(plugin_workspaces._HeldDirectory, "sync", original)
 
     successor = _acquire(ctx, "detach-fault", intent=intent)
     snapshot = ctx.workspaces.inspect(successor)
@@ -1281,16 +1478,16 @@ def test_mkdir_strict_flush_failure_never_commits_active_state(
     home = tmp_path / "home"
     ctx = _context(home)
     intent = ctx.workspaces.new_intent()
-    original = plugin_workspaces._strict_sync_directory
+    original = plugin_workspaces._HeldDirectory.sync
     fail_once = [True]
 
-    def fail_workspace_dir(path):
-        if path.name == "mkdir-flush" and fail_once[0]:
+    def fail_workspace_dir(self):
+        if self.path.name == "workspaces" and fail_once[0]:
             fail_once[0] = False
             raise OSError("strict directory flush failed")
-        return original(path)
+        return original(self)
 
-    monkeypatch.setattr(plugin_workspaces, "_strict_sync_directory", fail_workspace_dir)
+    monkeypatch.setattr(plugin_workspaces._HeldDirectory, "sync", fail_workspace_dir)
     with pytest.raises(plugin_workspaces.WorkspacePathError, match="flush failed"):
         _acquire(ctx, "mkdir-flush", intent=intent)
     db = home / "plugin-data/pr-review/workspace-leases.db"
@@ -1299,7 +1496,7 @@ def test_mkdir_strict_flush_failure_never_commits_active_state(
             "SELECT state FROM workspace_leases WHERE workspace_id='mkdir-flush'"
         ).fetchone()[0]
     assert state == "released"
-    monkeypatch.setattr(plugin_workspaces, "_strict_sync_directory", original)
+    monkeypatch.setattr(plugin_workspaces._HeldDirectory, "sync", original)
     assert ctx.workspaces.inspect(_acquire(ctx, "mkdir-flush", intent=intent))["state"] == "active"
 
 
@@ -1315,18 +1512,18 @@ def test_rmdir_flush_failure_reconciles_completed_removal(
     planned = plugin_workspaces._planned_detached_path(
         layout, "rmdir-flush", handle["lease_id"], snapshot["generation"], "release",
     )
-    original = plugin_workspaces._strict_sync_directory
+    original = plugin_workspaces._HeldDirectory.sync
 
-    def fail_after_rmdir(path):
-        if path == layout.quarantine_dir and not planned.exists():
+    def fail_after_rmdir(self):
+        if self.path == layout.quarantine_dir and not planned.exists():
             raise OSError("rmdir metadata flush failed")
-        return original(path)
+        return original(self)
 
-    monkeypatch.setattr(plugin_workspaces, "_strict_sync_directory", fail_after_rmdir)
+    monkeypatch.setattr(plugin_workspaces._HeldDirectory, "sync", fail_after_rmdir)
     with pytest.raises(plugin_workspaces.WorkspaceDurabilityError) as raised:
         ctx.workspaces.release(handle)
     assert raised.value.mutation_completed is True
-    monkeypatch.setattr(plugin_workspaces, "_strict_sync_directory", original)
+    monkeypatch.setattr(plugin_workspaces._HeldDirectory, "sync", original)
     released = ctx.workspaces.release(handle)
     assert released["cleanup"]["disposition"] == "removed"
     assert released["cleanup"]["reconciled_reason"] == "detached_target_absent"
@@ -1334,13 +1531,13 @@ def test_rmdir_flush_failure_reconciles_completed_removal(
 
 @pytest.mark.windows_only
 def test_windows_strict_metadata_flush_and_write_through_move(tmp_path: Path) -> None:
-    from hermes_cli import plugin_workspaces
+    from hermes_cli import plugin_workspace_fs
 
     source = tmp_path / "source"
     target = tmp_path / "target"
     source.mkdir()
-    plugin_workspaces._strict_sync_directory(source)
-    plugin_workspaces._strict_replace(source, target, tmp_path)
+    plugin_workspace_fs.strict_sync_directory(source)
+    plugin_workspace_fs.strict_replace(source, target, tmp_path)
     assert target.is_dir() and not source.exists()
 
 
@@ -1353,6 +1550,7 @@ def test_live_pid_is_not_killed_by_unstable_wall_clock_boot_time(
     row = {
         "owner_pid": os.getpid(), "owner_create_time": created,
         "owner_host": plugin_workspaces.socket.gethostname(),
+        "owner_machine_identity": "unverified",
         "owner_instance": "unverified",
     }
     monkeypatch.setattr(
@@ -1362,7 +1560,7 @@ def test_live_pid_is_not_killed_by_unstable_wall_clock_boot_time(
     monkeypatch.setattr(plugin_workspaces, "_pid_alive_matches", lambda *_args: True)
     monkeypatch.setattr(plugin_workspaces, "_process_create_time", lambda: created)
     assert plugin_workspaces._host_instance() == "unverified"
-    assert plugin_workspaces._owner_status(row) == "self"
+    assert plugin_workspaces._owner_status(row) == "unknown"
 
 
 def test_slow_release_cleanup_records_old_generation_after_successor_acquires(

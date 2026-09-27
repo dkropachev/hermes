@@ -160,6 +160,12 @@ the lease database. It rejects symlinked or aliased namespace, workspace, and da
 than following them. The lease service creates an empty directory; cloning or otherwise
 materializing repository content remains the plugin's responsibility.
 
+Filesystem mutations are relative to verified parent handles held through mutation and strict
+metadata flush. POSIX uses `O_DIRECTORY | O_NOFOLLOW` descriptors plus `dir_fd` rename/mkdir/stat;
+Windows holds reparse-point-safe directory handles without delete sharing, verifies file IDs, and
+uses write-through moves. Replacing `workspaces/` or `workspace-quarantine/` during an operation
+therefore fails closed instead of redirecting work outside plugin data.
+
 The lease database upgrades additively. Before backfilling a legacy row's canonical plugin identity,
 Hermes verifies every legacy row already names this plugin namespace and profile, has a valid
 workspace ID, and stores the exact canonical path beneath this plugin's `workspaces/` directory.
@@ -168,10 +174,12 @@ required rather than guessing ownership.
 
 ## Cleanup and recovery
 
-Acquisition records the owner PID, process creation time, host, host-instance witness, generation,
+Acquisition records the owner PID, process creation time, diagnostic hostname, hashed stable
+machine identity, independent boot witness, generation,
 wall-clock audit timestamps, and a monotonic heartbeat/deadline. On the same verified boot, every
 expiry decision uses only the monotonic deadline, so wall-clock corrections neither reclaim early
-nor extend a lease. A verified reboot makes the old same-host owner dead. Foreign or unverifiable
+nor extend a lease. A boot mismatch proves death only when stable machine identity also matches;
+equal hostnames alone never establish machine identity. Foreign or unverifiable
 ownership must be observed continuously by one local boot/process for a full TTL before expiry;
 one wall-clock-expired read never grants authority. After a worker restart, call `reconnect` with
 its persisted handle. A dead
