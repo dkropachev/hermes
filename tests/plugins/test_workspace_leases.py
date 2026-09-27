@@ -65,7 +65,29 @@ def _reconnect(
 
 
 def _child_env(home: Path) -> dict[str, str]:
-    return {**os.environ, "HERMES_HOME": str(home)}
+    env = {**os.environ, "HERMES_HOME": str(home)}
+    env.pop("HERMES_ENABLE_PROJECT_PLUGINS", None)
+    return env
+
+
+def _make_workspace_fixture_plugin(home: Path) -> None:
+    plugin = home / "plugins/workspace-fixture"
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.yaml").write_text(
+        "name: workspace-fixture\nversion: 1.0.0\ndescription: workspace fixture\n",
+        encoding="utf-8",
+    )
+    (plugin / "__init__.py").write_text(
+        "workspace_service = None\n"
+        "def register(ctx):\n"
+        "    global workspace_service\n"
+        "    workspace_service = ctx.workspaces\n",
+        encoding="utf-8",
+    )
+    (home / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - workspace-fixture\n",
+        encoding="utf-8",
+    )
 
 
 def _run_git(path: Path, *args: str) -> None:
@@ -1270,6 +1292,56 @@ def test_original_h1_database_conflicts_are_never_claimed(
             assert identity is None
 
 
+def test_real_plugin_discovery_workspace_lifecycle_survives_restart_and_profiles(
+    tmp_path: Path,
+) -> None:
+    homes = [tmp_path / "profiles/alpha", tmp_path / "profiles/beta"]
+    for home in homes:
+        home.mkdir(parents=True)
+        _make_workspace_fixture_plugin(home)
+
+    script = r"""
+import json
+from pathlib import Path
+from hermes_cli.plugins import PluginManager
+
+manager = PluginManager()
+manager.discover_and_load()
+loaded = manager._plugins['workspace-fixture']
+assert loaded.enabled and loaded.module is not None
+service = loaded.module.workspace_service
+intent = service.new_intent()
+handle = service.acquire('discovered-run', intent=intent)
+Path(service.inspect(handle)['path'], 'integration.txt').write_text('profile-alpha', encoding='utf-8')
+print(json.dumps(handle))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script], cwd=PROJECT_ROOT,
+        env=_child_env(homes[0]), check=True, capture_output=True, text=True, timeout=30,
+    )
+    handle = json.loads(result.stdout.strip().splitlines()[-1])
+
+    manager_b = PluginManager(scope_key=hermes_home_key(homes[1]))
+    manager_b.discover_and_load()
+    service_b = manager_b._plugins["workspace-fixture"].module.workspace_service
+    with pytest.raises(InvalidWorkspaceHandleError):
+        service_b.inspect(handle)
+    own_b = service_b.acquire("discovered-run", intent=service_b.new_intent())
+    assert Path(service_b.inspect(own_b)["path"]).is_relative_to(homes[1].resolve())
+
+    manager_a = PluginManager(scope_key=hermes_home_key(homes[0]))
+    manager_a.discover_and_load()
+    loaded_a = manager_a._plugins["workspace-fixture"]
+    assert loaded_a.enabled and loaded_a.module is not None
+    service_a = loaded_a.module.workspace_service
+    successor = service_a.reconnect(handle, intent=service_a.new_intent())
+    snapshot = service_a.inspect(successor)
+    assert Path(snapshot["path"], "integration.txt").read_text(encoding="utf-8") == "profile-alpha"
+    assert Path(snapshot["path"]).is_relative_to(homes[0].resolve())
+    assert service_a.release(successor)["state"] == "released"
+    assert service_b.inspect(own_b)["state"] == "active"
+
+
 def test_inspect_holds_fence_across_release_and_reacquire(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1614,6 +1686,39 @@ def test_unverified_machine_still_recognizes_exact_current_process(
     }
     monkeypatch.setattr(plugin_workspaces, "_pid_alive_matches", lambda *_args: True)
     assert plugin_workspaces._owner_status(row) == "unknown"
+
+
+def test_verified_foreign_machine_with_coincident_pid_create_is_never_self(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import plugin_workspaces
+
+    monkeypatch.setattr(
+        plugin_workspaces, "_machine_identity", lambda: "machine-sha256:local",
+    )
+    ctx = _context(tmp_path / "home")
+    handle = _acquire(ctx, "foreign-coincident", ttl_seconds=300)
+    db = tmp_path / "home/plugin-data/pr-review/workspace-leases.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """UPDATE workspace_leases SET owner_pid=?, owner_create_time=?,
+               owner_machine_identity='machine-sha256:foreign' WHERE lease_id=?""",
+            (os.getpid(), plugin_workspaces._process_create_time(), handle["lease_id"]),
+        )
+
+    with pytest.raises(WorkspaceOwnershipError):
+        ctx.workspaces.renew(handle)
+    with pytest.raises(WorkspaceOwnershipError):
+        ctx.workspaces.reconnect(handle, intent=ctx.workspaces.new_intent())
+    with pytest.raises(WorkspaceOwnershipError):
+        ctx.workspaces.release(handle)
+
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE workspace_leases SET owner_machine_identity=? WHERE lease_id=?",
+            ("machine-sha256:local", handle["lease_id"]),
+        )
+    assert ctx.workspaces.release(handle)["state"] == "released"
 
 
 def test_slow_release_cleanup_records_old_generation_after_successor_acquires(

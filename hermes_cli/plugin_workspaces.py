@@ -469,6 +469,16 @@ def _owner_status(row: Mapping[str, Any]) -> str:
         return "dead"
     if pid <= 0:
         return "dead"
+    recorded_machine = str(
+        _row_value(row, "owner_machine_identity") or "unverified"
+    )
+    current_machine = _machine_identity()
+    if (
+        _verified_instance(recorded_machine)
+        and _verified_instance(current_machine)
+        and recorded_machine != current_machine
+    ):
+        return "unknown"
     recorded_create = _row_value(row, "owner_create_time")
     if pid == os.getpid() and recorded_create is not None:
         current_create = _process_create_time()
@@ -479,10 +489,6 @@ def _owner_status(row: Mapping[str, Any]) -> str:
             if abs(float(current_create) - float(recorded_create)) < 2.0
             else "dead"
         )
-    recorded_machine = str(
-        _row_value(row, "owner_machine_identity") or "unverified"
-    )
-    current_machine = _machine_identity()
     if not (_verified_instance(recorded_machine) and _verified_instance(current_machine)):
         return "unknown"
     if recorded_machine != current_machine:
@@ -1091,8 +1097,6 @@ class PluginWorkspaces:
         )
         pid, created, host, instance = _owner_stamp()
         machine = _machine_identity()
-        detached: Path | None = None
-        preparation_error: WorkspacePathError | None = None
         reclaimed: str | None = None
 
         with _workspace_roots(layout) as recovery_roots, transaction(
@@ -1301,6 +1305,88 @@ class PluginWorkspaces:
                 _cleanup_receipt(conn, row, "acquire", "planned", cleanup)
                 _event(conn, row, "preparing", {"reclaimed": reclaimed, "cleanup": cleanup})
 
+        detached, cleanup = self._prepare_acquire_workspace(
+            layout, workspace_id, lease_id, generation, operation_id,
+            capability, planned_detached,
+        )
+
+        if detached is not None:
+            finished_cleanup = _finish_detached_cleanup(detached, cleanup)
+            finished_cleanup.update({
+                "operation": "acquire", "planned_detached_path": str(planned_detached),
+            })
+            with transaction(_connect(layout), immediate=True) as conn:
+                changed = conn.execute(
+                    """UPDATE workspace_leases SET cleanup_json=?, updated_at=? WHERE lease_id=?
+                       AND state='preparing' AND generation=? AND acquire_intent_id=?""",
+                    (
+                        json.dumps(finished_cleanup, sort_keys=True), time.time(), lease_id,
+                        generation, operation_id,
+                    ),
+                ).rowcount
+                if changed:
+                    prepared = conn.execute(
+                        "SELECT * FROM workspace_leases WHERE lease_id=?", (lease_id,),
+                    ).fetchone()
+                    _cleanup_receipt(
+                        conn, prepared, "acquire", "predecessor_cleanup_completed",
+                        finished_cleanup,
+                    )
+
+        with transaction(_connect(layout), immediate=True) as conn:
+            (
+                ready_at, ready_expires_wall, ready_mono, ready_expires_mono,
+                ready_observer, ready_observed_mono,
+            ) = _fresh_expiry(ttl)
+            current = _validated_row(
+                conn, layout, _handle(lease_id, capability), validate_path=False,
+            )
+            if (
+                current["state"] != "preparing"
+                or int(current["generation"]) != generation
+                or current["acquire_intent_id"] != operation_id
+            ):
+                raise InvalidWorkspaceHandleError("workspace preparation lost its fence")
+            if (
+                current["state"] != "preparing"
+                or int(current["generation"]) != generation
+                or current["acquire_intent_id"] != operation_id
+            ):
+                raise InvalidWorkspaceHandleError("workspace activation lost its fence")
+            _validate_workspace_entry(layout, str(current["workspace_id"]))
+            changed = conn.execute(
+                """UPDATE workspace_leases SET state='active', heartbeat_at=?, expires_at=?,
+                   heartbeat_monotonic=?, expires_monotonic=?, expiry_observer=?,
+                   expiry_observed_monotonic=?, updated_at=? WHERE lease_id=?
+                   AND state='preparing' AND generation=? AND acquire_intent_id=?""",
+                (
+                    ready_at, ready_expires_wall, ready_mono, ready_expires_mono,
+                    ready_observer, ready_observed_mono, ready_at, lease_id,
+                    generation, operation_id,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise InvalidWorkspaceHandleError("workspace activation lost its fence")
+            operation_changed = conn.execute(
+                """UPDATE workspace_lease_operations SET state='committed', updated_at=?
+                   WHERE operation_id=? AND kind='acquire' AND output_lease_id=?
+                   AND generation=? AND state='preparing'""",
+                (ready_at, operation_id, lease_id, generation),
+            ).rowcount
+            if operation_changed != 1:
+                raise InvalidWorkspaceHandleError("workspace acquire receipt lost its fence")
+            active = conn.execute(
+                "SELECT * FROM workspace_leases WHERE lease_id=?", (lease_id,),
+            ).fetchone()
+            _cleanup_receipt(conn, active, "acquire", "ready", json.loads(active["cleanup_json"]))
+            _event(conn, active, "acquired", {"reclaimed": reclaimed, "operation_id": operation_id})
+        return _response_handle(lease_id, capability)
+
+    def _prepare_acquire_workspace(
+        self, layout: _Layout, workspace_id: str, lease_id: str, generation: int,
+        operation_id: str, capability: str, planned_detached: Path,
+    ) -> tuple[Path | None, dict[str, Any]]:
+        preparation_error: WorkspacePathError | None = None
         with _workspace_roots(layout) as roots, transaction(
             _connect(layout), immediate=True,
         ) as conn:
@@ -1383,75 +1469,9 @@ class PluginWorkspaces:
                 ).rowcount
                 if changed != 1:
                     raise InvalidWorkspaceHandleError("workspace preparation lost its fence")
-
         if preparation_error is not None:
             raise preparation_error
-
-        if detached is not None:
-            finished_cleanup = _finish_detached_cleanup(detached, cleanup)
-            finished_cleanup.update({
-                "operation": "acquire", "planned_detached_path": str(planned_detached),
-            })
-            with transaction(_connect(layout), immediate=True) as conn:
-                changed = conn.execute(
-                    """UPDATE workspace_leases SET cleanup_json=?, updated_at=? WHERE lease_id=?
-                       AND state='preparing' AND generation=? AND acquire_intent_id=?""",
-                    (
-                        json.dumps(finished_cleanup, sort_keys=True), time.time(), lease_id,
-                        generation, operation_id,
-                    ),
-                ).rowcount
-                if changed:
-                    prepared = conn.execute(
-                        "SELECT * FROM workspace_leases WHERE lease_id=?", (lease_id,),
-                    ).fetchone()
-                    _cleanup_receipt(
-                        conn, prepared, "acquire", "predecessor_cleanup_completed",
-                        finished_cleanup,
-                    )
-
-        with transaction(_connect(layout), immediate=True) as conn:
-            (
-                ready_at, ready_expires_wall, ready_mono, ready_expires_mono,
-                ready_observer, ready_observed_mono,
-            ) = _fresh_expiry(ttl)
-            current = _validated_row(
-                conn, layout, _handle(lease_id, capability), validate_path=False,
-            )
-            if (
-                current["state"] != "preparing"
-                or int(current["generation"]) != generation
-                or current["acquire_intent_id"] != operation_id
-            ):
-                raise InvalidWorkspaceHandleError("workspace activation lost its fence")
-            _validate_workspace_entry(layout, str(current["workspace_id"]))
-            changed = conn.execute(
-                """UPDATE workspace_leases SET state='active', heartbeat_at=?, expires_at=?,
-                   heartbeat_monotonic=?, expires_monotonic=?, expiry_observer=?,
-                   expiry_observed_monotonic=?, updated_at=? WHERE lease_id=?
-                   AND state='preparing' AND generation=? AND acquire_intent_id=?""",
-                (
-                    ready_at, ready_expires_wall, ready_mono, ready_expires_mono,
-                    ready_observer, ready_observed_mono, ready_at, lease_id,
-                    generation, operation_id,
-                ),
-            ).rowcount
-            if changed != 1:
-                raise InvalidWorkspaceHandleError("workspace activation lost its fence")
-            operation_changed = conn.execute(
-                """UPDATE workspace_lease_operations SET state='committed', updated_at=?
-                   WHERE operation_id=? AND kind='acquire' AND output_lease_id=?
-                   AND generation=? AND state='preparing'""",
-                (ready_at, operation_id, lease_id, generation),
-            ).rowcount
-            if operation_changed != 1:
-                raise InvalidWorkspaceHandleError("workspace acquire receipt lost its fence")
-            active = conn.execute(
-                "SELECT * FROM workspace_leases WHERE lease_id=?", (lease_id,),
-            ).fetchone()
-            _cleanup_receipt(conn, active, "acquire", "ready", json.loads(active["cleanup_json"]))
-            _event(conn, active, "acquired", {"reclaimed": reclaimed, "operation_id": operation_id})
-        return _response_handle(lease_id, capability)
+        return detached, cleanup
 
     def renew(
         self, handle: Mapping[str, Any], *, ttl_seconds: float | None = None,
