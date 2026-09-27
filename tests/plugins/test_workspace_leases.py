@@ -17,6 +17,7 @@ from hermes_constants import hermes_home_key, reset_hermes_home_override, set_he
 from hermes_cli.plugin_workspaces import (
     HOST_FEATURE,
     InvalidWorkspaceHandleError,
+    InvalidWorkspaceIntentError,
     WorkspaceInUseError,
     WorkspaceLeaseExpiredError,
 )
@@ -26,10 +27,17 @@ from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _context(home: Path, plugin_id: str = "pr-review") -> PluginContext:
+def _context(
+    home: Path, plugin_id: str = "pr-review", *, skill_namespace: str = "",
+) -> PluginContext:
     home.mkdir(parents=True, exist_ok=True)
     return PluginContext(
-        PluginManifest(name=plugin_id, key=plugin_id),
+        PluginManifest(
+            name=plugin_id,
+            key=plugin_id,
+            portable=bool(skill_namespace),
+            skill_namespace=skill_namespace,
+        ),
         PluginManager(scope_key=hermes_home_key(home)),
     )
 
@@ -38,10 +46,22 @@ def _child_env(home: Path) -> dict[str, str]:
     return {**os.environ, "HERMES_HOME": str(home)}
 
 
+def _acquire(ctx: PluginContext, workspace_id: str, **kwargs):
+    return ctx.workspaces.acquire(
+        workspace_id, intent=ctx.workspaces.new_intent(), **kwargs,
+    )
+
+
+def _reconnect(ctx: PluginContext, handle, **kwargs):
+    return ctx.workspaces.reconnect(
+        handle, intent=ctx.workspaces.new_intent(), **kwargs,
+    )
+
+
 def test_handle_is_opaque_serializable_and_profile_bound(tmp_path: Path) -> None:
     home_a, home_b = tmp_path / "profiles" / "a", tmp_path / "profiles" / "b"
     ctx = _context(home_a)
-    handle = ctx.workspaces.acquire("run-1")
+    handle = _acquire(ctx, "run-1")
 
     assert json.loads(json.dumps(handle)) == handle
     assert set(handle) == {"contract_version", "lease_id", "capability"}
@@ -71,9 +91,9 @@ def test_handle_validation_token_rotation_and_idempotent_release(tmp_path: Path)
     ctx = _context(tmp_path / "home")
     for invalid_id in ("", "../escape", "UPPER", "a/b", "con", "run.", "a" * 129):
         with pytest.raises(ValueError, match="workspace_id"):
-            ctx.workspaces.acquire(invalid_id)
+            ctx.workspaces.acquire(invalid_id, intent=ctx.workspaces.new_intent())
 
-    handle = ctx.workspaces.acquire("run-1")
+    handle = _acquire(ctx, "run-1")
     forged = {**handle, "capability": "x" * len(handle["capability"])}
     with pytest.raises(InvalidWorkspaceHandleError):
         ctx.workspaces.inspect(forged)
@@ -88,7 +108,7 @@ def test_handle_validation_token_rotation_and_idempotent_release(tmp_path: Path)
     )
     assert second_renewal["expiresAt"] >= first_renewal["expiresAt"]
 
-    successor = ctx.workspaces.reconnect(handle)
+    successor = _reconnect(ctx, handle)
     assert successor != handle
     assert ctx.workspaces.inspect(successor)["generation"] == 2
     with pytest.raises(InvalidWorkspaceHandleError):
@@ -103,15 +123,137 @@ def test_handle_validation_token_rotation_and_idempotent_release(tmp_path: Path)
         ctx.workspaces.renew(successor)
 
 
+def test_acquire_intent_resumes_after_plan_and_replays_exact_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hermes_cli.plugin_workspaces as workspace_module
+
+    ctx = _context(tmp_path / "home")
+    intent = ctx.workspaces.new_intent()
+    real_connect = workspace_module._connect
+    calls = 0
+
+    def fail_second_connect(layout):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise sqlite3.OperationalError("simulated process interruption")
+        return real_connect(layout)
+
+    monkeypatch.setattr(workspace_module, "_connect", fail_second_connect)
+    with pytest.raises(sqlite3.OperationalError, match="simulated"):
+        ctx.workspaces.acquire("planned", intent=intent)
+    monkeypatch.setattr(workspace_module, "_connect", real_connect)
+
+    handle = ctx.workspaces.acquire("planned", intent=intent)
+    assert ctx.workspaces.acquire("planned", intent=intent) == handle
+    assert ctx.workspaces.inspect(handle)["state"] == "active"
+
+
+def test_acquire_intent_recovers_crash_with_both_workspace_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hermes_cli.plugin_workspaces as workspace_module
+
+    home = tmp_path / "home"
+    ctx = _context(home)
+    predecessor = _acquire(ctx, "handoff")
+    predecessor_path = Path(ctx.workspaces.inspect(predecessor)["path"])
+    (predecessor_path / "work.txt").write_text("preserve", encoding="utf-8")
+    db = home / "plugin-data/pr-review/workspace-leases.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE workspace_leases SET owner_pid=99999999, owner_create_time=0 "
+            "WHERE lease_id=?",
+            (predecessor["lease_id"],),
+        )
+
+    intent = ctx.workspaces.new_intent()
+    real_event = workspace_module._event
+
+    def crash_before_commit(conn, row, event_type, details=None):
+        if event_type == "acquired":
+            raise RuntimeError("simulated crash before activation commit")
+        return real_event(conn, row, event_type, details)
+
+    monkeypatch.setattr(workspace_module, "_event", crash_before_commit)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        ctx.workspaces.acquire("handoff", intent=intent)
+    monkeypatch.setattr(workspace_module, "_event", real_event)
+
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT state, cleanup_json FROM workspace_leases WHERE workspace_id='handoff'"
+        ).fetchone()
+    cleanup = json.loads(row[1])
+    assert row[0] == "preparing"
+    assert predecessor_path.is_dir()
+    assert Path(cleanup["planned_detached_path"]).is_dir()
+
+    handle = ctx.workspaces.acquire("handoff", intent=intent)
+    recovered = ctx.workspaces.inspect(handle)["cleanup"]["recovered_cleanup"]
+    assert any(
+        item.get("disposition") == "quarantined"
+        and Path(item["quarantine_path"], "work.txt").is_file()
+        for item in recovered
+    )
+
+
+def test_reconnect_intent_replays_successor_after_lost_response(tmp_path: Path) -> None:
+    ctx = _context(tmp_path / "home")
+    predecessor = _acquire(ctx, "reconnect-replay")
+    intent = ctx.workspaces.new_intent()
+
+    successor = ctx.workspaces.reconnect(predecessor, intent=intent)
+    assert ctx.workspaces.reconnect(predecessor, intent=intent) == successor
+    with pytest.raises(InvalidWorkspaceIntentError, match="reused"):
+        ctx.workspaces.reconnect(
+            predecessor,
+            intent=intent,
+            ttl_seconds=123,
+        )
+
+
+def test_native_and_portable_generated_namespaces_are_disjoint(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    generated = "agent-plugin-collision-deadbeef"
+    native = _context(home, generated)
+    portable = _context(home, "collision", skill_namespace=generated)
+
+    native_handle = _acquire(native, "same")
+    portable_handle = _acquire(portable, "same")
+    native_path = Path(native.workspaces.inspect(native_handle)["path"])
+    portable_path = Path(portable.workspaces.inspect(portable_handle)["path"])
+    assert native_path != portable_path
+    assert ".portable-workspaces" not in native_path.parts
+    assert ".portable-workspaces" in portable_path.parts
+    with pytest.raises(InvalidWorkspaceHandleError):
+        native.workspaces.inspect(portable_handle)
+    with pytest.raises(InvalidWorkspaceHandleError):
+        portable.workspaces.inspect(native_handle)
+
+    with sqlite3.connect(home / "plugin-data" / generated / "workspace-leases.db") as conn:
+        native_digest = conn.execute(
+            "SELECT plugin_identity_digest FROM workspace_leases"
+        ).fetchone()[0]
+    with sqlite3.connect(
+        home / "plugin-data/.portable-workspaces" / generated / "workspace-leases.db"
+    ) as conn:
+        portable_digest = conn.execute(
+            "SELECT plugin_identity_digest FROM workspace_leases"
+        ).fetchone()[0]
+    assert native_digest != portable_digest
+
+
 def test_competing_process_cannot_acquire_live_workspace(tmp_path: Path) -> None:
     home = tmp_path / "home"
-    handle = _context(home).workspaces.acquire("shared", ttl_seconds=60)
+    handle = _acquire(_context(home), "shared", ttl_seconds=60)
     script = """
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 from hermes_cli.plugin_workspaces import WorkspaceInUseError
 ctx = PluginContext(PluginManifest(name='pr-review'), PluginManager())
 try:
-    ctx.workspaces.acquire('shared', ttl_seconds=60)
+    ctx.workspaces.acquire('shared', intent=ctx.workspaces.new_intent(), ttl_seconds=60)
 except WorkspaceInUseError:
     print('refused')
 else:
@@ -128,7 +270,7 @@ else:
 def test_foreign_process_cannot_reconnect_live_owner_after_ttl(tmp_path: Path) -> None:
     home = tmp_path / "home"
     ctx = _context(home)
-    handle = ctx.workspaces.acquire("shared", ttl_seconds=60)
+    handle = _acquire(ctx, "shared", ttl_seconds=60)
     db = home / "plugin-data/pr-review/workspace-leases.db"
     with sqlite3.connect(db) as conn:
         conn.execute("UPDATE workspace_leases SET expires_at=0 WHERE lease_id=?", (handle["lease_id"],))
@@ -140,7 +282,9 @@ from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 from hermes_cli.plugin_workspaces import WorkspaceOwnershipError
 ctx = PluginContext(PluginManifest(name='pr-review'), PluginManager())
 try:
-    ctx.workspaces.reconnect(json.loads(sys.argv[1]))
+    ctx.workspaces.reconnect(
+        json.loads(sys.argv[1]), intent=ctx.workspaces.new_intent()
+    )
 except WorkspaceOwnershipError:
     print('refused')
 else:
@@ -151,7 +295,7 @@ else:
         env=_child_env(home), check=True, capture_output=True, text=True, timeout=30,
     )
     assert result.stdout.strip().splitlines()[-1] == "refused"
-    assert ctx.workspaces.inspect(ctx.workspaces.reconnect(handle))["state"] == "active"
+    assert ctx.workspaces.inspect(_reconnect(ctx, handle))["state"] == "active"
 
 
 def test_simultaneous_processes_have_exactly_one_winner(tmp_path: Path) -> None:
@@ -176,7 +320,9 @@ while not gate.exists():
         raise RuntimeError('timed out waiting for acquisition gate')
     time.sleep(0.01)
 try:
-    ctx.workspaces.acquire('simultaneous', ttl_seconds=60)
+    ctx.workspaces.acquire(
+        'simultaneous', intent=ctx.workspaces.new_intent(), ttl_seconds=60
+    )
 except WorkspaceInUseError:
     outcome.write_text('refused', encoding='utf-8')
 else:
@@ -233,7 +379,9 @@ import json
 from pathlib import Path
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 ctx = PluginContext(PluginManifest(name='pr-review'), PluginManager())
-handle = ctx.workspaces.acquire('restart-safe', ttl_seconds=3600)
+handle = ctx.workspaces.acquire(
+    'restart-safe', intent=ctx.workspaces.new_intent(), ttl_seconds=3600
+)
 Path(ctx.workspaces.inspect(handle)['path'], 'work.txt').write_text('preserve me', encoding='utf-8')
 print(json.dumps(handle))
 """
@@ -244,7 +392,7 @@ print(json.dumps(handle))
     predecessor = json.loads(result.stdout.strip().splitlines()[-1])
 
     ctx = _context(home)
-    successor = ctx.workspaces.reconnect(predecessor)
+    successor = _reconnect(ctx, predecessor)
     snapshot = ctx.workspaces.inspect(successor)
     assert Path(snapshot["path"], "work.txt").read_text(encoding="utf-8") == "preserve me"
     assert snapshot["events"][-1]["type"] == "reconnected"
@@ -259,44 +407,48 @@ def test_process_and_boot_witnesses_make_persisted_owners_reclaimable(
     ctx = _context(home)
     db = home / "plugin-data/pr-review/workspace-leases.db"
 
-    stale_process = ctx.workspaces.acquire("stale-process")
+    stale_process = _acquire(ctx, "stale-process")
     with sqlite3.connect(db) as conn:
         conn.execute(
             "UPDATE workspace_leases SET owner_create_time=0 "
             "WHERE lease_id=?",
             (stale_process["lease_id"],),
         )
-    process_snapshot = ctx.workspaces.inspect(ctx.workspaces.reconnect(stale_process))
+    process_snapshot = ctx.workspaces.inspect(_reconnect(ctx, stale_process))
     assert process_snapshot["events"][-1]["details"]["previous_owner"] == "dead"
 
-    stale_boot = ctx.workspaces.acquire("stale-boot")
+    stale_boot = _acquire(ctx, "stale-boot")
     with sqlite3.connect(db) as conn:
         conn.execute(
             "UPDATE workspace_leases SET owner_instance='boot-id:previous-boot' "
             "WHERE lease_id=?",
             (stale_boot["lease_id"],),
         )
-    boot_snapshot = ctx.workspaces.inspect(ctx.workspaces.reconnect(stale_boot))
+    boot_snapshot = ctx.workspaces.inspect(_reconnect(ctx, stale_boot))
     assert boot_snapshot["events"][-1]["details"]["previous_owner"] == "dead"
 
     # Losing access to the current boot witness is not evidence of a reboot.
     import hermes_cli.plugin_workspaces as workspace_module
 
-    current = ctx.workspaces.acquire("current-boot")
+    current = _acquire(ctx, "current-boot")
     monkeypatch.setattr(workspace_module, "_host_instance", lambda: "unverified")
     assert ctx.workspaces.renew(current)["state"] == "active"
 
 
-def test_expired_generation_is_atomically_reclaimed(tmp_path: Path) -> None:
+def test_only_dead_generation_is_atomically_reclaimed(tmp_path: Path) -> None:
     ctx = _context(tmp_path / "home")
-    old = ctx.workspaces.acquire("ttl", ttl_seconds=60)
+    old = _acquire(ctx, "ttl", ttl_seconds=60)
     old_path = Path(ctx.workspaces.inspect(old)["path"])
     (old_path / "untracked.txt").write_text("old", encoding="utf-8")
     db = tmp_path / "home/plugin-data/pr-review/workspace-leases.db"
     with sqlite3.connect(db) as conn:
-        conn.execute("UPDATE workspace_leases SET expires_at=0 WHERE lease_id=?", (old["lease_id"],))
+        conn.execute(
+            "UPDATE workspace_leases SET expires_at=0, owner_pid=99999999, "
+            "owner_create_time=0 WHERE lease_id=?",
+            (old["lease_id"],),
+        )
 
-    successor = ctx.workspaces.acquire("ttl", ttl_seconds=60)
+    successor = _acquire(ctx, "ttl", ttl_seconds=60)
     snapshot = ctx.workspaces.inspect(successor)
     assert snapshot["generation"] == 2
     assert not Path(snapshot["path"], "untracked.txt").exists()
@@ -306,13 +458,45 @@ def test_expired_generation_is_atomically_reclaimed(tmp_path: Path) -> None:
         ctx.workspaces.inspect(old)
 
 
+def test_expiry_never_lets_another_process_steal_a_live_owner(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    ctx = _context(home)
+    handle = _acquire(ctx, "clock-jump", ttl_seconds=60)
+    db = home / "plugin-data/pr-review/workspace-leases.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE workspace_leases SET expires_at=0 WHERE lease_id=?",
+            (handle["lease_id"],),
+        )
+
+    script = """
+from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+from hermes_cli.plugin_workspaces import WorkspaceInUseError
+ctx = PluginContext(PluginManifest(name='pr-review'), PluginManager())
+try:
+    ctx.workspaces.acquire(
+        'clock-jump', intent=ctx.workspaces.new_intent(), ttl_seconds=60
+    )
+except WorkspaceInUseError:
+    print('refused')
+else:
+    print('stolen')
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script], cwd=PROJECT_ROOT, env=_child_env(home),
+        check=True, capture_output=True, text=True, timeout=30,
+    )
+    assert result.stdout.strip().splitlines()[-1] == "refused"
+    assert ctx.workspaces.inspect(_reconnect(ctx, handle))["state"] == "active"
+
+
 def test_stale_preparation_and_release_receipts_are_recovered(tmp_path: Path) -> None:
     home = tmp_path / "home"
     ctx = _context(home)
     db = home / "plugin-data/pr-review/workspace-leases.db"
     quarantine = home / "plugin-data/pr-review/workspace-quarantine"
 
-    preparing = ctx.workspaces.acquire("preparing-crash")
+    preparing = _acquire(ctx, "preparing-crash")
     canonical = Path(ctx.workspaces.inspect(preparing)["path"])
     (canonical / "predecessor.txt").write_text("predecessor", encoding="utf-8")
     planned = quarantine / ".detached-preparing-crash-crashed"
@@ -332,7 +516,7 @@ def test_stale_preparation_and_release_receipts_are_recovered(tmp_path: Path) ->
             (json.dumps(receipt), preparing["lease_id"]),
         )
 
-    successor = ctx.workspaces.acquire("preparing-crash")
+    successor = _acquire(ctx, "preparing-crash")
     recovered = ctx.workspaces.inspect(successor)["cleanup"]["recovered_cleanup"]
     recovered_files = {
         child.name
@@ -342,7 +526,7 @@ def test_stale_preparation_and_release_receipts_are_recovered(tmp_path: Path) ->
     }
     assert recovered_files == {"predecessor.txt", "unpublished.txt"}
 
-    releasing = ctx.workspaces.acquire("release-crash")
+    releasing = _acquire(ctx, "release-crash")
     release_path = Path(ctx.workspaces.inspect(releasing)["path"])
     (release_path / "work.txt").write_text("keep", encoding="utf-8")
     release_target = quarantine / ".detached-release-crash-crashed"
@@ -365,14 +549,14 @@ def test_stale_preparation_and_release_receipts_are_recovered(tmp_path: Path) ->
 
 def test_expired_handle_requires_reconnect_for_direct_use(tmp_path: Path) -> None:
     ctx = _context(tmp_path / "home")
-    handle = ctx.workspaces.acquire("expired", ttl_seconds=60)
+    handle = _acquire(ctx, "expired", ttl_seconds=60)
     db = tmp_path / "home/plugin-data/pr-review/workspace-leases.db"
     with sqlite3.connect(db) as conn:
         conn.execute("UPDATE workspace_leases SET expires_at=0 WHERE lease_id=?", (handle["lease_id"],))
 
     with pytest.raises(WorkspaceLeaseExpiredError):
         ctx.workspaces.inspect(handle)
-    successor = ctx.workspaces.reconnect(handle)
+    successor = _reconnect(ctx, handle)
     assert ctx.workspaces.inspect(successor)["generation"] == 2
 
 
@@ -383,7 +567,7 @@ def test_expiry_is_sampled_after_transaction_entry(
 
     home = tmp_path / "home"
     ctx = _context(home)
-    handle = ctx.workspaces.acquire("lock-delayed")
+    handle = _acquire(ctx, "lock-delayed")
     db = home / "plugin-data/pr-review/workspace-leases.db"
     with sqlite3.connect(db) as conn:
         conn.execute("UPDATE workspace_leases SET expires_at=5 WHERE lease_id=?", (handle["lease_id"],))
@@ -407,7 +591,7 @@ def test_expiry_is_sampled_after_transaction_entry(
 def test_cleanup_deletes_only_empty_and_quarantines_every_nonempty_tree(tmp_path: Path) -> None:
     ctx = _context(tmp_path / "home")
 
-    nonempty = ctx.workspaces.acquire("nonempty")
+    nonempty = _acquire(ctx, "nonempty")
     nonempty_path = Path(ctx.workspaces.inspect(nonempty)["path"])
     (nonempty_path / "work.txt").write_text("data", encoding="utf-8")
     cleanup = ctx.workspaces.release(nonempty)["cleanup"]
@@ -415,7 +599,7 @@ def test_cleanup_deletes_only_empty_and_quarantines_every_nonempty_tree(tmp_path
     assert cleanup["disposition"] == "quarantined"
     assert Path(cleanup["quarantine_path"], "work.txt").is_file()
 
-    empty = ctx.workspaces.acquire("empty")
+    empty = _acquire(ctx, "empty")
     empty_path = Path(ctx.workspaces.inspect(empty)["path"])
     cleanup = ctx.workspaces.release(empty)["cleanup"]
     assert cleanup["classification"] == "clean_empty"

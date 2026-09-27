@@ -62,27 +62,41 @@ invent or infer the bound-dispatch feature name from `workspace_leases.v1`.
 
 ## Lifecycle API
 
-The facade has five methods:
+The facade has six methods. `acquire` and `reconnect` require an idempotency intent that the caller
+creates and durably stores **before** making the call:
 
 ```python
-handle = ctx.workspaces.acquire("run-01", ttl_seconds=300)
+acquire_intent = ctx.workspaces.new_intent()
+persist_pending_intent(acquire_intent)
+handle = ctx.workspaces.acquire("run-01", intent=acquire_intent, ttl_seconds=300)
+persist_handle_and_clear_intent(handle)
+
 snapshot = ctx.workspaces.inspect(handle)
 snapshot = ctx.workspaces.renew(handle, ttl_seconds=300)
-successor = ctx.workspaces.reconnect(handle, ttl_seconds=300)
+
+reconnect_intent = ctx.workspaces.new_intent()
+persist_pending_intent(reconnect_intent)
+successor = ctx.workspaces.reconnect(
+    handle, intent=reconnect_intent, ttl_seconds=300
+)
+persist_handle_and_clear_intent(successor)
+
 released = ctx.workspaces.release(successor)
 ```
 
 | Method | Contract |
 |---|---|
-| `acquire(workspace_id, *, ttl_seconds=300)` | Exclusively reserves the plugin's named directory and returns a new opaque handle. A live, unexpired generation cannot be acquired twice. |
+| `new_intent()` | Returns a JSON-serializable operation UUID and output capability for one `acquire` or `reconnect`. Persist it before calling. |
+| `acquire(workspace_id, *, intent, ttl_seconds=300)` | Exclusively reserves the plugin's named directory and returns a new opaque handle. Repeating the exact request with the same intent resumes a durable preparation or replays its result. |
 | `inspect(handle)` | Validates the handle, scope, path, state, and TTL, then returns the current snapshot. It does not renew the heartbeat. |
 | `renew(handle, *, ttl_seconds=None)` | Extends the heartbeat for the current process owner and returns the updated snapshot. |
-| `reconnect(handle, *, ttl_seconds=None)` | Reclaims a lease after a process restart when ownership can be proven safe. It rotates the lease ID and bearer capability and returns a successor handle. |
+| `reconnect(handle, *, intent, ttl_seconds=None)` | Reclaims a lease after a process restart when ownership can be proven safe. It rotates the lease ID and bearer capability and returns a successor handle. Repeating the exact request with the same intent replays that successor. |
 | `release(handle)` | Atomically detaches the leased path, records the released state, and then cleans or quarantines its contents. Repeating release with the same current handle is safe. |
 
 `ttl_seconds` must be finite and between 1 second and 24 hours. A worker should renew well before
 expiry and persist the returned handle before it begins work that must survive a host restart.
-Another live process cannot renew, reconnect, or release an unexpired lease it does not own.
+Expiry makes direct inspection and renewal fail, but it is not proof that another process may take
+over: a foreign or unverifiable live owner is never displaced solely because its TTL elapsed.
 
 `workspace_id` is a stable plugin-chosen identifier: 1–128 lowercase ASCII letters, digits,
 periods, underscores, or hyphens. It must start with a letter or digit, may not contain `..`, and
@@ -111,6 +125,11 @@ immediately, so a stale worker cannot inspect, renew, or release the successor's
 are also bound to the plugin namespace and active Hermes profile; a handle copied to another plugin
 or profile is rejected.
 
+An intent is also a bearer secret. Hermes stores its operation UUID and capability digest, not the
+capability itself. If a process stops after an acquire plan is committed or after a reconnect result
+is committed but before receiving the response, retry the identical call with the persisted intent.
+Hermes resumes or returns the exact same handle; reusing an intent for different inputs is rejected.
+
 Use `inspect(handle)["path"]` to obtain the path after each acquisition or reconnect. Never derive a
 path from a handle or accept a caller-provided substitute.
 
@@ -134,15 +153,20 @@ $HERMES_HOME/plugin-data/pr-review/workspaces/run-01
 
 Runtime data never belongs in an installed plugin directory. The facade remains bound to the
 `PluginContext` profile that created it even if a multiplexed process later changes ambient profile
-scope. Plugin namespaces and profile paths keep cooperative plugins' state separate; they are not
-an access-control boundary. The lease service creates an empty directory. Cloning or otherwise
+scope. Portable Agent Plugins use the structurally separate
+`plugin-data/.portable-workspaces/<generated-namespace>/` tree, so a native plugin ID cannot collide
+with a generated portable namespace. Each database and lease row is additionally bound to a digest
+of the exact plugin kind and identity. These checks coordinate trusted plugins; they are not an
+access-control boundary. The lease service creates an empty directory. Cloning or otherwise
 materializing repository content remains the plugin's responsibility.
 
 ## Cleanup and recovery
 
-Acquisition records the owner PID, process creation time, host, host-instance witness, generation,
+Acquisition records the owner PID, process creation time, host, Linux boot-ID witness when
+available, generation,
 heartbeat, and expiry. After a worker restart, call `reconnect` with its persisted handle. A dead
-owner or expired generation can be reclaimed; a live foreign owner is refused. Successful
+owner can be reclaimed; the same owner can reconnect an expired generation, while a live or
+unverifiable foreign owner is refused regardless of TTL. Successful
 reconnect increments the generation and fences the predecessor.
 
 Release and stale-generation reclamation first rename the old directory away from its public
@@ -174,6 +198,7 @@ recovery paths:
 | `WorkspaceLeaseExpiredError` | The handle expired and must be reconnected before direct use. |
 | `WorkspaceOwnershipError` | A different live or unverifiable process owns the lease. |
 | `InvalidWorkspaceHandleError` | The handle is malformed, stale, released, tampered with, or belongs to another plugin/profile. |
+| `InvalidWorkspaceIntentError` | The intent is malformed, has no valid receipt, or was reused for different inputs. |
 | `WorkspacePathError` | The expected workspace directory is missing or cannot be used. |
 
 Do not fall back to an arbitrary temporary directory after a fencing, ownership, or path error:

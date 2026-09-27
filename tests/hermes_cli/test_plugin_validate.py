@@ -164,7 +164,8 @@ class TestCapabilityProbe:
             manifest=dict(BASE_MANIFEST),
             init_py=(
                 "def register(ctx):\n"
-                "    if ctx.has_host_feature('workspace_leases.v1'):\n"
+                "    probe = getattr(ctx, 'has_host_feature', None)\n"
+                "    if probe and probe('workspace_leases.v1'):\n"
                 "        ctx.register_tool('gated_tool', schema={}, handler=lambda **kw: None)\n"
             ),
         )
@@ -178,7 +179,8 @@ class TestCapabilityProbe:
             manifest={**BASE_MANIFEST, "provides_tools": ["fallback_tool", "lease_tool"]},
             init_py=(
                 "def register(ctx):\n"
-                "    if ctx.has_host_feature('workspace_leases.v1'):\n"
+                "    probe = getattr(ctx, 'has_host_feature', None)\n"
+                "    if probe and probe('workspace_leases.v1'):\n"
                 "        assert ctx.workspaces is not None\n"
                 "        ctx.register_tool('lease_tool', schema={}, handler=lambda **kw: None)\n"
                 "    else:\n"
@@ -194,13 +196,27 @@ class TestCapabilityProbe:
             manifest=dict(BASE_MANIFEST),
             init_py=(
                 "def register(ctx):\n"
-                "    if ctx.has_host_feature('workspace_leases.v1'):\n"
+                "    probe = getattr(ctx, 'has_host_feature', None)\n"
+                "    if probe and probe('workspace_leases.v1'):\n"
                 "        ctx.workspaces.acquire('registration')\n"
             ),
         )
         report = validate_plugin_dir(d)
         assert not report.ok
         assert any("not allowed during plugin registration" in failure for failure in report.failures)
+
+    def test_direct_feature_probe_is_rejected_by_legacy_mode(self, tmp_path):
+        d = _make_plugin(
+            tmp_path,
+            manifest=dict(BASE_MANIFEST),
+            init_py=(
+                "def register(ctx):\n"
+                "    ctx.has_host_feature('workspace_leases.v1')\n"
+            ),
+        )
+        report = validate_plugin_dir(d)
+        assert not report.ok
+        assert any("has_host_feature" in failure for failure in report.failures)
 
 
 class TestModelProviderKind:

@@ -211,6 +211,13 @@ class RecordingContext:
     profile_name = "default"
     plugin_id = "hermes_validate_probe_plugin"
 
+    def __getattribute__(self, name):
+        # The fallback pass models an older Hermes build: neither the feature
+        # probe nor its facade exists.  Plugins must use getattr before calling.
+        if not workspace_leases and name in {"has_host_feature", "workspaces"}:
+            raise AttributeError(name)
+        return object.__getattribute__(self, name)
+
     def register_tool(self, name, *args, **kwargs):
         recorded["tools"].append(str(name))
 
@@ -247,6 +254,8 @@ class RecordingContext:
         # not have raise AttributeError exactly like it would; handing back a
         # callable made `getattr(ctx, "profile_path", None)` truthy and crashed
         # register() in the probe alone.
+        if not workspace_leases and name in {"has_host_feature", "workspaces"}:
+            raise AttributeError(name)
         if name in context_methods:
             def _noop(*args, **kwargs):
                 return None
