@@ -29,7 +29,7 @@ from typing import Any, Mapping
 from hermes_constants import get_hermes_home, hermes_home_key, mkdir_under_hermes_home
 from hermes_cli.plugins_manifest import _portable_skill_namespace
 from hermes_cli.process_identity import _pid_alive_matches, _process_create_time
-from hermes_cli.sqlite_util import add_column_if_missing, open_db, transaction
+from hermes_cli.sqlite_util import open_db, transaction
 
 
 HOST_FEATURE = "workspace_leases.v1"
@@ -213,9 +213,7 @@ def _initialize(conn) -> None:
             output_capability_hash TEXT NOT NULL,
             plugin_identity_digest TEXT NOT NULL,
             ttl_seconds REAL NOT NULL,
-            ttl_seconds_provided INTEGER
-                CHECK (ttl_seconds_provided IN (0, 1)),
-            ttl_argument_mode INTEGER
+            ttl_argument_mode INTEGER NOT NULL
                 CHECK (ttl_argument_mode IN (0, 1)),
             result_generation INTEGER,
             state TEXT NOT NULL CHECK (state IN ('planned', 'committed', 'failed')),
@@ -229,34 +227,6 @@ def _initialize(conn) -> None:
         );
         """
     )
-    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(workspace_leases)")}
-    if "plugin_identity_digest" not in columns:
-        add_column_if_missing(
-            conn,
-            "workspace_leases",
-            "plugin_identity_digest",
-            "plugin_identity_digest TEXT NOT NULL DEFAULT ''",
-        )
-    operation_columns = {
-        str(row[1]) for row in conn.execute("PRAGMA table_info(workspace_lease_operations)")
-    }
-    if "ttl_seconds_provided" not in operation_columns:
-        add_column_if_missing(
-            conn,
-            "workspace_lease_operations",
-            "ttl_seconds_provided",
-            "ttl_seconds_provided INTEGER "
-            "CHECK (ttl_seconds_provided IN (0, 1))",
-        )
-    if "ttl_argument_mode" not in operation_columns:
-        # Receipts predating this column cannot prove whether TTL was omitted.
-        # Keep them NULL so either exact normalized replay remains recoverable.
-        add_column_if_missing(
-            conn,
-            "workspace_lease_operations",
-            "ttl_argument_mode",
-            "ttl_argument_mode INTEGER CHECK (ttl_argument_mode IN (0, 1))",
-        )
 
 
 def _connect(layout: _Layout):
@@ -470,7 +440,6 @@ def _validate_operation(
     stored_ttl_mode = operation["ttl_argument_mode"]
     if (
         ttl_seconds_provided is not None
-        and stored_ttl_mode is not None
         and bool(stored_ttl_mode) != ttl_seconds_provided
     ):
         raise InvalidWorkspaceIntentError(
@@ -842,9 +811,10 @@ class PluginWorkspaces:
                     """INSERT INTO workspace_lease_operations
                        (operation_id, operation_kind, workspace_id, input_lease_id,
                         input_capability_hash, output_lease_id, output_capability_hash,
-                        plugin_identity_digest, ttl_seconds, result_generation, state,
+                        plugin_identity_digest, ttl_seconds, ttl_argument_mode,
+                        result_generation, state,
                         error_text, created_at, updated_at)
-                       VALUES (?, 'acquire', ?, NULL, NULL, ?, ?, ?, ?, NULL, 'planned',
+                       VALUES (?, 'acquire', ?, NULL, NULL, ?, ?, ?, ?, 1, NULL, 'planned',
                                NULL, ?, ?)""",
                     (
                         operation_id, workspace_id, lease_id, _capability_hash(capability),
@@ -1091,16 +1061,15 @@ class PluginWorkspaces:
                 """INSERT INTO workspace_lease_operations
                    (operation_id, operation_kind, workspace_id, input_lease_id,
                     input_capability_hash, output_lease_id, output_capability_hash,
-                    plugin_identity_digest, ttl_seconds, ttl_seconds_provided,
-                    ttl_argument_mode, result_generation, state, error_text, created_at, updated_at)
-                   VALUES (?, 'reconnect', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'committed',
+                    plugin_identity_digest, ttl_seconds, ttl_argument_mode,
+                    result_generation, state, error_text, created_at, updated_at)
+                   VALUES (?, 'reconnect', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'committed',
                            NULL, ?, ?)""",
                 (
                     operation_id, row["workspace_id"], previous_lease_id,
                     _capability_hash(previous_capability), successor_lease_id,
                     _capability_hash(successor_capability), layout.plugin_identity_digest,
-                    ttl, int(ttl_was_provided), int(ttl_was_provided),
-                    int(updated["generation"]), now, now,
+                    ttl, int(ttl_was_provided), int(updated["generation"]), now, now,
                 ),
             )
             _event(conn, updated, "reconnected", {
