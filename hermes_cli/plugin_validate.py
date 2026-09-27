@@ -192,7 +192,9 @@ def _check_requires_env(report: ValidationReport, manifest: dict) -> None:
 _PROBE_SCRIPT = r"""
 import importlib.util
 import json
+import secrets
 import sys
+import uuid
 
 plugin_dir = sys.argv[1]
 sentinel = sys.argv[2]
@@ -268,12 +270,12 @@ class RecordingWorkspaces:
     # Shape-only facade; registration probes must never mutate host state.
 
     def new_intent(self):
-        # Pure, deterministic, and shape-valid.  Plugins commonly prepare an intent before
+        # Pure, fresh, and shape-valid.  Plugins commonly prepare an intent before
         # registering a handler; that must validate without granting registration-time I/O.
         return {
             "contract_version": 1,
-            "operation_id": "00000000-0000-4000-8000-000000000000",
-            "output_capability": "validate-probe-output-capability-00000000",
+            "operation_id": str(uuid.uuid4()),
+            "output_capability": secrets.token_urlsafe(32),
         }
 
     def _blocked(self, *args, **kwargs):

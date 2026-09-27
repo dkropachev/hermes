@@ -200,7 +200,7 @@ class TestCapabilityProbe:
                 "    if probe and probe('workspace_leases.v1'):\n"
                 "        first = ctx.workspaces.new_intent()\n"
                 "        second = ctx.workspaces.new_intent()\n"
-                "        assert first == second and first is not second\n"
+                "        assert first != second\n"
                 "        assert set(first) == {'contract_version', 'operation_id', 'output_capability'}\n"
                 "        assert first['contract_version'] == 1\n"
                 "        assert len(first['operation_id']) == 36\n"
