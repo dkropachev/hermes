@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import socket
 import stat
 import subprocess
 import sys
@@ -89,6 +90,83 @@ def _expire_lease(conn: sqlite3.Connection, lease_id: str) -> None:
            WHERE lease_id=?""",
         (lease_id,),
     )
+
+
+def _seed_original_h1_database(
+    home: Path, *, workspace_id: str = "legacy-run", plugin_namespace: str = "pr-review",
+    profile_key: str | None = None, workspace_path: str | None = None,
+) -> tuple[dict, Path]:
+    from hermes_cli import plugin_workspaces
+
+    data_dir = home / "plugin-data/pr-review"
+    workspaces = data_dir / "workspaces"
+    quarantine = data_dir / "workspace-quarantine"
+    workspace = workspaces / workspace_id
+    workspace.mkdir(parents=True)
+    quarantine.mkdir()
+    db = data_dir / "workspace-leases.db"
+    capability = "legacy-capability-" + "x" * 32
+    lease_id = "11111111-1111-4111-8111-111111111111"
+    now = time.time()
+    with sqlite3.connect(db) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE workspace_leases (
+                workspace_id TEXT PRIMARY KEY,
+                lease_id TEXT NOT NULL UNIQUE,
+                capability_hash TEXT NOT NULL,
+                contract_version INTEGER NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('preparing', 'active', 'releasing', 'released')),
+                plugin_namespace TEXT NOT NULL,
+                profile_key TEXT NOT NULL,
+                workspace_path TEXT NOT NULL,
+                owner_pid INTEGER NOT NULL,
+                owner_create_time REAL,
+                owner_host TEXT NOT NULL,
+                owner_instance TEXT NOT NULL,
+                ttl_seconds REAL NOT NULL,
+                acquired_at REAL NOT NULL,
+                heartbeat_at REAL NOT NULL,
+                expires_at REAL NOT NULL,
+                released_at REAL,
+                generation INTEGER NOT NULL,
+                cleanup_json TEXT,
+                updated_at REAL NOT NULL
+            );
+            CREATE TABLE workspace_lease_events (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workspace_id TEXT NOT NULL,
+                lease_id TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                occurred_at REAL NOT NULL,
+                actor_pid INTEGER NOT NULL,
+                actor_create_time REAL,
+                details_json TEXT NOT NULL
+            );
+            CREATE INDEX workspace_lease_events_lookup
+                ON workspace_lease_events(workspace_id, event_id);
+            """
+        )
+        conn.execute(
+            """INSERT INTO workspace_leases
+               (workspace_id, lease_id, capability_hash, contract_version, state,
+                plugin_namespace, profile_key, workspace_path, owner_pid, owner_create_time,
+                owner_host, owner_instance, ttl_seconds, acquired_at, heartbeat_at, expires_at,
+                released_at, generation, cleanup_json, updated_at)
+               VALUES (?, ?, ?, 1, 'active', ?, ?, ?, ?, ?, ?, ?, 300, ?, ?, ?, NULL, 1, ?, ?)""",
+            (
+                workspace_id, lease_id, plugin_workspaces._capability_hash(capability),
+                plugin_namespace, profile_key or hermes_home_key(home),
+                workspace_path or str(workspace), os.getpid(),
+                plugin_workspaces._process_create_time(), socket.gethostname(),
+                plugin_workspaces._host_instance(), now, now, now + 300,
+                json.dumps({"classification": "missing", "disposition": "absent"}), now,
+            ),
+        )
+    return {
+        "contract_version": 1, "lease_id": lease_id, "capability": capability,
+    }, workspace
 
 
 def test_handle_is_opaque_serializable_and_profile_bound(tmp_path: Path) -> None:
@@ -550,7 +628,7 @@ def test_native_reserved_namespace_cannot_collide_with_portable_plugin(tmp_path:
             "UPDATE workspace_leases SET plugin_identity='forged' WHERE lease_id=?",
             (portable_handle["lease_id"],),
         )
-    with pytest.raises(InvalidWorkspaceHandleError):
+    with pytest.raises(WorkspacePathError, match="refusing to claim"):
         portable.workspaces.inspect(portable_handle)
 
 
@@ -901,6 +979,66 @@ def test_database_wal_and_shm_are_private_under_permissive_umask(tmp_path: Path)
         if conn is not None:
             conn.close()
         os.umask(previous_umask)
+
+
+def test_original_h1_database_upgrades_without_stranding_handle(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    handle, workspace = _seed_original_h1_database(home)
+    (workspace / "preserve.txt").write_text("legacy", encoding="utf-8")
+    ctx = _context(home)
+
+    inspected = ctx.workspaces.inspect(handle)
+    assert inspected["workspaceId"] == "legacy-run"
+    assert Path(inspected["path"], "preserve.txt").read_text(encoding="utf-8") == "legacy"
+    successor = _reconnect(ctx, handle)
+    assert ctx.workspaces.inspect(successor)["generation"] == 2
+    released = ctx.workspaces.release(successor)
+    assert released["state"] == "released"
+    assert released["cleanup"]["disposition"] == "quarantined"
+
+    db = home / "plugin-data/pr-review/workspace-leases.db"
+    with sqlite3.connect(db) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(workspace_leases)")}
+        identity, heartbeat_mono, intent_id = conn.execute(
+            """SELECT plugin_identity, heartbeat_monotonic, acquire_intent_id
+               FROM workspace_leases WHERE workspace_id='legacy-run'"""
+        ).fetchone()
+    assert {
+        "plugin_identity", "acquire_intent_id", "heartbeat_monotonic",
+        "expires_monotonic", "expiry_observer", "expiry_observed_monotonic",
+    } <= columns
+    assert identity == ctx.workspaces._layout().plugin_identity
+    assert heartbeat_mono is not None
+    assert intent_id is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("plugin_namespace", "another-plugin"),
+        ("profile_key", "/foreign/profile"),
+        ("workspace_id", "legacy-run."),
+        ("workspace_path", "/foreign/workspace"),
+    ],
+)
+def test_original_h1_database_conflicts_are_never_claimed(
+    tmp_path: Path, field: str, value: str,
+) -> None:
+    home = tmp_path / field
+    kwargs = {field: value}
+    handle, _workspace = _seed_original_h1_database(home, **kwargs)
+    ctx = _context(home)
+
+    with pytest.raises(WorkspacePathError, match="refusing to claim"):
+        ctx.workspaces.inspect(handle)
+    db = home / "plugin-data/pr-review/workspace-leases.db"
+    with sqlite3.connect(db) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(workspace_leases)")}
+        if "plugin_identity" in columns:
+            identity = conn.execute(
+                "SELECT plugin_identity FROM workspace_leases",
+            ).fetchone()[0]
+            assert identity is None
 
 
 def test_inspect_holds_fence_across_release_and_reacquire(

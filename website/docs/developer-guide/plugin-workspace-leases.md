@@ -160,6 +160,12 @@ the lease database. It rejects symlinked or aliased namespace, workspace, and da
 than following them. The lease service creates an empty directory; cloning or otherwise
 materializing repository content remains the plugin's responsibility.
 
+The lease database upgrades additively. Before backfilling a legacy row's canonical plugin identity,
+Hermes verifies every legacy row already names this plugin namespace and profile, has a valid
+workspace ID, and stores the exact canonical path beneath this plugin's `workspaces/` directory.
+Any conflicting or malformed row aborts the upgrade without claiming it; operator repair is
+required rather than guessing ownership.
+
 ## Cleanup and recovery
 
 Acquisition records the owner PID, process creation time, host, host-instance witness, generation,

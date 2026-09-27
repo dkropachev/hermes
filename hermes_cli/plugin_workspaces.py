@@ -29,7 +29,7 @@ from typing import Any, Mapping
 from hermes_constants import get_hermes_home, hermes_home_key, mkdir_under_hermes_home
 from hermes_cli.plugins_manifest import _portable_skill_namespace
 from hermes_cli.process_identity import _pid_alive_matches, _process_create_time
-from hermes_cli.sqlite_util import open_db, transaction
+from hermes_cli.sqlite_util import add_column_if_missing, open_db, transaction
 
 
 HOST_FEATURE = "workspace_leases.v1"
@@ -317,7 +317,40 @@ def _layout(plugin_id: str, skill_namespace: str, home_path: Path | None = None)
     )
 
 
-def _initialize(conn) -> None:
+def _validate_legacy_rows(conn, layout: _Layout) -> None:
+    rows = conn.execute(
+        """SELECT workspace_id, plugin_namespace, plugin_identity, profile_key, workspace_path
+           FROM workspace_leases"""
+    ).fetchall()
+    invalid: list[str] = []
+    for row in rows:
+        workspace_id = row["workspace_id"]
+        try:
+            _validated_workspace_id(workspace_id)
+        except ValueError:
+            invalid.append(f"workspace_id={workspace_id!r}")
+            continue
+        expected_path = str(layout.workspaces_dir / workspace_id)
+        identity = row["plugin_identity"]
+        if (
+            row["plugin_namespace"] != layout.plugin_namespace
+            or row["profile_key"] != layout.profile_key
+            or row["workspace_path"] != expected_path
+            or identity not in (None, layout.plugin_identity)
+        ):
+            invalid.append(f"workspace_id={workspace_id!r}")
+    if invalid:
+        raise WorkspacePathError(
+            "refusing to claim legacy workspace lease rows that do not match this "
+            f"plugin/profile/layout: {', '.join(invalid[:5])}"
+        )
+    conn.execute(
+        "UPDATE workspace_leases SET plugin_identity=? WHERE plugin_identity IS NULL",
+        (layout.plugin_identity,),
+    )
+
+
+def _initialize(conn, layout: _Layout) -> None:
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS workspace_leases (
@@ -390,22 +423,30 @@ def _initialize(conn) -> None:
         );
         """
     )
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(workspace_leases)")}
-    if "plugin_identity" not in columns:
-        conn.execute("ALTER TABLE workspace_leases ADD COLUMN plugin_identity TEXT")
-    if "acquire_intent_id" not in columns:
-        conn.execute("ALTER TABLE workspace_leases ADD COLUMN acquire_intent_id TEXT")
-    for column in (
-        "heartbeat_monotonic", "expires_monotonic", "expiry_observed_monotonic",
-    ):
-        if column not in columns:
-            conn.execute(f"ALTER TABLE workspace_leases ADD COLUMN {column} REAL")
-    if "expiry_observer" not in columns:
-        conn.execute("ALTER TABLE workspace_leases ADD COLUMN expiry_observer TEXT")
-    conn.execute(
-        """CREATE UNIQUE INDEX IF NOT EXISTS workspace_lease_acquire_intent
-           ON workspace_leases(acquire_intent_id)"""
-    )
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(workspace_leases)")}
+        additions = {
+            "plugin_identity": "plugin_identity TEXT",
+            "acquire_intent_id": "acquire_intent_id TEXT",
+            "heartbeat_monotonic": "heartbeat_monotonic REAL",
+            "expires_monotonic": "expires_monotonic REAL",
+            "expiry_observer": "expiry_observer TEXT",
+            "expiry_observed_monotonic": "expiry_observed_monotonic REAL",
+        }
+        for column, ddl in additions.items():
+            if column not in columns:
+                add_column_if_missing(conn, "workspace_leases", column, ddl)
+        _validate_legacy_rows(conn, layout)
+        conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS workspace_lease_acquire_intent
+               ON workspace_leases(acquire_intent_id)"""
+        )
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    else:
+        conn.execute("COMMIT")
 
 
 def _connect(layout: _Layout):
@@ -422,7 +463,7 @@ def _connect(layout: _Layout):
         foreign_keys=True,
         synchronous_full=True,
         wal_lock_retries=5,
-        initialize=_initialize,
+        initialize=lambda conn: _initialize(conn, layout),
     )
     try:
         if layout.db_path.is_symlink() or layout.db_path.resolve(strict=True).parent != layout.data_dir:
