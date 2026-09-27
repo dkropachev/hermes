@@ -107,7 +107,7 @@ def _plugin_namespace(plugin_id: str, skill_namespace: str) -> str:
         and _PLUGIN_NAMESPACE_RE.fullmatch(candidate)
         and ".." not in candidate
         and candidate.split(".", 1)[0] not in _WINDOWS_RESERVED
-        and not candidate.startswith("agent-plugin-")
+        and not candidate.startswith(("agent-plugin-", "hermes-native-"))
     ):
         return candidate
     return _native_hashed_namespace(candidate)
@@ -612,30 +612,47 @@ def _reconcile_pending_generation(conn, layout: _Layout, row: Mapping[str, Any])
     planned = _planned_detached_path(
         layout, workspace_id, lease_id, generation, operation,
     )
+    recovery_base = _planned_detached_path(
+        layout, workspace_id, lease_id, generation, "recovery",
+    )
     preserved: list[dict[str, Any]] = []
+
+    def recovery_paths() -> list[Path]:
+        candidates = [recovery_base]
+        candidates.extend(sorted(recovery_base.parent.glob(f"{recovery_base.name}-*")))
+        return [path for path in candidates if path.exists() or path.is_symlink()]
+
+    def remember(source: str, path: Path) -> None:
+        if not any(item.get("quarantine_path") == str(path) for item in preserved):
+            preserved.append({
+                "source": source, "disposition": "quarantined",
+                "quarantine_path": str(path),
+            })
+
+    # A previous retry may have crashed after moving the canonical name to recovery but before its
+    # receipt transaction committed. Inventory every deterministic recovery slot on every pass.
+    for existing in recovery_paths():
+        remember("recovery", existing)
 
     if canonical.exists() or canonical.is_symlink():
         target = planned
         if target.exists() or target.is_symlink():
-            target = _planned_detached_path(
-                layout, workspace_id, lease_id, generation, "recovery",
-            )
+            target = recovery_base
+            suffix = 2
+            while target.exists() or target.is_symlink():
+                target = recovery_base.with_name(f"{recovery_base.name}-{suffix}")
+                suffix += 1
         try:
             os.replace(canonical, target)
-            preserved.append({
-                "source": "canonical", "disposition": "quarantined",
-                "quarantine_path": str(target),
-            })
+            remember("canonical", target)
         except OSError as exc:
             raise WorkspacePathError(
                 f"cannot preserve interrupted workspace generation at {canonical}: {exc}"
             ) from exc
     if planned.exists() or planned.is_symlink():
-        if not any(item.get("quarantine_path") == str(planned) for item in preserved):
-            preserved.append({
-                "source": "detached", "disposition": "quarantined",
-                "quarantine_path": str(planned),
-            })
+        remember("detached", planned)
+    for existing in recovery_paths():
+        remember("recovery", existing)
     if not preserved:
         preserved.append({"disposition": "absent"})
     _cleanup_receipt(
@@ -986,6 +1003,33 @@ class PluginWorkspaces:
                     layout, row["workspace_id"], row["lease_id"], row["generation"], "release",
                 )
                 detached = planned if planned.exists() or planned.is_symlink() else None
+                if detached is None:
+                    cleanup = {
+                        **cleanup, "classification": "missing", "safe_to_delete": True,
+                        "disposition": "removed",
+                        "reconciled_reason": "detached_target_absent",
+                        "planned_detached_path": str(planned),
+                    }
+                    changed = conn.execute(
+                        """UPDATE workspace_leases SET cleanup_json=?, updated_at=?
+                           WHERE lease_id=? AND state='released' AND generation=?""",
+                        (
+                            json.dumps(cleanup, sort_keys=True), now, row["lease_id"],
+                            row["generation"],
+                        ),
+                    ).rowcount
+                    if changed != 1:
+                        raise InvalidWorkspaceHandleError(
+                            "workspace cleanup changed during reconciliation"
+                        )
+                    row = conn.execute(
+                        "SELECT * FROM workspace_leases WHERE lease_id=?", (row["lease_id"],)
+                    ).fetchone()
+                    _cleanup_receipt(
+                        conn, row, "release", "cleanup_reconciled", cleanup,
+                    )
+                    _event(conn, row, "cleanup_reconciled", {"cleanup": cleanup})
+                    return _public_snapshot(conn, row)
                 released_snapshot = _public_snapshot(conn, row)
             else:
                 if row["state"] not in {"active", "releasing"}:

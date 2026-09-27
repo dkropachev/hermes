@@ -426,6 +426,21 @@ def test_native_reserved_namespace_cannot_collide_with_portable_plugin(tmp_path:
         portable.workspaces.inspect(portable_handle)
 
 
+def test_generated_native_namespace_cannot_collide_with_literal_native_id(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    generated = _context(home, "MixedCasePlugin")
+    generated_handle = generated.workspaces.acquire("run")
+    generated_path = Path(generated.workspaces.inspect(generated_handle)["path"])
+    generated_namespace = generated_path.parent.parent.name
+    literal = _context(home, generated_namespace)
+    literal_handle = literal.workspaces.acquire("run")
+    literal_path = Path(literal.workspaces.inspect(literal_handle)["path"])
+
+    assert generated_namespace.startswith("hermes-native-")
+    assert literal_path.parent.parent.name.startswith("hermes-native-")
+    assert literal_path != generated_path
+
+
 def test_unverified_current_boot_witness_does_not_mark_verified_owner_dead(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -521,6 +536,63 @@ def test_crashed_acquire_reconciles_both_names_and_keeps_receipts(tmp_path: Path
     assert recovery and recovery[-1]["phase"] == "reconciled"
 
 
+def test_recovery_retry_inventories_prior_deterministic_recovery_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import plugin_workspaces
+
+    home = tmp_path / "home"
+    ctx = _context(home)
+    failed = ctx.workspaces.acquire("crash-recovery")
+    canonical = Path(ctx.workspaces.inspect(failed)["path"])
+    (canonical / "canonical.txt").write_text("canonical", encoding="utf-8")
+    db = home / "plugin-data/pr-review/workspace-leases.db"
+    with sqlite3.connect(db) as conn:
+        lease_id, generation = conn.execute(
+            "SELECT lease_id, generation FROM workspace_leases WHERE workspace_id='crash-recovery'"
+        ).fetchone()
+        planned = plugin_workspaces._planned_detached_path(
+            ctx.workspaces._layout(), "crash-recovery", lease_id, generation, "acquire",
+        )
+        planned.mkdir()
+        (planned / "detached.txt").write_text("detached", encoding="utf-8")
+        conn.execute(
+            """UPDATE workspace_leases SET state='preparing', owner_pid=-1, expires_at=0,
+               cleanup_json=? WHERE workspace_id='crash-recovery'""",
+            (json.dumps({
+                "operation": "acquire", "disposition": "preparing",
+                "planned_detached_path": str(planned),
+            }),),
+        )
+    recovery_path = plugin_workspaces._planned_detached_path(
+        ctx.workspaces._layout(), "crash-recovery", lease_id, generation, "recovery",
+    )
+    real_receipt = plugin_workspaces._cleanup_receipt
+    fail_once = [True]
+
+    def crash_before_receipt(conn, row, operation, phase, details):
+        if operation == "recovery" and phase == "reconciled" and fail_once[0]:
+            fail_once[0] = False
+            raise RuntimeError("injected crash before recovery receipt commit")
+        return real_receipt(conn, row, operation, phase, details)
+
+    monkeypatch.setattr(plugin_workspaces, "_cleanup_receipt", crash_before_receipt)
+    with pytest.raises(RuntimeError, match="injected crash"):
+        ctx.workspaces.acquire("crash-recovery")
+    assert not canonical.exists()
+    assert (recovery_path / "canonical.txt").read_text(encoding="utf-8") == "canonical"
+
+    successor = ctx.workspaces.acquire("crash-recovery")
+    receipts = ctx.workspaces.inspect(successor)["cleanupReceipts"]
+    reconciled = [receipt for receipt in receipts if receipt["operation"] == "recovery"][-1]
+    paths = {
+        item.get("quarantine_path")
+        for item in reconciled["details"]["preserved"]
+    }
+    assert str(planned) in paths
+    assert str(recovery_path) in paths
+
+
 def test_crashed_release_resumes_detached_cleanup_and_receipt(tmp_path: Path) -> None:
     from hermes_cli import plugin_workspaces
 
@@ -555,6 +627,44 @@ def test_crashed_release_resumes_detached_cleanup_and_receipt(tmp_path: Path) ->
         if receipt["leaseId"] == handle["lease_id"] and receipt["operation"] == "release"
     ]
     assert phases[-2:] == ["released", "cleanup_completed"]
+
+
+def test_released_missing_detached_target_is_terminally_reconciled(tmp_path: Path) -> None:
+    from hermes_cli import plugin_workspaces
+
+    home = tmp_path / "home"
+    ctx = _context(home)
+    handle = ctx.workspaces.acquire("empty-release-crash")
+    canonical = Path(ctx.workspaces.inspect(handle)["path"])
+    db = home / "plugin-data/pr-review/workspace-leases.db"
+    with sqlite3.connect(db) as conn:
+        lease_id, generation = conn.execute(
+            """SELECT lease_id, generation FROM workspace_leases
+               WHERE workspace_id='empty-release-crash'"""
+        ).fetchone()
+        planned = plugin_workspaces._planned_detached_path(
+            ctx.workspaces._layout(), "empty-release-crash", lease_id, generation, "release",
+        )
+        os.replace(canonical, planned)
+        planned.rmdir()  # crash after physical cleanup, before completion receipt/state update
+        conn.execute(
+            """UPDATE workspace_leases SET state='released', released_at=1, cleanup_json=?
+               WHERE lease_id=?""",
+            (json.dumps({
+                "operation": "release", "classification": "pending",
+                "disposition": "detached", "planned_detached_path": str(planned),
+            }), lease_id),
+        )
+
+    released = ctx.workspaces.release(handle)
+    assert released["cleanup"]["disposition"] == "removed"
+    assert released["cleanup"]["reconciled_reason"] == "detached_target_absent"
+    phases = [
+        receipt["phase"] for receipt in released["cleanupReceipts"]
+        if receipt["leaseId"] == handle["lease_id"]
+    ]
+    assert phases[-1] == "cleanup_reconciled"
+    assert ctx.workspaces.release(handle)["cleanup"] == released["cleanup"]
 
 
 @pytest.mark.parametrize("owner_status", ["live", "unknown"])
@@ -601,7 +711,9 @@ def test_database_wal_and_shm_are_private_under_permissive_umask(tmp_path: Path)
         os.umask(previous_umask)
 
 
-def test_host_feature_probe_and_validator_fallback(tmp_path: Path) -> None:
+def test_host_feature_probe_and_validator_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     ctx = _context(tmp_path / "home")
     assert ctx.has_host_feature(HOST_FEATURE) is True
     assert ctx.has_host_feature("workspace_leases.future") is False
@@ -610,15 +722,38 @@ def test_host_feature_probe_and_validator_fallback(tmp_path: Path) -> None:
 
     plugin = tmp_path / "probe-plugin"
     plugin.mkdir()
-    (plugin / "__init__.py").write_text(
+    source = (
         "def register(ctx):\n"
         "    probe = getattr(ctx, 'has_host_feature', None)\n"
         "    if not callable(probe) or not probe('workspace_leases.v1'):\n"
+        "        ctx.register_tool('review-only')\n"
         "        return\n"
         "    from hermes_cli.plugin_workspaces import WorkspaceLeaseError\n"
-        "    raise WorkspaceLeaseError('validator must report host feature unavailable')\n",
-        encoding="utf-8",
+        "    raise WorkspaceLeaseError('validator must report host feature unavailable')\n"
     )
+    (plugin / "__init__.py").write_text(source, encoding="utf-8")
     recorded, error = _run_capability_probe(plugin, {"name": "probe-plugin"})
     assert error == ""
     assert recorded is not None
+    assert recorded["tools"] == ["review-only"]
+
+    import builtins
+
+    registered: list[str] = []
+
+    class OldHostContext:
+        def register_tool(self, name, *args, **kwargs):
+            registered.append(name)
+
+    real_import = builtins.__import__
+
+    def old_host_import(name, *args, **kwargs):
+        if name == "hermes_cli.plugin_workspaces":
+            raise AssertionError("lease module import attempted on old host")
+        return real_import(name, *args, **kwargs)
+
+    namespace: dict[str, object] = {}
+    monkeypatch.setattr(builtins, "__import__", old_host_import)
+    exec(compile(source, "old-host-plugin/__init__.py", "exec"), namespace)
+    namespace["register"](OldHostContext())
+    assert registered == ["review-only"]

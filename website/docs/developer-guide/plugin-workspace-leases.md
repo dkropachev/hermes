@@ -132,10 +132,10 @@ $HERMES_HOME/plugin-data/pr-review/workspaces/run-01
 Runtime data never belongs in an installed plugin directory. The facade remains bound to the
 `PluginContext` profile that created it even if a multiplexed process later changes ambient profile
 scope. Plugin namespaces isolate unrelated plugins, while profile paths isolate tenants.
-The `agent-plugin-*` family is reserved for portable packages. A native plugin whose ID uses that
-prefix receives a separate `hermes-native-*` hashed namespace, and every lease also persists an
-independent canonical plugin-identity digest. The native ID `pr-review` keeps the exact readable
-path shown above.
+The `agent-plugin-*` and host-generated `hermes-native-*` families are reserved. A native plugin
+whose literal ID uses either prefix is hashed again into a distinct namespace, and every lease also
+persists an independent canonical plugin-identity digest. The native ID `pr-review` keeps the exact
+readable path shown above.
 
 On POSIX hosts Hermes enforces mode `0700` on host-owned data/workspace directories and `0600` on
 the lease database. It rejects symlinked or aliased namespace, workspace, and database paths rather
