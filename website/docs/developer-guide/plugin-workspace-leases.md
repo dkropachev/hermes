@@ -1,6 +1,6 @@
 ---
 title: Durable Plugin Workspace Leases
-description: Reserve private, profile-scoped work directories across plugin worker restarts
+description: Reserve profile-scoped work directories across cooperative plugin worker restarts
 ---
 
 # Durable Plugin Workspace Leases
@@ -35,9 +35,18 @@ def register(ctx):
     register_development_surfaces(ctx, workspaces)
 ```
 
-The `hermes plugins validate` registration probe reports host features as unavailable. Keep the
-fallback path importable and functional; do not fail plugin registration merely because the
-validator or an older host does not offer leases.
+`hermes plugins validate` probes registration once with this host feature unavailable and once
+with it available. Keep both paths importable and functional. Registration probes expose only the
+API shape and reject lifecycle mutations such as `acquire`.
+
+:::warning Cooperative-host boundary
+Version 1 coordinates trusted plugin workers on a cooperative machine. It is not a filesystem
+security boundary: it does not defend against symlink, junction, mount, inode-replacement,
+permission, or case-alias attacks by another local process or plugin. It also does not sandbox
+commands. That hardening is intentionally deferred to
+[Hermes issue #9](https://github.com/dkropachev/hermes/issues/9). Do not use this API to run
+untrusted code or to isolate mutually hostile tenants.
+:::
 
 :::caution Lifecycle is not workspace-bound execution
 `workspace_leases.v1` covers only acquisition, ownership fencing, heartbeat/reconnect, inspection,
@@ -65,7 +74,7 @@ released = ctx.workspaces.release(successor)
 
 | Method | Contract |
 |---|---|
-| `acquire(workspace_id, *, ttl_seconds=300)` | Exclusively reserves a canonical directory and returns a new opaque handle. A live, unexpired generation cannot be acquired twice. |
+| `acquire(workspace_id, *, ttl_seconds=300)` | Exclusively reserves the plugin's named directory and returns a new opaque handle. A live, unexpired generation cannot be acquired twice. |
 | `inspect(handle)` | Validates the handle, scope, path, state, and TTL, then returns the current snapshot. It does not renew the heartbeat. |
 | `renew(handle, *, ttl_seconds=None)` | Extends the heartbeat for the current process owner and returns the updated snapshot. |
 | `reconnect(handle, *, ttl_seconds=None)` | Reclaims a lease after a process restart when ownership can be proven safe. It rotates the lease ID and bearer capability and returns a successor handle. |
@@ -105,7 +114,7 @@ or profile is rejected.
 Use `inspect(handle)["path"]` to obtain the path after each acquisition or reconnect. Never derive a
 path from a handle or accept a caller-provided substitute.
 
-## Paths, profiles, and permissions
+## Paths and profiles
 
 Hermes allocates workspaces under the active profile's plugin-data directory:
 
@@ -125,11 +134,8 @@ $HERMES_HOME/plugin-data/pr-review/workspaces/run-01
 
 Runtime data never belongs in an installed plugin directory. The facade remains bound to the
 `PluginContext` profile that created it even if a multiplexed process later changes ambient profile
-scope. Plugin namespaces isolate unrelated plugins, while profile paths isolate tenants.
-
-On POSIX hosts Hermes enforces mode `0700` on host-owned data/workspace directories and `0600` on
-the lease database. It rejects symlinked or aliased namespace, workspace, and database paths rather
-than following them. The lease service creates an empty directory; cloning or otherwise
+scope. Plugin namespaces and profile paths keep cooperative plugins' state separate; they are not
+an access-control boundary. The lease service creates an empty directory. Cloning or otherwise
 materializing repository content remains the plugin's responsibility.
 
 ## Cleanup and recovery
@@ -143,14 +149,17 @@ Release and stale-generation reclamation first rename the old directory away fro
 workspace name. That atomic detach prevents delayed cleanup from deleting a successor that has
 already acquired the same `workspace_id`.
 
-Hermes removes only work it can prove disposable:
+The MVP cleanup rule is deliberately small and conservative:
 
 - an empty directory is removed;
-- a clean Git checkout whose `HEAD` is contained by a remote-tracking ref is removed;
-- dirty, untracked, ignored, unpushed, non-Git, or otherwise uncertain content is moved to
-  `workspace-quarantine/` and reported in the cleanup receipt.
+- every non-empty directory is moved to `workspace-quarantine/` and reported in the cleanup
+  receipt.
 
-Snapshots include current ownership and timing fields, the canonical path, generation, bounded
+Version 1 does not invoke Git or attempt to distinguish pushed checkouts from dirty, untracked,
+ignored, unpushed, or non-Git content. Smarter destructive cleanup is deferred with the other
+workspace hardening in [Hermes issue #9](https://github.com/dkropachev/hermes/issues/9).
+
+Snapshots include current ownership and timing fields, the allocated path, generation, bounded
 lifecycle events, and the latest cleanup receipt. Surface quarantine receipts to an operator and
 make retention an explicit plugin policy; do not silently delete quarantined work.
 
@@ -165,8 +174,7 @@ recovery paths:
 | `WorkspaceLeaseExpiredError` | The handle expired and must be reconnected before direct use. |
 | `WorkspaceOwnershipError` | A different live or unverifiable process owns the lease. |
 | `InvalidWorkspaceHandleError` | The handle is malformed, stale, released, tampered with, or belongs to another plugin/profile. |
-| `WorkspacePathError` | Hermes cannot prove the on-disk path or lease database is canonical and safe. |
+| `WorkspacePathError` | The expected workspace directory is missing or cannot be used. |
 
-Fail closed on all of these. In particular, never fall back to an arbitrary temporary directory
-after a fencing, ownership, or path-validation error: doing so would disconnect durable job state
-from the workspace that the lease protects.
+Do not fall back to an arbitrary temporary directory after a fencing, ownership, or path error:
+doing so would disconnect durable job state from the workspace that the lease protects.

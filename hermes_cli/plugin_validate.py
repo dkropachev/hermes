@@ -201,6 +201,7 @@ options = json.loads(sys.argv[3])
 # stub's attribute surface cannot drift from the class plugins run against.
 context_methods = set(options["context_methods"])
 provider_kind = options["kind"] == "model-provider"
+workspace_leases = bool(options.get("workspace_leases"))
 
 recorded = {"tools": [], "hooks": [], "middleware": [], "commands": [], "providers": []}
 
@@ -231,9 +232,13 @@ class RecordingContext:
         return default
 
     def has_host_feature(self, feature):
-        # Validation runs without host services.  A correctly capability-gated
-        # plugin therefore takes the same fallback path it takes on older Hermes.
-        return False
+        return workspace_leases and feature == "workspace_leases.v1"
+
+    @property
+    def workspaces(self):
+        if not workspace_leases:
+            raise AttributeError("workspaces")
+        return RecordingWorkspaces()
 
     def __getattr__(self, name):
         # Any other REAL registration surface (platforms, providers, skills,
@@ -248,6 +253,15 @@ class RecordingContext:
 
             return _noop
         raise AttributeError(name)
+
+
+class RecordingWorkspaces:
+    # Shape-only facade; registration probes must never mutate host state.
+
+    def _blocked(self, *args, **kwargs):
+        raise RuntimeError("workspace lifecycle calls are not allowed during plugin registration")
+
+    acquire = renew = reconnect = inspect = release = _blocked
 
 
 def emit(payload):
@@ -309,11 +323,12 @@ emit(recorded)
 """
 
 
-def _probe_options(manifest: dict) -> dict:
+def _probe_options(manifest: dict, *, workspace_leases: bool = False) -> dict:
     from hermes_cli.plugins import PluginContext
 
     return {
         "kind": str(manifest.get("kind") or ""),
+        "workspace_leases": workspace_leases,
         "context_methods": sorted(
             n for n in dir(PluginContext)
             if not n.startswith("_") and callable(getattr(PluginContext, n))
@@ -321,7 +336,9 @@ def _probe_options(manifest: dict) -> dict:
     }
 
 
-def _run_capability_probe(plugin_dir: Path, manifest: dict) -> Tuple[Optional[dict], str]:
+def _run_capability_probe(
+    plugin_dir: Path, manifest: dict, *, workspace_leases: bool = False,
+) -> Tuple[Optional[dict], str]:
     """Run the recording probe in a scratch subprocess.
 
     Returns ``(recorded, error)`` — exactly one is meaningful: *recorded*
@@ -339,7 +356,7 @@ def _run_capability_probe(plugin_dir: Path, manifest: dict) -> Tuple[Optional[di
                     _PROBE_SCRIPT,
                     str(plugin_dir),
                     _PROBE_SENTINEL,
-                    json.dumps(_probe_options(manifest)),
+                    json.dumps(_probe_options(manifest, workspace_leases=workspace_leases)),
                 ],
                 capture_output=True,
                 text=True,
@@ -394,6 +411,20 @@ def _check_capabilities(
     if recorded is None:
         report.add("capability probe", False, error)
         return None
+    if str(manifest.get("kind") or "") != "model-provider":
+        enabled, enabled_error = _run_capability_probe(
+            plugin_dir, manifest, workspace_leases=True,
+        )
+        if enabled is None:
+            report.add(
+                "capability probe", False,
+                f"workspace_leases.v1 mode: {enabled_error}",
+            )
+            return None
+        for category in ("tools", "hooks", "middleware", "commands", "providers"):
+            recorded[category] = sorted(
+                set(recorded.get(category) or []) | set(enabled.get(category) or [])
+            )
     if recorded.get("providers"):
         report.add(
             "capability probe", True,

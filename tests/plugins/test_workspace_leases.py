@@ -5,10 +5,10 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-import stat
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -19,7 +19,6 @@ from hermes_cli.plugin_workspaces import (
     InvalidWorkspaceHandleError,
     WorkspaceInUseError,
     WorkspaceLeaseExpiredError,
-    WorkspacePathError,
 )
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 
@@ -37,22 +36,6 @@ def _context(home: Path, plugin_id: str = "pr-review") -> PluginContext:
 
 def _child_env(home: Path) -> dict[str, str]:
     return {**os.environ, "HERMES_HOME": str(home)}
-
-
-def _run_git(path: Path, *args: str) -> None:
-    subprocess.run(
-        ["git", "-C", str(path), *args], check=True, capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
-    )
-
-
-def _commit(path: Path, filename: str = "tracked.txt") -> None:
-    (path / filename).write_text("base\n", encoding="utf-8")
-    _run_git(path, "add", filename)
-    _run_git(
-        path, "-c", "user.name=Hermes Tests", "-c", "user.email=tests@invalid",
-        "commit", "-m", "fixture",
-    )
 
 
 def test_handle_is_opaque_serializable_and_profile_bound(tmp_path: Path) -> None:
@@ -82,19 +65,14 @@ def test_handle_is_opaque_serializable_and_profile_bound(tmp_path: Path) -> None
     db = home_a / "plugin-data/pr-review/workspace-leases.db"
     with sqlite3.connect(db) as conn:
         assert handle["capability"] not in "\n".join(conn.iterdump())
-    if os.name != "nt":
-        private_dirs = [
-            home_a / "plugin-data",
-            home_a / "plugin-data/pr-review",
-            home_a / "plugin-data/pr-review/workspaces",
-            Path(snapshot["path"]),
-        ]
-        assert all(stat.S_IMODE(path.stat().st_mode) == 0o700 for path in private_dirs)
-        assert stat.S_IMODE(db.stat().st_mode) == 0o600
 
 
 def test_handle_validation_token_rotation_and_idempotent_release(tmp_path: Path) -> None:
     ctx = _context(tmp_path / "home")
+    for invalid_id in ("", "../escape", "UPPER", "a/b", "con", "run.", "a" * 129):
+        with pytest.raises(ValueError, match="workspace_id"):
+            ctx.workspaces.acquire(invalid_id)
+
     handle = ctx.workspaces.acquire("run-1")
     forged = {**handle, "capability": "x" * len(handle["capability"])}
     with pytest.raises(InvalidWorkspaceHandleError):
@@ -145,6 +123,35 @@ else:
     )
     assert result.stdout.strip().splitlines()[-1] == "refused"
     assert _context(home).workspaces.inspect(handle)["state"] == "active"
+
+
+def test_foreign_process_cannot_reconnect_live_owner_after_ttl(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    ctx = _context(home)
+    handle = ctx.workspaces.acquire("shared", ttl_seconds=60)
+    db = home / "plugin-data/pr-review/workspace-leases.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE workspace_leases SET expires_at=0 WHERE lease_id=?", (handle["lease_id"],))
+
+    script = """
+import json
+import sys
+from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+from hermes_cli.plugin_workspaces import WorkspaceOwnershipError
+ctx = PluginContext(PluginManifest(name='pr-review'), PluginManager())
+try:
+    ctx.workspaces.reconnect(json.loads(sys.argv[1]))
+except WorkspaceOwnershipError:
+    print('refused')
+else:
+    print('reconnected')
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, json.dumps(handle)], cwd=PROJECT_ROOT,
+        env=_child_env(home), check=True, capture_output=True, text=True, timeout=30,
+    )
+    assert result.stdout.strip().splitlines()[-1] == "refused"
+    assert ctx.workspaces.inspect(ctx.workspaces.reconnect(handle))["state"] == "active"
 
 
 def test_simultaneous_processes_have_exactly_one_winner(tmp_path: Path) -> None:
@@ -245,6 +252,41 @@ print(json.dumps(handle))
         ctx.workspaces.inspect(predecessor)
 
 
+def test_process_and_boot_witnesses_make_persisted_owners_reclaimable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    ctx = _context(home)
+    db = home / "plugin-data/pr-review/workspace-leases.db"
+
+    stale_process = ctx.workspaces.acquire("stale-process")
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE workspace_leases SET owner_create_time=0 "
+            "WHERE lease_id=?",
+            (stale_process["lease_id"],),
+        )
+    process_snapshot = ctx.workspaces.inspect(ctx.workspaces.reconnect(stale_process))
+    assert process_snapshot["events"][-1]["details"]["previous_owner"] == "dead"
+
+    stale_boot = ctx.workspaces.acquire("stale-boot")
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE workspace_leases SET owner_instance='boot-id:previous-boot' "
+            "WHERE lease_id=?",
+            (stale_boot["lease_id"],),
+        )
+    boot_snapshot = ctx.workspaces.inspect(ctx.workspaces.reconnect(stale_boot))
+    assert boot_snapshot["events"][-1]["details"]["previous_owner"] == "dead"
+
+    # Losing access to the current boot witness is not evidence of a reboot.
+    import hermes_cli.plugin_workspaces as workspace_module
+
+    current = ctx.workspaces.acquire("current-boot")
+    monkeypatch.setattr(workspace_module, "_host_instance", lambda: "unverified")
+    assert ctx.workspaces.renew(current)["state"] == "active"
+
+
 def test_expired_generation_is_atomically_reclaimed(tmp_path: Path) -> None:
     ctx = _context(tmp_path / "home")
     old = ctx.workspaces.acquire("ttl", ttl_seconds=60)
@@ -264,6 +306,63 @@ def test_expired_generation_is_atomically_reclaimed(tmp_path: Path) -> None:
         ctx.workspaces.inspect(old)
 
 
+def test_stale_preparation_and_release_receipts_are_recovered(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    ctx = _context(home)
+    db = home / "plugin-data/pr-review/workspace-leases.db"
+    quarantine = home / "plugin-data/pr-review/workspace-quarantine"
+
+    preparing = ctx.workspaces.acquire("preparing-crash")
+    canonical = Path(ctx.workspaces.inspect(preparing)["path"])
+    (canonical / "predecessor.txt").write_text("predecessor", encoding="utf-8")
+    planned = quarantine / ".detached-preparing-crash-crashed"
+    canonical.replace(planned)
+    canonical.mkdir()
+    (canonical / "unpublished.txt").write_text("unpublished", encoding="utf-8")
+    receipt = {
+        "classification": "pending",
+        "disposition": "preparing",
+        "original_path": str(canonical),
+        "planned_detached_path": str(planned),
+    }
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """UPDATE workspace_leases SET state='preparing', owner_pid=99999999,
+               owner_create_time=0, expires_at=0, cleanup_json=? WHERE lease_id=?""",
+            (json.dumps(receipt), preparing["lease_id"]),
+        )
+
+    successor = ctx.workspaces.acquire("preparing-crash")
+    recovered = ctx.workspaces.inspect(successor)["cleanup"]["recovered_cleanup"]
+    recovered_files = {
+        child.name
+        for item in recovered
+        if item.get("disposition") == "quarantined"
+        for child in Path(item["quarantine_path"]).iterdir()
+    }
+    assert recovered_files == {"predecessor.txt", "unpublished.txt"}
+
+    releasing = ctx.workspaces.acquire("release-crash")
+    release_path = Path(ctx.workspaces.inspect(releasing)["path"])
+    (release_path / "work.txt").write_text("keep", encoding="utf-8")
+    release_target = quarantine / ".detached-release-crash-crashed"
+    release_path.replace(release_target)
+    release_receipt = {
+        "classification": "pending",
+        "disposition": "releasing",
+        "original_path": str(release_path),
+        "planned_detached_path": str(release_target),
+    }
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE workspace_leases SET state='releasing', cleanup_json=? WHERE lease_id=?",
+            (json.dumps(release_receipt), releasing["lease_id"]),
+        )
+    released = ctx.workspaces.release(releasing)
+    assert released["cleanup"]["disposition"] == "quarantined"
+    assert Path(released["cleanup"]["quarantine_path"], "work.txt").is_file()
+
+
 def test_expired_handle_requires_reconnect_for_direct_use(tmp_path: Path) -> None:
     ctx = _context(tmp_path / "home")
     handle = ctx.workspaces.acquire("expired", ttl_seconds=60)
@@ -277,81 +376,44 @@ def test_expired_handle_requires_reconnect_for_direct_use(tmp_path: Path) -> Non
     assert ctx.workspaces.inspect(successor)["generation"] == 2
 
 
-def test_symlink_aliases_are_never_followed(tmp_path: Path) -> None:
+def test_expiry_is_sampled_after_transaction_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hermes_cli.plugin_workspaces as workspace_module
+
     home = tmp_path / "home"
-    external = tmp_path / "external"
-    external.mkdir()
-    (external / "sentinel").write_text("outside", encoding="utf-8")
-    root = home / "plugin-data/pr-review/workspaces"
-    root.mkdir(parents=True)
-    (home / "plugin-data/pr-review/workspace-quarantine").mkdir()
-    (root / "aliased").symlink_to(external, target_is_directory=True)
-
     ctx = _context(home)
-    handle = ctx.workspaces.acquire("aliased")
-    leased = Path(ctx.workspaces.inspect(handle)["path"])
-    assert leased.is_dir() and not leased.is_symlink()
-    assert (external / "sentinel").read_text(encoding="utf-8") == "outside"
+    handle = ctx.workspaces.acquire("lock-delayed")
+    db = home / "plugin-data/pr-review/workspace-leases.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE workspace_leases SET expires_at=5 WHERE lease_id=?", (handle["lease_id"],))
 
-    hostile_target = tmp_path / "hostile"
-    hostile_target.mkdir()
-    leased.rmdir()
-    leased.symlink_to(hostile_target, target_is_directory=True)
-    with pytest.raises(WorkspacePathError):
-        ctx.workspaces.inspect(handle)
+    entered = False
+    real_transaction = workspace_module.transaction
+
+    @contextmanager
+    def observed_transaction(conn, *, immediate=False):
+        nonlocal entered
+        with real_transaction(conn, immediate=immediate) as active:
+            entered = True
+            yield active
+
+    monkeypatch.setattr(workspace_module, "transaction", observed_transaction)
+    monkeypatch.setattr(workspace_module.time, "time", lambda: 10.0 if entered else 1.0)
+    with pytest.raises(WorkspaceLeaseExpiredError):
+        ctx.workspaces.renew(handle)
 
 
-def test_symlinked_host_namespace_is_rejected(tmp_path: Path) -> None:
-    home, external = tmp_path / "home", tmp_path / "external"
-    home.mkdir()
-    external.mkdir()
-    (home / "plugin-data").symlink_to(external, target_is_directory=True)
-    with pytest.raises(WorkspacePathError):
-        _context(home).workspaces.acquire("run-1")
-
-
-def test_cleanup_receipts_preserve_every_uncertain_or_unique_tree(tmp_path: Path) -> None:
+def test_cleanup_deletes_only_empty_and_quarantines_every_nonempty_tree(tmp_path: Path) -> None:
     ctx = _context(tmp_path / "home")
 
-    setups = {
-        "uncertain": lambda path: (path / "note.txt").write_text("data", encoding="utf-8"),
-        "untracked": lambda path: (
-            _run_git(path, "init"),
-            (path / "new.txt").write_text("data", encoding="utf-8"),
-        ),
-        "dirty": lambda path: (
-            _run_git(path, "init"), _commit(path),
-            (path / "tracked.txt").write_text("changed\n", encoding="utf-8"),
-        ),
-        "ignored": lambda path: (
-            _run_git(path, "init"),
-            (path / ".gitignore").write_text("cache.bin\n", encoding="utf-8"),
-            _run_git(path, "add", ".gitignore"),
-            _run_git(
-                path, "-c", "user.name=Hermes Tests", "-c", "user.email=tests@invalid",
-                "commit", "-m", "ignore fixture",
-            ),
-            (path / "cache.bin").write_text("generated but unique", encoding="utf-8"),
-        ),
-        "unpushed": lambda path: (_run_git(path, "init"), _commit(path)),
-        "clean_git": lambda path: (
-            _run_git(path, "init"), _commit(path),
-            _run_git(path, "update-ref", "refs/remotes/origin/main", "HEAD"),
-        ),
-    }
-
-    for expected, setup in setups.items():
-        handle = ctx.workspaces.acquire(expected)
-        path = Path(ctx.workspaces.inspect(handle)["path"])
-        setup(path)
-        cleanup = ctx.workspaces.release(handle)["cleanup"]
-        assert cleanup["classification"] == expected
-        if expected == "clean_git":
-            assert cleanup["disposition"] == "removed"
-            assert not path.exists()
-        else:
-            assert cleanup["disposition"] == "quarantined"
-            assert Path(cleanup["quarantine_path"]).exists()
+    nonempty = ctx.workspaces.acquire("nonempty")
+    nonempty_path = Path(ctx.workspaces.inspect(nonempty)["path"])
+    (nonempty_path / "work.txt").write_text("data", encoding="utf-8")
+    cleanup = ctx.workspaces.release(nonempty)["cleanup"]
+    assert cleanup["classification"] == "nonempty"
+    assert cleanup["disposition"] == "quarantined"
+    assert Path(cleanup["quarantine_path"], "work.txt").is_file()
 
     empty = ctx.workspaces.acquire("empty")
     empty_path = Path(ctx.workspaces.inspect(empty)["path"])
@@ -361,21 +423,7 @@ def test_cleanup_receipts_preserve_every_uncertain_or_unique_tree(tmp_path: Path
     assert not empty_path.exists()
 
 
-def test_host_feature_probe_and_validator_fallback(tmp_path: Path) -> None:
+def test_host_feature_probe(tmp_path: Path) -> None:
     ctx = _context(tmp_path / "home")
     assert ctx.has_host_feature(HOST_FEATURE) is True
     assert ctx.has_host_feature("workspace_leases.future") is False
-
-    from hermes_cli.plugin_validate import _run_capability_probe
-
-    plugin = tmp_path / "probe-plugin"
-    plugin.mkdir()
-    (plugin / "__init__.py").write_text(
-        "def register(ctx):\n"
-        "    if ctx.has_host_feature('workspace_leases.v1'):\n"
-        "        raise RuntimeError('validator must report host feature unavailable')\n",
-        encoding="utf-8",
-    )
-    recorded, error = _run_capability_probe(plugin, {"name": "probe-plugin"})
-    assert error == ""
-    assert recorded is not None

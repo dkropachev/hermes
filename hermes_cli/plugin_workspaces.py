@@ -1,8 +1,12 @@
-"""Durable, profile-scoped workspace leases for trusted plugins.
+"""Durable, profile-scoped workspace leases for cooperative trusted plugins.
 
 The handle is a bearer capability, not a path.  Only a SHA-256 digest is
 persisted; the plugin must keep the serializable handle if it wants to renew,
 reconnect, inspect, or release a lease after a host restart.
+
+This v1 service coordinates trusted plugin workers.  It deliberately does not
+try to defend its directories from a hostile local process or plugin; stronger
+filesystem and execution isolation is tracked separately in Hermes issue #9.
 """
 
 from __future__ import annotations
@@ -16,8 +20,6 @@ import re
 import secrets
 import shutil
 import socket
-import stat
-import subprocess
 import time
 import uuid
 from dataclasses import dataclass
@@ -65,15 +67,13 @@ class WorkspaceOwnershipError(WorkspaceLeaseError):
 
 
 class WorkspacePathError(WorkspaceLeaseError):
-    """The workspace layout cannot be proven safe and canonical."""
+    """The expected workspace directory is missing or unusable."""
 
 
 @dataclass(frozen=True)
 class _Layout:
-    home: Path
     profile_key: str
     plugin_namespace: str
-    data_dir: Path
     workspaces_dir: Path
     quarantine_dir: Path
     db_path: Path
@@ -86,6 +86,7 @@ def _plugin_namespace(plugin_id: str, skill_namespace: str) -> str:
         candidate == folded
         and _PLUGIN_NAMESPACE_RE.fullmatch(candidate)
         and ".." not in candidate
+        and not candidate.endswith(".")
         and candidate.split(".", 1)[0] not in _WINDOWS_RESERVED
     ):
         return candidate
@@ -97,11 +98,12 @@ def _validated_workspace_id(workspace_id: str) -> str:
         not isinstance(workspace_id, str)
         or not _WORKSPACE_ID_RE.fullmatch(workspace_id)
         or ".." in workspace_id
+        or workspace_id.endswith(".")
         or workspace_id.split(".", 1)[0] in _WINDOWS_RESERVED
     ):
         raise ValueError(
             "workspace_id must be 1-128 lowercase ASCII letters, numbers, '.', '_', or '-' "
-            "(without '..' or a reserved device name)"
+            "(without '..', a trailing '.', or a reserved device name)"
         )
     return workspace_id
 
@@ -116,49 +118,21 @@ def _ttl(value: Any) -> float:
     return ttl
 
 
-def _safe_child(parent: Path, name: str) -> Path:
-    """Create one host-owned directory component and reject aliases/junctions/symlinks."""
-    candidate = parent / name
-    try:
-        candidate.mkdir(mode=0o700)
-    except FileExistsError:
-        pass
-    except OSError as exc:
-        raise WorkspacePathError(f"cannot create workspace directory {candidate}: {exc}") from exc
-    try:
-        info = candidate.lstat()
-        resolved = candidate.resolve(strict=True)
-    except OSError as exc:
-        raise WorkspacePathError(f"cannot validate workspace directory {candidate}: {exc}") from exc
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-        raise WorkspacePathError(f"workspace directory is not a regular directory: {candidate}")
-    if os.path.normcase(str(resolved)) != os.path.normcase(str(candidate.absolute())):
-        raise WorkspacePathError(f"workspace directory resolves through an alias: {candidate}")
-    if os.name != "nt":
-        try:
-            os.chmod(candidate, 0o700)
-        except OSError as exc:
-            raise WorkspacePathError(f"cannot secure workspace directory {candidate}: {exc}") from exc
-    return candidate
-
-
 def _layout(plugin_id: str, skill_namespace: str, home_path: Path | None = None) -> _Layout:
-    raw_home = Path(home_path if home_path is not None else get_hermes_home()).expanduser()
-    mkdir_under_hermes_home(raw_home)
-    try:
-        home = raw_home.resolve(strict=True)
-    except OSError as exc:
-        raise WorkspacePathError(f"cannot resolve HERMES_HOME {raw_home}: {exc}") from exc
+    home = Path(home_path if home_path is not None else get_hermes_home()).expanduser().absolute()
     namespace = _plugin_namespace(plugin_id, skill_namespace)
-    plugin_data = _safe_child(home, "plugin-data")
-    data_dir = _safe_child(plugin_data, namespace)
-    workspaces = _safe_child(data_dir, "workspaces")
-    quarantine = _safe_child(data_dir, "workspace-quarantine")
+    try:
+        mkdir_under_hermes_home(home)
+        data_dir = home / "plugin-data" / namespace
+        workspaces = data_dir / "workspaces"
+        quarantine = data_dir / "workspace-quarantine"
+        workspaces.mkdir(parents=True, exist_ok=True)
+        quarantine.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise WorkspacePathError(f"cannot create plugin workspace storage below {home}: {exc}") from exc
     return _Layout(
-        home=home,
         profile_key=hermes_home_key(home),
         plugin_namespace=namespace,
-        data_dir=data_dir,
         workspaces_dir=workspaces,
         quarantine_dir=quarantine,
         db_path=data_dir / "workspace-leases.db",
@@ -208,9 +182,7 @@ def _initialize(conn) -> None:
 
 
 def _connect(layout: _Layout):
-    if layout.db_path.is_symlink():
-        raise WorkspacePathError(f"workspace lease database cannot be a symlink: {layout.db_path}")
-    conn = open_db(
+    return open_db(
         layout.db_path,
         db_label=f"plugin-data/{layout.plugin_namespace}/workspace-leases.db",
         foreign_keys=True,
@@ -218,15 +190,6 @@ def _connect(layout: _Layout):
         wal_lock_retries=5,
         initialize=_initialize,
     )
-    try:
-        if layout.db_path.is_symlink() or layout.db_path.resolve(strict=True).parent != layout.data_dir:
-            raise WorkspacePathError("workspace lease database resolved outside its plugin namespace")
-        if os.name != "nt":
-            os.chmod(layout.db_path, 0o600)
-    except BaseException:
-        conn.close()
-        raise
-    return conn
 
 
 def _host_instance() -> str:
@@ -265,7 +228,11 @@ def _owner_status(row: Mapping[str, Any]) -> str:
         return "unknown"
     current_instance = _host_instance()
     recorded_instance = str(_row_value(row, "owner_instance") or "unverified")
-    if recorded_instance != "unverified" and current_instance != recorded_instance:
+    if (
+        recorded_instance != "unverified"
+        and current_instance != "unverified"
+        and current_instance != recorded_instance
+    ):
         return "dead"
     alive = _pid_alive_matches(pid, _row_value(row, "owner_create_time"))
     if alive is False:
@@ -313,9 +280,7 @@ def _capability_hash(capability: str) -> str:
     return hashlib.sha256(capability.encode("utf-8")).hexdigest()
 
 
-def _validated_row(
-    conn, layout: _Layout, handle: Mapping[str, Any], *, validate_path: bool = True,
-):
+def _validated_row(conn, layout: _Layout, handle: Mapping[str, Any]):
     lease_id, capability = _parse_handle(handle)
     row = conn.execute("SELECT * FROM workspace_leases WHERE lease_id=?", (lease_id,)).fetchone()
     if row is None or not hmac.compare_digest(str(row["capability_hash"]), _capability_hash(capability)):
@@ -325,21 +290,13 @@ def _validated_row(
     expected = layout.workspaces_dir / str(row["workspace_id"])
     if os.path.normcase(str(expected)) != os.path.normcase(str(row["workspace_path"])):
         raise InvalidWorkspaceHandleError("workspace lease has an invalid persisted path")
-    if validate_path:
-        _validate_workspace_path(expected)
     return row
 
 
-def _validate_workspace_path(expected: Path) -> None:
-    try:
-        info = expected.lstat()
-        resolved = expected.resolve(strict=True)
-    except OSError as exc:
-        raise WorkspacePathError(f"workspace path is unavailable: {expected}") from exc
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-        raise WorkspacePathError(f"workspace path is not a regular directory: {expected}")
-    if os.path.normcase(str(resolved)) != os.path.normcase(str(expected.absolute())):
-        raise WorkspacePathError(f"workspace path resolves through an alias: {expected}")
+def _require_workspace_directory(path: Path) -> None:
+    """Check ordinary cooperative-host lifecycle damage, not hostile path substitution."""
+    if not path.is_dir():
+        raise WorkspacePathError(f"workspace path is unavailable: {path}")
 
 
 def _event(conn, row: Mapping[str, Any], event_type: str, details: Mapping[str, Any] | None = None) -> None:
@@ -357,18 +314,8 @@ def _event(conn, row: Mapping[str, Any], event_type: str, details: Mapping[str, 
     )
 
 
-def _git(workspace: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    allowed = ("PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC", "TMPDIR", "TEMP", "TMP")
-    env = {key: os.environ[key] for key in allowed if key in os.environ}
-    env.update({"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1", "LC_ALL": "C"})
-    return subprocess.run(
-        ["git", "-c", "core.fsmonitor=false", "-C", str(workspace), *args],
-        capture_output=True, text=True,
-        encoding="utf-8", errors="replace", timeout=5, env=env, check=False,
-    )
-
-
 def _classify_workspace(path: Path) -> dict[str, Any]:
+    """Delete only an empty tree; preserve every non-empty or uncertain tree."""
     checked_at = time.time()
     if path.is_symlink():
         return {"classification": "symlink", "safe_to_delete": False, "checked_at": checked_at}
@@ -379,40 +326,11 @@ def _classify_workspace(path: Path) -> dict[str, Any]:
     try:
         if next(path.iterdir(), None) is None:
             return {"classification": "clean_empty", "safe_to_delete": True, "checked_at": checked_at}
-        status = _git(
-            path, "status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching",
-        )
-        if status.returncode != 0:
-            return {
-                "classification": "uncertain", "safe_to_delete": False,
-                "checked_at": checked_at, "reason": "git_status_failed",
-            }
-        lines = [line for line in status.stdout.splitlines() if line]
-        if lines:
-            untracked = any(line.startswith("??") for line in lines)
-            ignored = any(line.startswith("!!") for line in lines)
-            tracked = any(not line.startswith(("??", "!!")) for line in lines)
-            classification = "dirty" if tracked else "untracked" if untracked else "ignored"
-            return {
-                "classification": classification,
-                "safe_to_delete": False, "checked_at": checked_at,
-                "dirty": tracked, "untracked": untracked, "ignored": ignored,
-                "changed_paths": len(lines),
-            }
-        contains = _git(path, "branch", "-r", "--contains", "HEAD", "--format=%(refname)")
-        if contains.returncode == 0 and contains.stdout.strip():
-            return {"classification": "clean_git", "safe_to_delete": True, "checked_at": checked_at}
-        head = _git(path, "rev-parse", "--verify", "HEAD")
-        if head.returncode == 0:
-            return {
-                "classification": "unpushed", "safe_to_delete": False,
-                "checked_at": checked_at, "head": head.stdout.strip()[:64],
-            }
         return {
-            "classification": "uncertain", "safe_to_delete": False,
-            "checked_at": checked_at, "reason": "git_head_unverifiable",
+            "classification": "nonempty", "safe_to_delete": False,
+            "checked_at": checked_at,
         }
-    except (OSError, subprocess.SubprocessError) as exc:
+    except OSError as exc:
         return {
             "classification": "uncertain", "safe_to_delete": False,
             "checked_at": checked_at, "reason": type(exc).__name__,
@@ -460,7 +378,9 @@ def _finish_detached_cleanup(detached: Path, receipt: dict[str, Any]) -> dict[st
     finished = {**receipt, **assessment}
     try:
         if assessment["safe_to_delete"]:
-            if detached.is_dir() and not detached.is_symlink():
+            if assessment["classification"] == "missing":
+                pass
+            elif detached.is_dir() and not detached.is_symlink():
                 shutil.rmtree(detached)
             else:
                 detached.unlink()
@@ -475,6 +395,88 @@ def _finish_detached_cleanup(detached: Path, receipt: dict[str, Any]) -> dict[st
             "cleanup_error": f"{type(exc).__name__}: {exc}",
         })
     return finished
+
+
+def _receipt_path(layout: _Layout, cleanup: Mapping[str, Any]) -> Path | None:
+    raw = cleanup.get("detached_path") or cleanup.get("planned_detached_path")
+    if not isinstance(raw, str):
+        return None
+    path = Path(raw)
+    if path.parent != layout.quarantine_dir:
+        raise InvalidWorkspaceHandleError("workspace cleanup receipt escaped quarantine")
+    return path
+
+
+def _recover_transition(conn, layout: _Layout, row: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Finish filesystem work described by a stale durable transition receipt."""
+    state = str(row["state"])
+    cleanup = json.loads(row["cleanup_json"] or "{}")
+    if not isinstance(cleanup, dict):
+        raise InvalidWorkspaceHandleError("workspace cleanup receipt is malformed")
+    planned = _receipt_path(layout, cleanup)
+    recovered: list[dict[str, Any]] = []
+
+    if state == "preparing":
+        # A crash can leave both the predecessor at the planned detached name and
+        # the unpublished replacement at the canonical name. Preserve any
+        # non-empty replacement before finishing the predecessor receipt.
+        if planned is not None and (planned.exists() or planned.is_symlink()):
+            canonical = Path(str(row["workspace_path"]))
+            if canonical.exists() or canonical.is_symlink():
+                recovery_target = _planned_detached_path(
+                    layout, str(row["workspace_id"]), str(row["lease_id"]),
+                )
+                detached, receipt = _detach_workspace(
+                    layout, str(row["workspace_id"]), str(row["lease_id"]),
+                    planned=recovery_target,
+                )
+                recovered.append(
+                    _finish_detached_cleanup(detached, receipt) if detached is not None else receipt
+                )
+            recovered.append(_finish_detached_cleanup(planned, cleanup))
+        _event(conn, row, "preparation_recovered", {"cleanup": recovered})
+        return recovered
+
+    if state == "releasing":
+        if planned is None:
+            raise InvalidWorkspaceHandleError("workspace release receipt is malformed")
+        detached, receipt = _detach_workspace(
+            layout, str(row["workspace_id"]), str(row["lease_id"]), planned=planned,
+        )
+        if detached is None and receipt.get("disposition") == "preserved":
+            raise WorkspacePathError(
+                "cannot recover workspace release; existing contents were preserved"
+            )
+        finished = _finish_detached_cleanup(detached, receipt) if detached is not None else receipt
+        finished_at = time.time()
+        conn.execute(
+            """UPDATE workspace_leases SET state='released', released_at=?, cleanup_json=?,
+               updated_at=? WHERE lease_id=? AND state='releasing' AND generation=?""",
+            (
+                finished_at, json.dumps(finished, sort_keys=True), finished_at,
+                row["lease_id"], row["generation"],
+            ),
+        )
+        updated = conn.execute(
+            "SELECT * FROM workspace_leases WHERE lease_id=?", (row["lease_id"],),
+        ).fetchone()
+        _event(conn, updated, "release_recovered", {"cleanup": finished})
+        return [finished]
+
+    if state == "released" and planned is not None and (
+        cleanup.get("disposition") in {"detached", "pending", "releasing"}
+    ):
+        finished = _finish_detached_cleanup(planned, cleanup)
+        conn.execute(
+            "UPDATE workspace_leases SET cleanup_json=?, updated_at=? WHERE lease_id=?",
+            (json.dumps(finished, sort_keys=True), time.time(), row["lease_id"]),
+        )
+        updated = conn.execute(
+            "SELECT * FROM workspace_leases WHERE lease_id=?", (row["lease_id"],),
+        ).fetchone()
+        _event(conn, updated, "cleanup_recovered", {"cleanup": finished})
+        return [finished]
+    return recovered
 
 
 def _public_snapshot(conn, row: Mapping[str, Any]) -> dict[str, Any]:
@@ -531,17 +533,17 @@ class PluginWorkspaces:
         self, workspace_id: str, *, ttl_seconds: float = DEFAULT_TTL_SECONDS,
     ) -> dict[str, Any]:
         workspace_id, ttl = _validated_workspace_id(workspace_id), _ttl(ttl_seconds)
-        layout, now = self._layout(), time.time()
+        layout = self._layout()
         lease_id, capability = str(uuid.uuid4()), secrets.token_urlsafe(32)
-        pid, created, host, instance = _owner_stamp()
         planned_detached = _planned_detached_path(layout, workspace_id, lease_id)
-        detached: Path | None = None
         preparation_error: WorkspacePathError | None = None
         with transaction(_connect(layout), immediate=True) as conn:
+            now = time.time()
+            pid, created, host, instance = _owner_stamp()
             old = conn.execute(
                 "SELECT * FROM workspace_leases WHERE workspace_id=?", (workspace_id,)
             ).fetchone()
-            generation, reclaimed = 1, None
+            generation, reclaimed, recovered = 1, None, []
             if old is not None:
                 generation = int(old["generation"]) + 1
                 if old["plugin_namespace"] != layout.plugin_namespace or old["profile_key"] != layout.profile_key:
@@ -561,11 +563,14 @@ class PluginWorkspaces:
                             f"workspace {workspace_id!r} is already leased until {old['expires_at']}"
                         )
                     reclaimed = "owner_dead" if owner_status == "dead" else "ttl_expired"
+                recovered = _recover_transition(conn, layout, old)
             cleanup = {
                 "classification": "pending", "disposition": "preparing",
                 "original_path": str(layout.workspaces_dir / workspace_id),
                 "planned_detached_path": str(planned_detached),
             }
+            if recovered:
+                cleanup["recovered_cleanup"] = recovered
             row_values = (
                 workspace_id, lease_id, _capability_hash(capability), HANDLE_VERSION, "preparing",
                 layout.plugin_namespace, layout.profile_key, str(layout.workspaces_dir / workspace_id),
@@ -583,15 +588,15 @@ class PluginWorkspaces:
                 row_values,
             )
             row = conn.execute("SELECT * FROM workspace_leases WHERE lease_id=?", (lease_id,)).fetchone()
-            _event(conn, row, "preparing", {"reclaimed": reclaimed, "cleanup": cleanup})
+            _event(conn, row, "preparing", {
+                "reclaimed": reclaimed, "cleanup": cleanup, "recovered_cleanup": recovered,
+            })
 
         # The preparing row is now durable.  Hold another IMMEDIATE transaction across the
         # canonical-name handoff; a crash/commit failure leaves a reclaimable preparing generation,
         # never the predecessor row pointing at a replacement directory.
         with transaction(_connect(layout), immediate=True) as conn:
-            current = _validated_row(
-                conn, layout, _handle(lease_id, capability), validate_path=False,
-            )
+            current = _validated_row(conn, layout, _handle(lease_id, capability))
             if current["state"] != "preparing" or int(current["generation"]) != generation:
                 raise InvalidWorkspaceHandleError(
                     "workspace lease changed while it was being prepared"
@@ -599,6 +604,8 @@ class PluginWorkspaces:
             detached, cleanup = _detach_workspace(
                 layout, workspace_id, lease_id, planned=planned_detached,
             )
+            if recovered:
+                cleanup["recovered_cleanup"] = recovered
             path = layout.workspaces_dir / workspace_id
             if detached is None and cleanup["disposition"] == "preserved":
                 preparation_error = WorkspacePathError(
@@ -606,21 +613,15 @@ class PluginWorkspaces:
                 )
             if preparation_error is None:
                 try:
-                    path.mkdir(mode=0o700)
-                    if os.name != "nt":
-                        os.chmod(path, 0o700)
-                    if path.is_symlink() or os.path.normcase(
-                        str(path.resolve(strict=True))
-                    ) != os.path.normcase(str(path.absolute())):
-                        raise WorkspacePathError(f"workspace path is not canonical: {path}")
-                except (OSError, WorkspacePathError) as exc:
-                    preparation_error = (
-                        exc if isinstance(exc, WorkspacePathError) else
-                        WorkspacePathError(f"cannot create canonical workspace {path}: {exc}")
+                    path.mkdir()
+                except OSError as exc:
+                    preparation_error = WorkspacePathError(
+                        f"cannot create workspace {path}: {exc}"
                     )
+            if detached is not None:
+                cleanup = _finish_detached_cleanup(detached, cleanup)
             if preparation_error is not None:
                 cleanup.update({
-                    "disposition": "preserved",
                     "preparation_error": (
                         f"{type(preparation_error).__name__}: {preparation_error}"
                     ),
@@ -642,10 +643,15 @@ class PluginWorkspaces:
                 ).fetchone()
                 _event(conn, failed, "preparation_failed", {"cleanup": cleanup})
             else:
+                activated_at = time.time()
                 conn.execute(
-                    """UPDATE workspace_leases SET state='active', cleanup_json=?, updated_at=?
+                    """UPDATE workspace_leases SET state='active', cleanup_json=?, heartbeat_at=?,
+                       expires_at=?, updated_at=?
                        WHERE lease_id=? AND state='preparing' AND generation=?""",
-                    (json.dumps(cleanup, sort_keys=True), time.time(), lease_id, generation),
+                    (
+                        json.dumps(cleanup, sort_keys=True), activated_at,
+                        activated_at + ttl, activated_at, lease_id, generation,
+                    ),
                 )
                 if conn.execute("SELECT changes()").fetchone()[0] != 1:
                     raise InvalidWorkspaceHandleError(
@@ -658,31 +664,18 @@ class PluginWorkspaces:
 
         if preparation_error is not None:
             raise preparation_error
-
-        if detached is not None:
-            finished_cleanup = _finish_detached_cleanup(detached, cleanup)
-            with transaction(_connect(layout), immediate=True) as conn:
-                changed = conn.execute(
-                    """UPDATE workspace_leases SET cleanup_json=?, updated_at=?
-                       WHERE lease_id=? AND state='active' AND generation=?""",
-                    (json.dumps(finished_cleanup, sort_keys=True), time.time(), lease_id, generation),
-                ).rowcount
-                if changed:
-                    active = conn.execute(
-                        "SELECT * FROM workspace_leases WHERE lease_id=?", (lease_id,)
-                    ).fetchone()
-                    _event(conn, active, "predecessor_cleanup_completed", {"cleanup": finished_cleanup})
         return _handle(lease_id, capability)
 
     def renew(
         self, handle: Mapping[str, Any], *, ttl_seconds: float | None = None,
     ) -> dict[str, Any]:
-        layout, now = self._layout(), time.time()
+        layout = self._layout()
         with transaction(_connect(layout), immediate=True) as conn:
-            row = _validated_row(conn, layout, handle, validate_path=False)
+            row = _validated_row(conn, layout, handle)
+            now = time.time()
             if row["state"] != "active":
                 raise InvalidWorkspaceHandleError("workspace lease has been released")
-            _validate_workspace_path(Path(row["workspace_path"]))
+            _require_workspace_directory(Path(row["workspace_path"]))
             if float(row["expires_at"]) <= now:
                 raise WorkspaceLeaseExpiredError("workspace lease expired; reconnect it before use")
             if _owner_state(row) is not True:
@@ -702,12 +695,13 @@ class PluginWorkspaces:
     def reconnect(
         self, handle: Mapping[str, Any], *, ttl_seconds: float | None = None,
     ) -> dict[str, Any]:
-        layout, now = self._layout(), time.time()
+        layout = self._layout()
         with transaction(_connect(layout), immediate=True) as conn:
-            row = _validated_row(conn, layout, handle, validate_path=False)
+            row = _validated_row(conn, layout, handle)
+            now = time.time()
             if row["state"] != "active":
                 raise InvalidWorkspaceHandleError("workspace lease has been released")
-            _validate_workspace_path(Path(row["workspace_path"]))
+            _require_workspace_directory(Path(row["workspace_path"]))
             owner, expired = _owner_state(row), float(row["expires_at"]) <= now
             if owner is None:
                 raise WorkspaceOwnershipError("workspace lease still belongs to another live process")
@@ -738,21 +732,27 @@ class PluginWorkspaces:
             return _handle(successor_lease_id, successor_capability)
 
     def inspect(self, handle: Mapping[str, Any]) -> dict[str, Any]:
-        layout, now = self._layout(), time.time()
+        layout = self._layout()
         with transaction(_connect(layout)) as conn:
-            row = _validated_row(conn, layout, handle, validate_path=False)
+            row = _validated_row(conn, layout, handle)
+            now = time.time()
             if row["state"] != "active":
                 raise InvalidWorkspaceHandleError("workspace lease has been released")
-            _validate_workspace_path(Path(row["workspace_path"]))
+            _require_workspace_directory(Path(row["workspace_path"]))
             if float(row["expires_at"]) <= now:
                 raise WorkspaceLeaseExpiredError("workspace lease expired; reconnect it before use")
             return _public_snapshot(conn, row)
 
     def release(self, handle: Mapping[str, Any]) -> dict[str, Any]:
-        layout, now = self._layout(), time.time()
+        layout = self._layout()
         with transaction(_connect(layout), immediate=True) as conn:
-            row = _validated_row(conn, layout, handle, validate_path=False)
+            row = _validated_row(conn, layout, handle)
+            now = time.time()
             if row["state"] == "released":
+                _recover_transition(conn, layout, row)
+                row = conn.execute(
+                    "SELECT * FROM workspace_leases WHERE lease_id=?", (row["lease_id"],),
+                ).fetchone()
                 return _public_snapshot(conn, row)
             if row["state"] not in {"active", "releasing"}:
                 raise InvalidWorkspaceHandleError("workspace lease is not active")
@@ -783,17 +783,14 @@ class PluginWorkspaces:
                 _event(conn, row, "release_started", {"cleanup": cleanup})
             else:
                 cleanup = json.loads(row["cleanup_json"] or "{}")
-                try:
-                    planned = Path(cleanup["planned_detached_path"])
-                except (KeyError, TypeError) as exc:
-                    raise InvalidWorkspaceHandleError("workspace release receipt is malformed") from exc
-                if planned.parent != layout.quarantine_dir:
-                    raise InvalidWorkspaceHandleError("workspace release receipt escaped quarantine")
+                planned = _receipt_path(layout, cleanup)
+                if planned is None:
+                    raise InvalidWorkspaceHandleError("workspace release receipt is malformed")
 
         # The releasing state and planned rename are durable before filesystem mutation.  A retry after
         # process death resumes the same target; a commit failure cannot resurrect an active predecessor.
         with transaction(_connect(layout), immediate=True) as conn:
-            current = _validated_row(conn, layout, handle, validate_path=False)
+            current = _validated_row(conn, layout, handle)
             if current["state"] == "released":
                 return _public_snapshot(conn, current)
             if current["state"] != "releasing" or current["generation"] != row["generation"]:
@@ -801,6 +798,12 @@ class PluginWorkspaces:
             detached, cleanup = _detach_workspace(
                 layout, current["workspace_id"], current["lease_id"], planned=planned,
             )
+            if detached is None and cleanup.get("disposition") == "preserved":
+                raise WorkspacePathError(
+                    "cannot detach workspace during release; existing contents were preserved"
+                )
+            if detached is not None:
+                cleanup = _finish_detached_cleanup(detached, cleanup)
             finished_at = time.time()
             changed = conn.execute(
                 """UPDATE workspace_leases SET state='released', released_at=?, cleanup_json=?,
@@ -816,27 +819,6 @@ class PluginWorkspaces:
                 "SELECT * FROM workspace_leases WHERE lease_id=?", (current["lease_id"],)
             ).fetchone()
             _event(conn, updated, "released", {"cleanup": cleanup})
-            released_snapshot = _public_snapshot(conn, updated)
-
-        if detached is None:
-            return released_snapshot
-        cleanup = _finish_detached_cleanup(detached, cleanup)
-        finished = time.time()
-        with transaction(_connect(layout), immediate=True) as conn:
-            changed = conn.execute(
-                """UPDATE workspace_leases SET cleanup_json=?, updated_at=?
-                   WHERE lease_id=? AND state='released' AND generation=?""",
-                (
-                    json.dumps(cleanup, sort_keys=True), finished, current["lease_id"],
-                    current["generation"],
-                ),
-            ).rowcount
-            if not changed:
-                return released_snapshot
-            updated = conn.execute(
-                "SELECT * FROM workspace_leases WHERE lease_id=?", (current["lease_id"],)
-            ).fetchone()
-            _event(conn, updated, "cleanup_completed", {"cleanup": cleanup})
             return _public_snapshot(conn, updated)
 
 

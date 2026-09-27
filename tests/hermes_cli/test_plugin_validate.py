@@ -158,6 +158,50 @@ class TestCapabilityProbe:
         report = validate_plugin_dir(d)
         assert report.ok, report.failures
 
+    def test_workspace_feature_gated_registration_is_still_audited(self, tmp_path):
+        d = _make_plugin(
+            tmp_path,
+            manifest=dict(BASE_MANIFEST),
+            init_py=(
+                "def register(ctx):\n"
+                "    if ctx.has_host_feature('workspace_leases.v1'):\n"
+                "        ctx.register_tool('gated_tool', schema={}, handler=lambda **kw: None)\n"
+            ),
+        )
+        report = validate_plugin_dir(d)
+        assert not report.ok
+        assert any("gated_tool" in failure for failure in report.failures)
+
+    def test_workspace_and_fallback_registration_modes_are_unioned(self, tmp_path):
+        d = _make_plugin(
+            tmp_path,
+            manifest={**BASE_MANIFEST, "provides_tools": ["fallback_tool", "lease_tool"]},
+            init_py=(
+                "def register(ctx):\n"
+                "    if ctx.has_host_feature('workspace_leases.v1'):\n"
+                "        assert ctx.workspaces is not None\n"
+                "        ctx.register_tool('lease_tool', schema={}, handler=lambda **kw: None)\n"
+                "    else:\n"
+                "        ctx.register_tool('fallback_tool', schema={}, handler=lambda **kw: None)\n"
+            ),
+        )
+        report = validate_plugin_dir(d)
+        assert report.ok, report.failures
+
+    def test_workspace_mutation_is_blocked_during_registration(self, tmp_path):
+        d = _make_plugin(
+            tmp_path,
+            manifest=dict(BASE_MANIFEST),
+            init_py=(
+                "def register(ctx):\n"
+                "    if ctx.has_host_feature('workspace_leases.v1'):\n"
+                "        ctx.workspaces.acquire('registration')\n"
+            ),
+        )
+        report = validate_plugin_dir(d)
+        assert not report.ok
+        assert any("not allowed during plugin registration" in failure for failure in report.failures)
+
 
 class TestModelProviderKind:
     def test_import_time_register_provider_is_the_entry_point(self, tmp_path):
