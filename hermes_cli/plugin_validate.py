@@ -192,7 +192,9 @@ def _check_requires_env(report: ValidationReport, manifest: dict) -> None:
 _PROBE_SCRIPT = r"""
 import importlib.util
 import json
+import secrets
 import sys
+import uuid
 
 plugin_dir = sys.argv[1]
 sentinel = sys.argv[2]
@@ -201,6 +203,18 @@ options = json.loads(sys.argv[3])
 # stub's attribute surface cannot drift from the class plugins run against.
 context_methods = set(options["context_methods"])
 provider_kind = options["kind"] == "model-provider"
+workspace_leases = bool(options.get("workspace_leases"))
+
+if not workspace_leases:
+    class _BlockWorkspaceModule:
+        def find_spec(self, fullname, path=None, target=None):
+            if fullname == "hermes_cli.plugin_workspaces":
+                raise ModuleNotFoundError(
+                    "hermes_cli.plugin_workspaces is unavailable on this simulated older host"
+                )
+            return None
+
+    sys.meta_path.insert(0, _BlockWorkspaceModule())
 
 recorded = {"tools": [], "hooks": [], "middleware": [], "commands": [], "providers": []}
 
@@ -209,6 +223,13 @@ class RecordingContext:
     plugin_config = {}
     profile_name = "default"
     plugin_id = "hermes_validate_probe_plugin"
+
+    def __getattribute__(self, name):
+        # The fallback pass models an older Hermes build: neither the feature
+        # probe nor its facade exists.  Plugins must use getattr before calling.
+        if not workspace_leases and name in {"has_host_feature", "workspaces"}:
+            raise AttributeError(name)
+        return object.__getattribute__(self, name)
 
     def register_tool(self, name, *args, **kwargs):
         recorded["tools"].append(str(name))
@@ -230,6 +251,15 @@ class RecordingContext:
         # plugins do `int(ctx.get_config("timeout", 180))` in register().
         return default
 
+    def has_host_feature(self, feature):
+        return workspace_leases and feature == "workspace_leases.v1"
+
+    @property
+    def workspaces(self):
+        if not workspace_leases:
+            raise AttributeError("workspaces")
+        return RecordingWorkspaces()
+
     def __getattr__(self, name):
         # Any other REAL registration surface (platforms, providers, skills,
         # context engines, ...) is accepted as a no-op — the probe only audits
@@ -237,12 +267,32 @@ class RecordingContext:
         # not have raise AttributeError exactly like it would; handing back a
         # callable made `getattr(ctx, "profile_path", None)` truthy and crashed
         # register() in the probe alone.
+        if not workspace_leases and name in {"has_host_feature", "workspaces"}:
+            raise AttributeError(name)
         if name in context_methods:
             def _noop(*args, **kwargs):
                 return None
 
             return _noop
         raise AttributeError(name)
+
+
+class RecordingWorkspaces:
+    # Shape-only facade; registration probes must never mutate host state.
+
+    def new_intent(self):
+        # Pure, fresh, and shape-valid.  Plugins commonly prepare an intent before
+        # registering a handler; that must validate without granting registration-time I/O.
+        return {
+            "contract_version": 1,
+            "operation_id": str(uuid.uuid4()),
+            "output_capability": secrets.token_urlsafe(32),
+        }
+
+    def _blocked(self, *args, **kwargs):
+        raise RuntimeError("workspace lifecycle calls are not allowed during plugin registration")
+
+    acquire = renew = reconnect = inspect = release = _blocked
 
 
 def emit(payload):
@@ -304,11 +354,12 @@ emit(recorded)
 """
 
 
-def _probe_options(manifest: dict) -> dict:
+def _probe_options(manifest: dict, *, workspace_leases: bool = False) -> dict:
     from hermes_cli.plugins import PluginContext
 
     return {
         "kind": str(manifest.get("kind") or ""),
+        "workspace_leases": workspace_leases,
         "context_methods": sorted(
             n for n in dir(PluginContext)
             if not n.startswith("_") and callable(getattr(PluginContext, n))
@@ -316,7 +367,9 @@ def _probe_options(manifest: dict) -> dict:
     }
 
 
-def _run_capability_probe(plugin_dir: Path, manifest: dict) -> Tuple[Optional[dict], str]:
+def _run_capability_probe(
+    plugin_dir: Path, manifest: dict, *, workspace_leases: bool = False,
+) -> Tuple[Optional[dict], str]:
     """Run the recording probe in a scratch subprocess.
 
     Returns ``(recorded, error)`` — exactly one is meaningful: *recorded*
@@ -334,7 +387,7 @@ def _run_capability_probe(plugin_dir: Path, manifest: dict) -> Tuple[Optional[di
                     _PROBE_SCRIPT,
                     str(plugin_dir),
                     _PROBE_SENTINEL,
-                    json.dumps(_probe_options(manifest)),
+                    json.dumps(_probe_options(manifest, workspace_leases=workspace_leases)),
                 ],
                 capture_output=True,
                 text=True,
@@ -389,6 +442,20 @@ def _check_capabilities(
     if recorded is None:
         report.add("capability probe", False, error)
         return None
+    if str(manifest.get("kind") or "") != "model-provider":
+        enabled, enabled_error = _run_capability_probe(
+            plugin_dir, manifest, workspace_leases=True,
+        )
+        if enabled is None:
+            report.add(
+                "capability probe", False,
+                f"workspace_leases.v1 mode: {enabled_error}",
+            )
+            return None
+        for category in ("tools", "hooks", "middleware", "commands", "providers"):
+            recorded[category] = sorted(
+                set(recorded.get(category) or []) | set(enabled.get(category) or [])
+            )
     if recorded.get("providers"):
         report.add(
             "capability probe", True,

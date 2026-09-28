@@ -292,6 +292,19 @@ class PluginContext:
         return PluginState(self.plugin_id, self.manifest.skill_namespace)
 
     @cached_property
+    def workspaces(self):
+        """Durable, profile-scoped workspace lease lifecycle facade."""
+        from hermes_cli.plugin_workspaces import PluginWorkspaces
+        return PluginWorkspaces(
+            self.plugin_id, self.manifest.skill_namespace, home_path=self._manager.home_path,
+        )
+
+    def has_host_feature(self, feature: str) -> bool:
+        """Probe an additive host API independently of operator-granted capabilities."""
+        from hermes_cli.plugin_workspaces import HOST_FEATURE
+        return feature == HOST_FEATURE
+
+    @cached_property
     def platform_actions(self):
         """Capability-gated platform action facade (``add_reaction``, ``set_thread_title``). Every call
         re-checks ``gateway.platform_actions`` (legacy ``plugins.entries.<id>.allow_platform_actions``,
