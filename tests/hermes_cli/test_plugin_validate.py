@@ -158,6 +158,119 @@ class TestCapabilityProbe:
         report = validate_plugin_dir(d)
         assert report.ok, report.failures
 
+    def test_workspace_feature_gated_registration_is_still_audited(self, tmp_path):
+        d = _make_plugin(
+            tmp_path,
+            manifest=dict(BASE_MANIFEST),
+            init_py=(
+                "def register(ctx):\n"
+                "    probe = getattr(ctx, 'has_host_feature', None)\n"
+                "    if probe and probe('workspace_leases.v1'):\n"
+                "        ctx.register_tool('gated_tool', schema={}, handler=lambda **kw: None)\n"
+            ),
+        )
+        report = validate_plugin_dir(d)
+        assert not report.ok
+        assert any("gated_tool" in failure for failure in report.failures)
+
+    def test_workspace_and_fallback_registration_modes_are_unioned(self, tmp_path):
+        d = _make_plugin(
+            tmp_path,
+            manifest={**BASE_MANIFEST, "provides_tools": ["fallback_tool", "lease_tool"]},
+            init_py=(
+                "def register(ctx):\n"
+                "    probe = getattr(ctx, 'has_host_feature', None)\n"
+                "    if probe and probe('workspace_leases.v1'):\n"
+                "        assert ctx.workspaces is not None\n"
+                "        ctx.register_tool('lease_tool', schema={}, handler=lambda **kw: None)\n"
+                "    else:\n"
+                "        ctx.register_tool('fallback_tool', schema={}, handler=lambda **kw: None)\n"
+            ),
+        )
+        report = validate_plugin_dir(d)
+        assert report.ok, report.failures
+
+    def test_workspace_types_are_imported_only_after_feature_probe(self, tmp_path):
+        d = _make_plugin(
+            tmp_path,
+            manifest={**BASE_MANIFEST, "provides_tools": ["fallback_tool", "lease_tool"]},
+            init_py=(
+                "def register(ctx):\n"
+                "    probe = getattr(ctx, 'has_host_feature', None)\n"
+                "    if probe and probe('workspace_leases.v1'):\n"
+                "        from hermes_cli.plugin_workspaces import WorkspaceLeaseError\n"
+                "        assert WorkspaceLeaseError is not None\n"
+                "        ctx.register_tool('lease_tool', schema={}, handler=lambda **kw: None)\n"
+                "    else:\n"
+                "        ctx.register_tool('fallback_tool', schema={}, handler=lambda **kw: None)\n"
+            ),
+        )
+        report = validate_plugin_dir(d)
+        assert report.ok, report.failures
+
+    def test_unconditional_workspace_module_import_fails_legacy_probe(self, tmp_path):
+        d = _make_plugin(
+            tmp_path,
+            manifest=dict(BASE_MANIFEST),
+            init_py=(
+                "from hermes_cli.plugin_workspaces import WorkspaceLeaseError\n"
+                "def register(ctx):\n"
+                "    assert WorkspaceLeaseError is not None\n"
+            ),
+        )
+        report = validate_plugin_dir(d)
+        assert not report.ok
+        assert any("older host" in failure for failure in report.failures)
+
+    def test_workspace_intent_factory_is_pure_and_shape_valid(self, tmp_path):
+        d = _make_plugin(
+            tmp_path,
+            manifest={**BASE_MANIFEST, "provides_tools": ["lease_tool"]},
+            init_py=(
+                "def register(ctx):\n"
+                "    probe = getattr(ctx, 'has_host_feature', None)\n"
+                "    if probe and probe('workspace_leases.v1'):\n"
+                "        first = ctx.workspaces.new_intent()\n"
+                "        second = ctx.workspaces.new_intent()\n"
+                "        assert first != second\n"
+                "        assert set(first) == {'contract_version', 'operation_id', 'output_capability'}\n"
+                "        assert first['contract_version'] == 1\n"
+                "        assert len(first['operation_id']) == 36\n"
+                "        assert len(first['output_capability']) >= 32\n"
+                "        ctx.register_tool('lease_tool', schema={}, handler=lambda **kw: None)\n"
+            ),
+        )
+        report = validate_plugin_dir(d)
+        assert report.ok, report.failures
+
+    def test_workspace_mutation_is_blocked_during_registration(self, tmp_path):
+        d = _make_plugin(
+            tmp_path,
+            manifest=dict(BASE_MANIFEST),
+            init_py=(
+                "def register(ctx):\n"
+                "    probe = getattr(ctx, 'has_host_feature', None)\n"
+                "    if probe and probe('workspace_leases.v1'):\n"
+                "        ctx.workspaces.acquire('registration')\n"
+            ),
+        )
+        report = validate_plugin_dir(d)
+        assert not report.ok
+        assert any("not allowed during plugin registration" in failure for failure in report.failures)
+
+    def test_direct_feature_probe_is_rejected_by_legacy_mode(self, tmp_path):
+        d = _make_plugin(
+            tmp_path,
+            manifest=dict(BASE_MANIFEST),
+            init_py=(
+                "def register(ctx):\n"
+                "    ctx.has_host_feature('workspace_leases.v1')\n"
+            ),
+        )
+        report = validate_plugin_dir(d)
+        assert not report.ok
+        assert any("has_host_feature" in failure for failure in report.failures)
+
 
 class TestModelProviderKind:
     def test_import_time_register_provider_is_the_entry_point(self, tmp_path):
