@@ -144,6 +144,13 @@ jobs:
     if: needs.detect.outputs.site == 'true'
     uses: ./.github/workflows/docs-site-checks.yml
 
+  feature-spec-check:
+    name: Feature Spec Check
+    needs: detect
+    # The catalog is a fork contract, so validate it for every PR and push.
+    # This lightweight job is deliberately independent of affected-area lanes.
+    uses: ./.github/workflows/feature-spec-check.yml
+
   history-check:
     name: Deny unrelated histories
     needs: detect
@@ -237,6 +244,7 @@ jobs:
       - rust-tests
       - e2e-desktop
       - docs-site
+      - feature-spec-check
       - history-check
       - contributor-check
       - uv-lockfile

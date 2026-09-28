@@ -133,6 +133,13 @@ CASES = {
     # SKILL.md reads like docs, but the skill-doc tests read skills/, so a
     # skill edit must still run Python.
     "skill md → python + site": (["skills/github/SKILL.md"], _lanes(python=True, site=True)),
+    # Feature specs are checked by an unconditional lightweight workflow, so
+    # they do not need to pay for the full Docusaurus build.
+    "feature spec → unconditional checker only": (["feature-specs/example.md"], _lanes()),
+    "feature spec checker → python plus unconditional checker": (
+        ["scripts/check_feature_specs.py"],
+        _lanes(python=True, scan=True),
+    ),
     "dockerfile → docker meta": (["Dockerfile"], _lanes(docker_meta=True)),
     # Only the flake reads these, so they run nix alone. No Python test opens
     # them, unlike pyproject.toml and uv.lock below.
@@ -330,6 +337,15 @@ def test_ci_jobs_only_gate_on_detect_outputs_that_detect_actually_declares():
 
     assert referenced, "found no detect-gated jobs — the walk is broken, not the wiring"
     assert referenced - declared == set(), "job(s) gate on an output detect never declares"
+
+
+def test_feature_spec_check_is_unconditional_and_aggregated():
+    ci = _yaml(".github/workflows/ci.yaml")
+    job = ci["jobs"]["feature-spec-check"]
+
+    assert "if" not in job
+    assert job["uses"] == "./.github/workflows/feature-spec-check.yml"
+    assert "feature-spec-check" in ci["jobs"]["all-checks-pass"]["needs"]
 
 
 def _iter_if_expressions(job: object):
