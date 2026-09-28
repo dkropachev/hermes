@@ -1105,6 +1105,7 @@ def _run_foreground(
     command: str, env: Any, plan: _ExecPlan, *,
     task_id: Optional[str], session_id: Optional[str], session_key: str,
     workdir: Optional[str], approval_note: Optional[str], clear_interrupt: bool,
+    allow_yield_to_background: bool = True,
 ) -> str:
     """Execute in the foreground with retry on transient errors, then finalize."""
     max_retries = 3
@@ -1127,10 +1128,16 @@ def _run_foreground(
             # bounded_capture: model-facing output keeps a head/tail window
             # while streaming so a verbose command can't OOM the gateway;
             # internal env.execute() consumers stay unbounded.
+            yield_kwargs = (
+                _yield_kwargs(
+                    command, env_type=env_type, cwd=command_cwd,
+                    effective_task_id=eff, task_id=task_id, session_key=session_key,
+                )
+                if allow_yield_to_background else {}
+            )
             result = env.execute(
                 command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
-                **_yield_kwargs(command, env_type=env_type, cwd=command_cwd, effective_task_id=eff,
-                                task_id=task_id, session_key=session_key),
+                **yield_kwargs,
             )
             break
         except Exception as e:
@@ -1235,6 +1242,7 @@ def terminal_tool(
     _host_local: bool = False,
     _completion_output_chars: int = 0,
     heartbeat: int = 0,
+    _allow_yield_to_background: bool = True,
 ) -> str:
     """Execute *command* in the configured terminal environment; returns a JSON string.
 
@@ -1324,6 +1332,7 @@ def terminal_tool(
             command, env, plan,
             task_id=task_id, session_id=session_id, session_key=session_key,
             workdir=workdir, approval_note=verdict.note, clear_interrupt=verdict.approved_run,
+            allow_yield_to_background=_allow_yield_to_background,
         )
     except _Rejected as r:
         return r.result_json

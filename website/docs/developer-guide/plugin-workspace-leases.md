@@ -48,21 +48,59 @@ commands. That hardening is intentionally deferred to
 untrusted code or to isolate mutually hostile tenants.
 :::
 
-:::caution Lifecycle is not workspace-bound execution
+:::caution Cooperative binding is not confinement
 `workspace_leases.v1` covers only acquisition, ownership fencing, heartbeat/reconnect, inspection,
-release, and conservative cleanup. It does **not** bind `terminal`, file tools, or
-`ctx.dispatch_tool()` to a lease handle, and it does not prevent a caller from supplying another
-working directory.
+release, and conservative cleanup. Hermes separately exposes `workspace_bound_dispatch.v1` through
+`ctx.workspace_tools`. Its terminal calls start in the leased directory and its file calls receive
+only host-constructed paths beneath that directory.
 
-A consumer that requires both durable leases and host-enforced terminal/file confinement must
-probe **both** `workspace_leases.v1` and the separate bound-dispatch host feature documented by the
-Hermes version that provides it. Keep that consumer disabled until both probes succeed. Do not
-invent or infer the bound-dispatch feature name from `workspace_leases.v1`.
+This is a safer API for trusted, cooperative plugins, not host-enforced confinement. A shell command
+can still `cd ..`, use an absolute path, or invoke any host program. File dispatch does not defend
+against symlinks, junctions, mounts, or another local process replacing paths. The existing
+`ctx.dispatch_tool()` API remains an ungated compatibility surface and can still dispatch ordinary
+terminal/file tools with their ordinary arguments. Do not run untrusted code with either API.
 :::
+
+## Workspace-bound tools
+
+Probe both independent features before enabling a workflow that needs lifecycle and bound dispatch:
+
+```python
+has_feature = getattr(ctx, "has_host_feature", None)
+if (
+    callable(has_feature)
+    and has_feature("workspace_leases.v1")
+    and has_feature("workspace_bound_dispatch.v1")
+):
+    tools = ctx.workspace_tools
+```
+
+`ctx.workspace_tools` is cached on the same `PluginContext` as `ctx.workspaces`, so both facades use
+the same immutable profile home and plugin identity. Every call revalidates that the handle is
+active, unexpired, current-generation, and owned by the current process. Dispatch remains pinned
+against release, reconnect, and same-name reacquisition until the synchronous call returns. A
+durable receipt keeps that fence in place if the host process exits before unwinding the call; it
+is never cleared automatically merely because its owner appears dead.
+
+| Method | Contract |
+|---|---|
+| `terminal(handle, command, timeout=None)` | Runs one foreground host-local command with the leased directory as its starting CWD. Existing terminal command approvals and secret stripping remain active. It never accepts `workdir`, `task_id`, background, PTY, or force options. |
+| `read_file(handle, relative_path, offset=1, limit=2000)` | Uses the canonical `read_file` implementation against a host-constructed workspace path. |
+| `write_file(handle, relative_path, content)` | Uses the canonical guarded whole-file writer, including stale-write checks. |
+| `edit_file(handle, relative_path, old_string, new_string, replace_all=False)` | Uses the canonical single-file replace implementation. |
+
+File paths must be relative. Absolute, drive-qualified, UNC, and `..` paths are rejected before a
+tool handler runs. Callers cannot substitute a path, working directory, task ID, backend, or profile.
+The host derives a stable internal task identity from the profile, plugin identity, workspace, and
+lease generation so read-before-write state stays scoped to that generation.
+
+`hermes plugins validate` runs registration in three host modes: no workspace features, lease-only,
+and lease plus bound dispatch. The recording `workspace_tools` facade exposes the production method
+shape in the third mode, but all tool calls are rejected during registration.
 
 ## Lifecycle API
 
-The facade has six methods. `acquire` and `reconnect` require an idempotency intent that the caller
+The facade has seven methods. `acquire` and `reconnect` require an idempotency intent that the caller
 creates and durably stores **before** making the call:
 
 ```python
@@ -92,6 +130,7 @@ released = ctx.workspaces.release(successor)
 | `renew(handle, *, ttl_seconds=None)` | Extends the heartbeat for the current process owner and returns the updated snapshot. |
 | `reconnect(handle, *, intent, ttl_seconds=None)` | Reclaims a lease after a process restart when ownership can be proven safe. It rotates the lease ID and bearer capability and returns a successor handle. Repeating the exact request with the same intent replays that successor. |
 | `release(handle)` | Atomically detaches the leased path, records the released state, and then cleans or quarantines its contents. Repeating release with the same current handle is safe. |
+| `recover_interrupted_dispatch(handle, *, operator_confirmed_quiescent, reason)` | After an unfinished bound-dispatch receipt blocks lifecycle changes, retires the old lease only with explicit operator-confirmed quiescence and a recorded reason. It detaches the old path, quarantines non-empty contents, and atomically resolves the receipt with an audit event. |
 
 `ttl_seconds` must be finite and between 1 second and 24 hours. A worker should renew well before
 expiry and persist the returned handle before it begins work that must survive a host restart.
@@ -182,6 +221,20 @@ The MVP cleanup rule is deliberately small and conservative:
 Version 1 does not invoke Git or attempt to distinguish pushed checkouts from dirty, untracked,
 ignored, unpushed, or non-Git content. Smarter destructive cleanup is deferred with the other
 workspace hardening in [Hermes issue #9](https://github.com/dkropachev/hermes/issues/9).
+
+A workspace-bound operation writes a durable in-flight receipt before invoking the terminal or
+file handler and removes it when the synchronous call unwinds. If the process exits without
+unwinding, reconnect, release, and same-name acquisition remain fenced: a foreground child might
+still be writing even when its parent PID is dead. The host does not guess that such work is safe.
+
+After an operator has independently established that the old operation and any child processes are
+quiescent, call `recover_interrupted_dispatch` with `operator_confirmed_quiescent=True` and a
+non-empty reason. Recovery durably enters a releasing state, detaches the canonical directory, and
+then resolves the dispatch receipt and lease in one database transaction. Non-empty contents stay
+under `workspace-quarantine/`; they are never reused as the next generation. The confirmation,
+reason, receipt metadata, and cleanup result remain in lifecycle events. A retry after a lost
+response returns the same released snapshot. Do not call this method automatically or treat an
+expired TTL/dead PID as operator confirmation.
 
 Snapshots include current ownership and timing fields, the allocated path, generation, bounded
 lifecycle events, and the latest cleanup receipt. Surface quarantine receipts to an operator and

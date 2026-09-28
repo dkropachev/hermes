@@ -142,7 +142,8 @@ def _resolved_or_raw(filepath: str, task_id: str) -> str:
         return filepath
 
 
-def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
+def _check_sensitive_path(filepath: str, task_id: str = "default", *,
+                          resolved_path: str | None = None) -> str | None:
     """Return an error message if the path targets a sensitive system location."""
     # NT/device-namespace guard on the RAW string, BEFORE the task-base join:
     # on POSIX a leading "\??\" reads as a relative segment and gets anchored
@@ -152,7 +153,9 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     nt_err = get_nt_namespace_error(filepath, verb="Write")
     if nt_err:
         return nt_err
-    candidates = (_resolved_or_raw(filepath, task_id), os.path.normpath(_expand_tilde(filepath)))
+    resolved = (str(resolved_path) if resolved_path is not None
+                else _resolved_or_raw(filepath, task_id))
+    candidates = (resolved, os.path.normpath(_expand_tilde(filepath)))
     if any(c.startswith(_SENSITIVE_PATH_PREFIXES) or c in _SENSITIVE_EXACT_PATHS for c in candidates):
         return (
             f"Refusing to write to sensitive system path: {filepath}\n"
@@ -204,7 +207,8 @@ def _protected_instruction_config() -> tuple[bool, list[str]]:
 
 def _protected_instruction_reason(filepath: str, task_id: str = "default",
                                   *, enabled: bool | None = None,
-                                  extra_patterns: list[str] | None = None) -> str | None:
+                                  extra_patterns: list[str] | None = None,
+                                  resolved_path: str | None = None) -> str | None:
     """Return a short label when ``filepath`` targets a protected instruction file, else ``None``.
     Matches BOTH the normalized input and its realpath so no symlink direction escapes.
 
@@ -218,10 +222,13 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
         return None
 
     normalized = os.path.normpath(_expand_tilde(filepath))
-    try:
-        resolved = os.path.realpath(str(_resolve_path_for_task(filepath, task_id)))
-    except (OSError, ValueError, RuntimeError):
-        resolved = os.path.realpath(normalized)
+    if resolved_path is not None:
+        resolved = os.path.realpath(str(resolved_path))
+    else:
+        try:
+            resolved = os.path.realpath(str(_resolve_path_for_task(filepath, task_id)))
+        except (OSError, ValueError, RuntimeError):
+            resolved = os.path.realpath(normalized)
 
     # ~/.hermes itself is governed by its own guards (config.yaml hard-block,
     # mirror guard, write_approval); this gate targets PROJECT-LOCAL files only.
@@ -326,20 +333,38 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
     return timed_out if timed else denied
 
 
-def _check_protected_instruction_write(paths: list[str], task_id: str = "default") -> str | None:
+def _check_protected_instruction_write(
+    paths: list[str],
+    task_id: str = "default",
+    *,
+    resolved_paths: dict[str, str] | None = None,
+) -> str | None:
     """Gate a write/patch touching protected instruction files. ONE protected file gates
     the ENTIRE multi-file patch (one prompt, all-or-nothing)."""
     enabled, extra = _protected_instruction_config()
     if not enabled:
         return None
-    reasons = [r for r in (_protected_instruction_reason(p, task_id, enabled=enabled, extra_patterns=extra)
-                           for p in paths) if r]
+    reasons = [r for r in (
+        _protected_instruction_reason(
+            p,
+            task_id,
+            enabled=enabled,
+            extra_patterns=extra,
+            resolved_path=(resolved_paths or {}).get(p),
+        )
+        for p in paths
+    ) if r]
     if not reasons:
         return None
     return _request_protected_instruction_approval(reasons, task_id)
 
 
-def _check_approval_required_write(paths: list[str], task_id: str = "default") -> str | None:
+def _check_approval_required_write(
+    paths: list[str],
+    task_id: str = "default",
+    *,
+    resolved_paths: dict[str, str] | None = None,
+) -> str | None:
     """Gate a write/patch touching an approval-required path (``~/.ssh/config`` can steer
     execution via ``ProxyCommand``). Routine gate: once/session/always, honors --yolo,
     fail-closed without an interactive/gateway channel."""
@@ -348,7 +373,10 @@ def _check_approval_required_write(paths: list[str], task_id: str = "default") -
     except Exception:
         return None
 
-    targets = [p for p in paths if is_write_approval_required(p)]
+    targets = [
+        p for p in paths
+        if is_write_approval_required((resolved_paths or {}).get(p, p))
+    ]
     if not targets:
         return None
 
@@ -405,7 +433,9 @@ def _get_container_mirror_prefix_for_task(task_id: str = "default") -> str | Non
     return None
 
 
-def _check_cross_profile_path(filepath: str, task_id: str = "default") -> str | None:
+def _check_cross_profile_path(filepath: str, task_id: str = "default", *,
+                              resolved_path: str | None = None,
+                              host_local: bool = False) -> str | None:
     """Soft-guard: warn when ``filepath`` lands on a host-side or Docker sandbox MIRROR of
     Hermes state (a write the host never reads). Not profile isolation — that guard was
     removed; ``cross_profile=True`` keeps bypassing this one for replay compat. Fails open."""
@@ -413,14 +443,17 @@ def _check_cross_profile_path(filepath: str, task_id: str = "default") -> str | 
         from agent.file_safety import get_container_mirror_warning, get_sandbox_mirror_warning
     except Exception:
         return None
-    resolved = _resolved_or_raw(filepath, task_id)
+    resolved = (str(resolved_path) if resolved_path is not None
+                else _resolved_or_raw(filepath, task_id))
     warning = get_sandbox_mirror_warning(resolved)
     if warning is not None:
         return warning
-    return get_container_mirror_warning(resolved, mirror_prefix=_get_container_mirror_prefix_for_task(task_id))
+    mirror_prefix = None if host_local else _get_container_mirror_prefix_for_task(task_id)
+    return get_container_mirror_warning(resolved, mirror_prefix=mirror_prefix)
 
 
-def _check_binary_document_write(filepath: str, task_id: str = "default") -> str | None:
+def _check_binary_document_write(filepath: str, task_id: str = "default", *,
+                                 resolved_path: str | None = None) -> str | None:
     """Reject text-tool writes that would corrupt a binary document (read_file showed
     EXTRACTED text, so the model may write it back). Opaque document formats and
     SQLite sidecars (-wal/-shm/-journal) are always rejected; .pdf and every other
@@ -432,8 +465,9 @@ def _check_binary_document_write(filepath: str, task_id: str = "default") -> str
     write_file/patch. A plain-text write can never produce a valid OOXML/OLE/ODF container, so that write
     silently destroys the document (port of nearai/ironclaw#7109).
     """
-    ext = os.path.splitext(filepath)[1].lower()
-    if has_opaque_document_extension(filepath):
+    target = str(resolved_path) if resolved_path is not None else filepath
+    ext = os.path.splitext(target)[1].lower()
+    if has_opaque_document_extension(target):
         return (
             f"Refusing to write plain text to binary document '{filepath}' ({ext}). "
             "A text write cannot produce a valid document container and would "
@@ -444,7 +478,7 @@ def _check_binary_document_write(filepath: str, task_id: str = "default") -> str
     # A -wal/-shm/-journal path is never a legitimate text target, even when
     # no sidecar exists yet: a checkpointed db has none on disk, and a garbage
     # WAL dropped next to a live database is picked up on the next open.
-    if is_sqlite_sidecar(filepath):
+    if is_sqlite_sidecar(target):
         return (
             f"Refusing to write plain text to binary SQLite sidecar '{filepath}' ({ext}). "
             "A -wal/-shm/-journal file holds raw database pages that SQLite "
@@ -455,12 +489,15 @@ def _check_binary_document_write(filepath: str, task_id: str = "default") -> str
     # with text destroys it — the model only ever saw extracted or mojibake
     # text. Creating a NEW file with such an extension stays allowed: raw PDF
     # syntax is text-authorable and text fixtures named ``*.db`` exist.
-    pdf = is_pdf_path(filepath)
-    if pdf or has_binary_extension(filepath):
-        try:
-            resolved = Path(_resolve_path_for_task(filepath, task_id))
-        except Exception:
-            resolved = Path(_expand_tilde(filepath))
+    pdf = is_pdf_path(target)
+    if pdf or has_binary_extension(target):
+        if resolved_path is not None:
+            resolved = Path(target)
+        else:
+            try:
+                resolved = Path(_resolve_path_for_task(filepath, task_id))
+            except Exception:
+                resolved = Path(_expand_tilde(filepath))
         try:
             if resolved.is_file():
                 if pdf:

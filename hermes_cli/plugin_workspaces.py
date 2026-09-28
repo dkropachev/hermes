@@ -20,8 +20,11 @@ import re
 import secrets
 import shutil
 import socket
+import threading
 import time
 import uuid
+import weakref
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -83,6 +86,32 @@ class _Layout:
     workspaces_dir: Path
     quarantine_dir: Path
     db_path: Path
+
+
+@dataclass(frozen=True)
+class _PinnedWorkspace:
+    """Host-derived inputs held stable for one synchronous bound dispatch."""
+
+    path: Path
+    task_id: str
+    generation: int
+
+
+_generation_locks_guard = threading.Lock()
+_generation_locks: weakref.WeakValueDictionary[tuple[str, str, str], threading.RLock] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _generation_lock(layout: _Layout, workspace_id: str) -> threading.RLock:
+    """One process-local mutex for a plugin/profile/workspace name."""
+    key = (layout.profile_key, layout.plugin_identity_digest, workspace_id)
+    with _generation_locks_guard:
+        lock = _generation_locks.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _generation_locks[key] = lock
+        return lock
 
 
 def _plugin_namespace(plugin_id: str, skill_namespace: str) -> str:
@@ -221,6 +250,21 @@ def _initialize(conn) -> None:
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS workspace_bound_dispatches (
+            dispatch_id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            lease_id TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            dispatch_kind TEXT NOT NULL
+                CHECK (dispatch_kind IN ('terminal', 'read_file', 'write_file', 'edit_file')),
+            owner_pid INTEGER NOT NULL,
+            owner_create_time REAL,
+            owner_host TEXT NOT NULL,
+            owner_instance TEXT NOT NULL,
+            started_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS workspace_bound_dispatches_workspace
+            ON workspace_bound_dispatches(workspace_id, generation);
         CREATE TABLE IF NOT EXISTS workspace_lease_metadata (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
@@ -404,6 +448,51 @@ def _validated_row(conn, layout: _Layout, handle: Mapping[str, Any]):
     if os.path.normcase(str(expected)) != os.path.normcase(str(row["workspace_path"])):
         raise InvalidWorkspaceHandleError("workspace lease has an invalid persisted path")
     return row
+
+
+def _raise_if_bound_dispatch_inflight(conn, row: Mapping[str, Any]) -> None:
+    """Fence lifecycle reuse after a dispatch owner exits without unwinding.
+
+    Bound dispatch is synchronous, so a surviving receipt means the owning host
+    process did not execute its ``finally`` block. Its foreground child may still
+    be writing below the workspace. Only explicit operator recovery may remove
+    this conservative fence.
+    """
+    dispatch = conn.execute(
+        """SELECT dispatch_id, dispatch_kind, lease_id, generation, owner_pid,
+                  owner_create_time, started_at
+           FROM workspace_bound_dispatches
+           WHERE workspace_id=? ORDER BY started_at, dispatch_id LIMIT 1""",
+        (row["workspace_id"],),
+    ).fetchone()
+    if dispatch is None:
+        return
+    raise WorkspaceInUseError(
+        f"workspace {row['workspace_id']!r} has an unfinished "
+        f"{dispatch['dispatch_kind']} workspace-bound dispatch; "
+        "operator recovery is required before its lease can change; after confirming "
+        "the old operation is quiescent, call recover_interrupted_dispatch()"
+    )
+
+
+def _dispatch_receipts(conn, row: Mapping[str, Any]) -> list[dict[str, Any]]:
+    receipts = conn.execute(
+        """SELECT dispatch_id, workspace_id, lease_id, generation, dispatch_kind,
+                  owner_pid, owner_create_time, owner_host, owner_instance, started_at
+           FROM workspace_bound_dispatches
+           WHERE workspace_id=? ORDER BY started_at, dispatch_id""",
+        (row["workspace_id"],),
+    ).fetchall()
+    result = [dict(receipt) for receipt in receipts]
+    if any(
+        receipt["lease_id"] != row["lease_id"]
+        or int(receipt["generation"]) != int(row["generation"])
+        for receipt in result
+    ):
+        raise WorkspaceLeaseError(
+            "workspace-bound dispatch receipt belongs to another lease generation"
+        )
+    return result
 
 
 def _validate_operation(
@@ -696,6 +785,19 @@ class PluginWorkspaces:
         intent: Mapping[str, Any],
         ttl_seconds: float = DEFAULT_TTL_SECONDS,
     ) -> dict[str, Any]:
+        workspace_id = _validated_workspace_id(workspace_id)
+        with _generation_lock(self._layout(), workspace_id):
+            return self._acquire_locked(
+                workspace_id, intent=intent, ttl_seconds=ttl_seconds,
+            )
+
+    def _acquire_locked(
+        self,
+        workspace_id: str,
+        *,
+        intent: Mapping[str, Any],
+        ttl_seconds: float = DEFAULT_TTL_SECONDS,
+    ) -> dict[str, Any]:
         workspace_id, ttl = _validated_workspace_id(workspace_id), _ttl(ttl_seconds)
         layout = self._layout()
         operation_id, capability = _parse_intent(intent)
@@ -744,6 +846,7 @@ class PluginWorkspaces:
                     raise WorkspaceInUseError(
                         f"workspace {workspace_id!r} is being prepared by another live owner"
                     )
+                _raise_if_bound_dispatch_inflight(conn, current)
                 ttl = float(operation["ttl_seconds"])
                 generation = int(current["generation"])
                 cleanup = json.loads(current["cleanup_json"] or "{}")
@@ -798,6 +901,7 @@ class PluginWorkspaces:
                                 f"workspace {workspace_id!r} is already owned by a live process"
                             )
                         reclaimed = "owner_dead"
+                    _raise_if_bound_dispatch_inflight(conn, old)
                     recovered = _recover_transition(conn, layout, old)
                 cleanup = {
                     "classification": "pending", "disposition": "preparing",
@@ -998,6 +1102,19 @@ class PluginWorkspaces:
         intent: Mapping[str, Any],
         ttl_seconds: float | None = None,
     ) -> dict[str, Any]:
+        workspace_id = self._workspace_id_for_reconnect(handle, intent)
+        with _generation_lock(self._layout(), workspace_id):
+            return self._reconnect_locked(
+                handle, intent=intent, ttl_seconds=ttl_seconds,
+            )
+
+    def _reconnect_locked(
+        self,
+        handle: Mapping[str, Any],
+        *,
+        intent: Mapping[str, Any],
+        ttl_seconds: float | None = None,
+    ) -> dict[str, Any]:
         layout = self._layout()
         ttl_was_provided = ttl_seconds is not None
         operation_id, successor_capability = _parse_intent(intent)
@@ -1036,6 +1153,7 @@ class PluginWorkspaces:
             owner, expired = _owner_state(row), float(row["expires_at"]) <= now
             if owner is None:
                 raise WorkspaceOwnershipError("workspace lease still belongs to another live process")
+            _raise_if_bound_dispatch_inflight(conn, row)
             ttl = _ttl(row["ttl_seconds"] if ttl_seconds is None else ttl_seconds)
             _event(conn, row, "reconnect_started", {
                 "operation_id": operation_id, "expired": expired,
@@ -1094,12 +1212,204 @@ class PluginWorkspaces:
                 raise WorkspaceLeaseExpiredError("workspace lease expired; reconnect it before use")
             return _public_snapshot(conn, row)
 
+    def recover_interrupted_dispatch(
+        self,
+        handle: Mapping[str, Any],
+        *,
+        operator_confirmed_quiescent: bool,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Retire a lease fenced by a dispatch whose owner exited abruptly.
+
+        The caller must obtain an explicit operator confirmation that no child or
+        other process from the interrupted operation can still write to the
+        workspace. Recovery never resumes or reuses those contents: the canonical
+        workspace is detached, non-empty contents are quarantined, and the old
+        lease is released. The confirmation, reason, resolved dispatch receipts,
+        and cleanup disposition are retained in append-only lease events.
+        """
+        if operator_confirmed_quiescent is not True:
+            raise ValueError("explicit operator confirmation of quiescence is required")
+        if not isinstance(reason, str) or not reason.strip() or len(reason.strip()) > 2000:
+            raise ValueError("recovery reason must be 1-2000 non-whitespace characters")
+        reason = reason.strip()
+        workspace_id = self._workspace_id_for_handle(handle)
+        layout = self._layout()
+        with _generation_lock(layout, workspace_id):
+            return self._recover_interrupted_dispatch_locked(
+                handle,
+                operator_confirmed_quiescent=operator_confirmed_quiescent,
+                reason=reason,
+            )
+
+    def _recover_interrupted_dispatch_locked(
+        self,
+        handle: Mapping[str, Any],
+        *,
+        operator_confirmed_quiescent: bool,
+        reason: str,
+    ) -> dict[str, Any]:
+        layout = self._layout()
+        planned: Path | None = None
+        generation = -1
+        lease_id = ""
+        with transaction(_connect(layout), immediate=True) as conn:
+            row = _validated_row(conn, layout, handle)
+            cleanup = json.loads(row["cleanup_json"] or "{}")
+            if not isinstance(cleanup, dict):
+                raise InvalidWorkspaceHandleError("workspace cleanup receipt is malformed")
+            receipts = _dispatch_receipts(conn, row)
+            if (
+                row["state"] == "released"
+                and cleanup.get("recovery_kind") == "interrupted_bound_dispatch"
+                and not receipts
+            ):
+                # The final database transaction committed but its response was
+                # lost. Return the durable result without repeating filesystem work.
+                return _public_snapshot(conn, row)
+            if not receipts:
+                raise InvalidWorkspaceHandleError(
+                    "workspace has no unfinished workspace-bound dispatch to recover"
+                )
+            if row["state"] not in {"active", "releasing"}:
+                raise InvalidWorkspaceHandleError(
+                    "workspace lease cannot recover an interrupted dispatch in its current state"
+                )
+            if _owner_status(row) == "live":
+                raise WorkspaceOwnershipError(
+                    "workspace dispatch owner is still live; stop it before confirming quiescence"
+                )
+            generation = int(row["generation"])
+            lease_id = str(row["lease_id"])
+            if row["state"] == "active":
+                planned = _planned_detached_path(layout, row["workspace_id"], row["lease_id"])
+                cleanup = {
+                    "classification": "pending",
+                    "disposition": "dispatch_recovery",
+                    "recovery_kind": "interrupted_bound_dispatch",
+                    "original_path": row["workspace_path"],
+                    "planned_detached_path": str(planned),
+                    "operator_confirmed_quiescent": operator_confirmed_quiescent,
+                    "reason": reason,
+                }
+                changed = conn.execute(
+                    """UPDATE workspace_leases SET state='releasing', cleanup_json=?, updated_at=?
+                       WHERE lease_id=? AND state='active' AND generation=?""",
+                    (
+                        json.dumps(cleanup, sort_keys=True), time.time(),
+                        lease_id, generation,
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise InvalidWorkspaceHandleError(
+                        "workspace lease changed while dispatch recovery started"
+                    )
+                started = conn.execute(
+                    "SELECT * FROM workspace_leases WHERE lease_id=?", (lease_id,),
+                ).fetchone()
+                _event(conn, started, "dispatch_recovery_started", {
+                    "operator_confirmed_quiescent": operator_confirmed_quiescent,
+                    "reason": reason,
+                    "dispatch_receipts": receipts,
+                    "cleanup": cleanup,
+                })
+            else:
+                if cleanup.get("recovery_kind") != "interrupted_bound_dispatch":
+                    raise InvalidWorkspaceHandleError(
+                        "workspace release was not started by interrupted dispatch recovery"
+                    )
+                planned = _receipt_path(layout, cleanup)
+                if planned is None:
+                    raise InvalidWorkspaceHandleError(
+                        "workspace dispatch recovery receipt is malformed"
+                    )
+
+        # The recovery decision and target name are durable before filesystem
+        # mutation. A retry resumes this exact detach after any process failure.
+        with transaction(_connect(layout), immediate=True) as conn:
+            current = _validated_row(conn, layout, handle)
+            if (
+                current["state"] == "released"
+                and not _dispatch_receipts(conn, current)
+            ):
+                return _public_snapshot(conn, current)
+            if current["state"] != "releasing" or int(current["generation"]) != generation:
+                raise InvalidWorkspaceHandleError(
+                    "workspace lease changed during dispatch recovery"
+                )
+            cleanup = json.loads(current["cleanup_json"] or "{}")
+            if (
+                not isinstance(cleanup, dict)
+                or cleanup.get("recovery_kind") != "interrupted_bound_dispatch"
+            ):
+                raise InvalidWorkspaceHandleError(
+                    "workspace dispatch recovery receipt is malformed"
+                )
+            receipts = _dispatch_receipts(conn, current)
+            if not receipts:
+                raise WorkspaceLeaseError(
+                    "workspace dispatch receipts disappeared during recovery"
+                )
+            detached, detached_receipt = _detach_workspace(
+                layout, str(current["workspace_id"]), lease_id, planned=planned,
+            )
+            if detached is None and detached_receipt.get("disposition") == "preserved":
+                raise WorkspacePathError(
+                    "cannot detach interrupted workspace; existing contents were preserved"
+                )
+            if detached is not None:
+                detached_receipt = _finish_detached_cleanup(detached, detached_receipt)
+            cleanup.update(detached_receipt)
+            cleanup.update({
+                "recovery_kind": "interrupted_bound_dispatch",
+                "operator_confirmed_quiescent": True,
+                "reason": str(cleanup.get("reason") or reason),
+            })
+            finished_at = time.time()
+            deleted = conn.execute(
+                """DELETE FROM workspace_bound_dispatches
+                   WHERE workspace_id=? AND lease_id=? AND generation=?""",
+                (current["workspace_id"], lease_id, generation),
+            ).rowcount
+            if deleted != len(receipts):
+                raise WorkspaceLeaseError(
+                    "workspace dispatch receipts changed during recovery"
+                )
+            changed = conn.execute(
+                """UPDATE workspace_leases SET state='released', released_at=?, cleanup_json=?,
+                   updated_at=? WHERE lease_id=? AND state='releasing' AND generation=?""",
+                (
+                    finished_at, json.dumps(cleanup, sort_keys=True), finished_at,
+                    lease_id, generation,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise InvalidWorkspaceHandleError(
+                    "workspace lease changed while dispatch recovery completed"
+                )
+            recovered = conn.execute(
+                "SELECT * FROM workspace_leases WHERE lease_id=?", (lease_id,),
+            ).fetchone()
+            _event(conn, recovered, "dispatch_recovered", {
+                "operator_confirmed_quiescent": True,
+                "reason": cleanup["reason"],
+                "resolved_dispatch_receipts": receipts,
+                "cleanup": cleanup,
+            })
+            return _public_snapshot(conn, recovered)
+
     def release(self, handle: Mapping[str, Any]) -> dict[str, Any]:
+        workspace_id = self._workspace_id_for_handle(handle)
+        with _generation_lock(self._layout(), workspace_id):
+            return self._release_locked(handle)
+
+    def _release_locked(self, handle: Mapping[str, Any]) -> dict[str, Any]:
         layout = self._layout()
         with transaction(_connect(layout), immediate=True) as conn:
             row = _validated_row(conn, layout, handle)
             now = time.time()
             if row["state"] == "released":
+                _raise_if_bound_dispatch_inflight(conn, row)
                 _recover_transition(conn, layout, row)
                 row = conn.execute(
                     "SELECT * FROM workspace_leases WHERE lease_id=?", (row["lease_id"],),
@@ -1110,6 +1420,7 @@ class PluginWorkspaces:
             owner_status = _owner_status(row)
             if owner_status in {"live", "unknown"}:
                 raise WorkspaceOwnershipError("workspace lease still belongs to another live process")
+            _raise_if_bound_dispatch_inflight(conn, row)
             if row["state"] == "active":
                 planned = _planned_detached_path(layout, row["workspace_id"], row["lease_id"])
                 cleanup = {
@@ -1170,6 +1481,191 @@ class PluginWorkspaces:
             ).fetchone()
             _event(conn, updated, "released", {"cleanup": cleanup})
             return _public_snapshot(conn, updated)
+
+    def _workspace_id_for_handle(self, handle: Mapping[str, Any]) -> str:
+        """Resolve the lock key from a validated handle without exposing a path."""
+        layout = self._layout()
+        with transaction(_connect(layout), immediate=True) as conn:
+            row = _validated_row(conn, layout, handle)
+            return str(row["workspace_id"])
+
+    def _workspace_id_for_reconnect(
+        self, handle: Mapping[str, Any], intent: Mapping[str, Any],
+    ) -> str:
+        """Resolve the generation lock for a request or its committed replay."""
+        layout = self._layout()
+        operation_id, output_capability = _parse_intent(intent)
+        input_lease_id, input_capability = _parse_handle(handle)
+        with transaction(_connect(layout), immediate=True) as conn:
+            try:
+                row = _validated_row(conn, layout, handle)
+                return str(row["workspace_id"])
+            except InvalidWorkspaceHandleError:
+                operation = conn.execute(
+                    "SELECT * FROM workspace_lease_operations WHERE operation_id=?",
+                    (operation_id,),
+                ).fetchone()
+                if operation is None:
+                    raise
+                if (
+                    operation["operation_kind"] != "reconnect"
+                    or operation["input_lease_id"] != input_lease_id
+                    or not hmac.compare_digest(
+                        str(operation["input_capability_hash"] or ""),
+                        _capability_hash(input_capability),
+                    )
+                    or not hmac.compare_digest(
+                        str(operation["output_capability_hash"]),
+                        _capability_hash(output_capability),
+                    )
+                    or not hmac.compare_digest(
+                        str(operation["plugin_identity_digest"]),
+                        layout.plugin_identity_digest,
+                    )
+                ):
+                    raise InvalidWorkspaceIntentError(
+                        "workspace reconnect intent does not match its predecessor"
+                    )
+                return str(operation["workspace_id"])
+
+    @contextmanager
+    def _pin_dispatch(
+        self,
+        handle: Mapping[str, Any],
+        *,
+        dispatch_kind: str,
+        minimum_ttl_seconds: float = DEFAULT_TTL_SECONDS,
+    ):
+        """Fence a synchronous dispatch against release/reconnect/reacquire.
+
+        The process-local generation lock remains held for the whole operation. The
+        database validation happens again after acquiring it, so a lifecycle change
+        between lock-key lookup and acquisition can only make the handle stale.
+        """
+        if dispatch_kind not in {"terminal", "read_file", "write_file", "edit_file"}:
+            raise ValueError("unsupported workspace-bound dispatch kind")
+        layout = self._layout()
+        workspace_id = self._workspace_id_for_handle(handle)
+        dispatch_id = str(uuid.uuid4())
+        with _generation_lock(layout, workspace_id):
+            with transaction(_connect(layout), immediate=True) as conn:
+                row = _validated_row(conn, layout, handle)
+                now = time.time()
+                if row["state"] != "active":
+                    raise InvalidWorkspaceHandleError("workspace lease is not active")
+                if float(row["expires_at"]) <= now:
+                    raise WorkspaceLeaseExpiredError(
+                        "workspace lease expired; reconnect it before use"
+                    )
+                if _owner_state(row) is not True:
+                    raise WorkspaceOwnershipError(
+                        "workspace lease is not owned by the current process"
+                    )
+                path = Path(str(row["workspace_path"]))
+                _require_workspace_directory(path)
+                generation = int(row["generation"])
+                _raise_if_bound_dispatch_inflight(conn, row)
+                # A dispatch is lease activity. Give the synchronous operation a
+                # complete validity window before releasing the database lock;
+                # cross-process lifecycle calls still apply their owner fencing.
+                dispatch_ttl = max(
+                    float(row["ttl_seconds"]), _ttl(minimum_ttl_seconds),
+                )
+                conn.execute(
+                    "UPDATE workspace_leases SET ttl_seconds=?, heartbeat_at=?, "
+                    "expires_at=?, updated_at=? WHERE lease_id=? AND state='active' "
+                    "AND generation=?",
+                    (
+                        dispatch_ttl,
+                        now,
+                        now + dispatch_ttl,
+                        now,
+                        row["lease_id"],
+                        generation,
+                    ),
+                )
+                if conn.execute("SELECT changes()").fetchone()[0] != 1:
+                    raise InvalidWorkspaceHandleError(
+                        "workspace lease changed while dispatch was pinned"
+                    )
+                pid, created, host, instance = _owner_stamp()
+                conn.execute(
+                    """INSERT INTO workspace_bound_dispatches
+                       (dispatch_id, workspace_id, lease_id, generation, dispatch_kind,
+                        owner_pid, owner_create_time, owner_host, owner_instance, started_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        dispatch_id, workspace_id, row["lease_id"], generation,
+                        dispatch_kind, pid, created, host, instance, now,
+                    ),
+                )
+                task_material = "\0".join((
+                    layout.profile_key,
+                    layout.plugin_identity_digest,
+                    workspace_id,
+                    str(generation),
+                ))
+                task_id = "plugin-workspace-" + hashlib.sha256(
+                    task_material.encode("utf-8")
+                ).hexdigest()[:32]
+            body_error: BaseException | None = None
+            try:
+                yield _PinnedWorkspace(
+                    path=path, task_id=task_id, generation=generation,
+                )
+            except BaseException as exc:
+                body_error = exc
+                raise
+            finally:
+                try:
+                    with transaction(_connect(layout), immediate=True) as conn:
+                        # A configured terminal timeout may be longer than the
+                        # conservative window reserved before dispatch. Refresh
+                        # the exact generation at completion so a successful
+                        # synchronous call always leaves a usable lease. Keep
+                        # this update and receipt deletion in one transaction:
+                        # if either fence cannot be proven, rollback preserves
+                        # the durable receipt for operator recovery.
+                        completed_at = time.time()
+                        refreshed = conn.execute(
+                            "UPDATE workspace_leases SET ttl_seconds=?, heartbeat_at=?, "
+                            "expires_at=?, updated_at=? WHERE lease_id=? AND state='active' "
+                            "AND generation=?",
+                            (
+                                dispatch_ttl,
+                                completed_at,
+                                completed_at + dispatch_ttl,
+                                completed_at,
+                                row["lease_id"],
+                                generation,
+                            ),
+                        ).rowcount
+                        if refreshed != 1:
+                            raise WorkspaceLeaseError(
+                                "workspace lease changed during dispatch completion"
+                            )
+                        deleted = conn.execute(
+                            """DELETE FROM workspace_bound_dispatches
+                               WHERE dispatch_id=? AND workspace_id=? AND lease_id=?
+                               AND generation=?""",
+                            (
+                                dispatch_id,
+                                workspace_id,
+                                row["lease_id"],
+                                generation,
+                            ),
+                        ).rowcount
+                        if deleted != 1:
+                            raise WorkspaceLeaseError(
+                                "workspace-bound dispatch receipt changed during completion"
+                            )
+                except BaseException as completion_error:
+                    if body_error is None:
+                        raise
+                    body_error.add_note(
+                        "Workspace-bound dispatch completion also failed; its durable "
+                        f"receipt was retained: {completion_error}"
+                    )
 
 
 __all__ = [

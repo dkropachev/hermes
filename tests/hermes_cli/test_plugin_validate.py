@@ -258,6 +258,44 @@ class TestCapabilityProbe:
         assert not report.ok
         assert any("not allowed during plugin registration" in failure for failure in report.failures)
 
+    def test_workspace_dispatch_and_older_host_modes_are_all_audited(self, tmp_path):
+        d = _make_plugin(
+            tmp_path,
+            manifest={
+                **BASE_MANIFEST,
+                "provides_tools": ["fallback_tool", "lease_tool", "dispatch_tool"],
+            },
+            init_py=(
+                "def register(ctx):\n"
+                "    probe = getattr(ctx, 'has_host_feature', None)\n"
+                "    if probe and probe('workspace_bound_dispatch.v1'):\n"
+                "        assert ctx.workspace_tools is not None\n"
+                "        ctx.register_tool('dispatch_tool', schema={}, handler=lambda **kw: None)\n"
+                "    elif probe and probe('workspace_leases.v1'):\n"
+                "        assert getattr(ctx, 'workspace_tools', None) is None\n"
+                "        ctx.register_tool('lease_tool', schema={}, handler=lambda **kw: None)\n"
+                "    else:\n"
+                "        ctx.register_tool('fallback_tool', schema={}, handler=lambda **kw: None)\n"
+            ),
+        )
+        report = validate_plugin_dir(d)
+        assert report.ok, report.failures
+
+    def test_workspace_dispatch_is_blocked_during_registration(self, tmp_path):
+        d = _make_plugin(
+            tmp_path,
+            manifest=dict(BASE_MANIFEST),
+            init_py=(
+                "def register(ctx):\n"
+                "    probe = getattr(ctx, 'has_host_feature', None)\n"
+                "    if probe and probe('workspace_bound_dispatch.v1'):\n"
+                "        ctx.workspace_tools.terminal({}, 'pwd')\n"
+            ),
+        )
+        report = validate_plugin_dir(d)
+        assert not report.ok
+        assert any("not allowed during plugin registration" in failure for failure in report.failures)
+
     def test_direct_feature_probe_is_rejected_by_legacy_mode(self, tmp_path):
         d = _make_plugin(
             tmp_path,
@@ -270,6 +308,39 @@ class TestCapabilityProbe:
         report = validate_plugin_dir(d)
         assert not report.ok
         assert any("has_host_feature" in failure for failure in report.failures)
+
+    def test_required_dispatch_host_skips_excluded_legacy_modes(self, tmp_path):
+        d = _make_plugin(
+            tmp_path,
+            manifest={
+                **BASE_MANIFEST,
+                "requires_hermes": ">=0.21.4",
+                "provides_tools": ["dispatch_tool"],
+            },
+            init_py=(
+                "from hermes_cli.plugin_workspace_dispatch import HOST_FEATURE\n"
+                "def register(ctx):\n"
+                "    assert ctx.has_host_feature(HOST_FEATURE)\n"
+                "    assert ctx.workspace_tools is not None\n"
+                "    ctx.register_tool('dispatch_tool', schema={}, handler=lambda **kw: None)\n"
+            ),
+        )
+        report = validate_plugin_dir(d)
+        assert report.ok, report.failures
+
+    def test_ungated_dispatch_import_still_fails_legacy_mode(self, tmp_path):
+        d = _make_plugin(
+            tmp_path,
+            manifest=dict(BASE_MANIFEST),
+            init_py=(
+                "from hermes_cli.plugin_workspace_dispatch import HOST_FEATURE\n"
+                "def register(ctx):\n"
+                "    assert ctx.has_host_feature(HOST_FEATURE)\n"
+            ),
+        )
+        report = validate_plugin_dir(d)
+        assert not report.ok
+        assert any("older host" in failure for failure in report.failures)
 
 
 class TestModelProviderKind:
