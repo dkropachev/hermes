@@ -1608,20 +1608,64 @@ class PluginWorkspaces:
                 task_id = "plugin-workspace-" + hashlib.sha256(
                     task_material.encode("utf-8")
                 ).hexdigest()[:32]
+            body_error: BaseException | None = None
             try:
                 yield _PinnedWorkspace(
                     path=path, task_id=task_id, generation=generation,
                 )
+            except BaseException as exc:
+                body_error = exc
+                raise
             finally:
-                with transaction(_connect(layout), immediate=True) as conn:
-                    deleted = conn.execute(
-                        "DELETE FROM workspace_bound_dispatches WHERE dispatch_id=?",
-                        (dispatch_id,),
-                    ).rowcount
-                    if deleted != 1:
-                        raise WorkspaceLeaseError(
-                            "workspace-bound dispatch receipt changed during completion"
-                        )
+                try:
+                    with transaction(_connect(layout), immediate=True) as conn:
+                        # A configured terminal timeout may be longer than the
+                        # conservative window reserved before dispatch. Refresh
+                        # the exact generation at completion so a successful
+                        # synchronous call always leaves a usable lease. Keep
+                        # this update and receipt deletion in one transaction:
+                        # if either fence cannot be proven, rollback preserves
+                        # the durable receipt for operator recovery.
+                        completed_at = time.time()
+                        refreshed = conn.execute(
+                            "UPDATE workspace_leases SET ttl_seconds=?, heartbeat_at=?, "
+                            "expires_at=?, updated_at=? WHERE lease_id=? AND state='active' "
+                            "AND generation=?",
+                            (
+                                dispatch_ttl,
+                                completed_at,
+                                completed_at + dispatch_ttl,
+                                completed_at,
+                                row["lease_id"],
+                                generation,
+                            ),
+                        ).rowcount
+                        if refreshed != 1:
+                            raise WorkspaceLeaseError(
+                                "workspace lease changed during dispatch completion"
+                            )
+                        deleted = conn.execute(
+                            """DELETE FROM workspace_bound_dispatches
+                               WHERE dispatch_id=? AND workspace_id=? AND lease_id=?
+                               AND generation=?""",
+                            (
+                                dispatch_id,
+                                workspace_id,
+                                row["lease_id"],
+                                generation,
+                            ),
+                        ).rowcount
+                        if deleted != 1:
+                            raise WorkspaceLeaseError(
+                                "workspace-bound dispatch receipt changed during completion"
+                            )
+                except BaseException as completion_error:
+                    if body_error is None:
+                        raise
+                    body_error.add_note(
+                        "Workspace-bound dispatch completion also failed; its durable "
+                        f"receipt was retained: {completion_error}"
+                    )
 
 
 __all__ = [

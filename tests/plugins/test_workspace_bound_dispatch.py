@@ -277,6 +277,75 @@ def test_dispatch_pin_renews_a_complete_operation_window(
     )
 
 
+def test_dispatch_completion_refreshes_lease_after_it_expires_during_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.terminal_tool as terminal_tool
+
+    home = tmp_path / "home"
+    ctx = _context(home)
+    handle = _acquire(ctx, "expired-during-call")
+    db = home / "plugin-data" / "pr-review" / "workspace-leases.db"
+    calls = 0
+
+    def terminal_that_outlives_window(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    "UPDATE workspace_leases SET expires_at=0 WHERE lease_id=?",
+                    (handle["lease_id"],),
+                )
+        return json.dumps({"exit_code": 0})
+
+    monkeypatch.setattr(
+        terminal_tool,
+        "terminal_tool",
+        terminal_that_outlives_window,
+    )
+
+    ctx.workspace_tools.terminal(handle, "first")
+    ctx.workspace_tools.terminal(handle, "second")
+    assert calls == 2
+
+
+def test_failed_completion_keeps_receipt_and_preserves_body_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.terminal_tool as terminal_tool
+
+    home = tmp_path / "home"
+    ctx = _context(home)
+    handle = _acquire(ctx, "failed-completion")
+    db = home / "plugin-data" / "pr-review" / "workspace-leases.db"
+
+    def failing_terminal(*args, **kwargs):
+        with sqlite3.connect(db) as conn:
+            conn.execute(
+                "UPDATE workspace_leases SET state='releasing' WHERE lease_id=?",
+                (handle["lease_id"],),
+            )
+        raise RuntimeError("simulated terminal body failure")
+
+    monkeypatch.setattr(terminal_tool, "terminal_tool", failing_terminal)
+    with pytest.raises(RuntimeError, match="simulated terminal body failure") as raised:
+        ctx.workspace_tools.terminal(handle, "pwd")
+
+    assert any(
+        "durable receipt was retained" in note
+        for note in getattr(raised.value, "__notes__", ())
+    )
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM workspace_bound_dispatches WHERE lease_id=?",
+            (handle["lease_id"],),
+        ).fetchone()[0] == 1
+    assert isinstance(raised.value, RuntimeError)
+
+
 def test_dispatch_receipt_is_cleared_after_success_and_exception(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
