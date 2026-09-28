@@ -771,24 +771,39 @@ def _resolve_or_none(filepath: str, task_id: str) -> str | None:
 
 
 def _write_precheck_error(paths: list[str], content_paths: list[str], task_id: str,
-                          cross_profile: bool) -> str | None:
+                          cross_profile: bool, *,
+                          resolved_paths: dict[str, str] | None = None,
+                          file_ops=None) -> str | None:
     """Run the shared write/patch guards in order; return the first error string.
 
     Order matters: hard denies (sensitive path, mirror) and the corruption
     guard run before anything that could prompt the user, and ONE approval
     prompt covers every path of a multi-file patch.
     """
+    host_local = file_ops is not None and _file_ops_uses_host_paths(file_ops)
     for p in paths:
-        err = _check_sensitive_path(p, task_id) or (
-            None if cross_profile else _check_cross_profile_path(p, task_id))
+        resolved = (resolved_paths or {}).get(p)
+        err = _check_sensitive_path(p, task_id, resolved_path=resolved) or (
+            None if cross_profile else _check_cross_profile_path(
+                p,
+                task_id,
+                resolved_path=resolved,
+                host_local=host_local,
+            ))
         if err:
             return err
     for p in content_paths:
-        err = _check_binary_document_write(p, task_id)
+        err = _check_binary_document_write(
+            p,
+            task_id,
+            resolved_path=(resolved_paths or {}).get(p),
+        )
         if err:
             return err
-    return (_check_protected_instruction_write(paths, task_id)
-            or _check_approval_required_write(paths, task_id))
+    return (_check_protected_instruction_write(
+                paths, task_id, resolved_paths=resolved_paths)
+            or _check_approval_required_write(
+                paths, task_id, resolved_paths=resolved_paths))
 
 
 def _edit_warnings(paths: list[str], path_to_resolved: dict, task_id: str) -> list[str]:
@@ -874,12 +889,21 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     (unadvertised in the schema; the mirror rejection error teaches it — the
     cross-PROFILE guard it was named for no longer exists).
     """
+    resolved_paths = {path: _resolved_path} if _resolved_path is not None else None
+    host_local = _file_ops is not None and _file_ops_uses_host_paths(_file_ops)
     # write_file checks the binary-document guard before the mirror guard.
-    err = (_check_sensitive_path(path, task_id)
-           or _check_binary_document_write(path, task_id)
-           or _check_protected_instruction_write([path], task_id)
-           or _check_approval_required_write([path], task_id)
-           or (None if cross_profile else _check_cross_profile_path(path, task_id)))
+    err = (_check_sensitive_path(path, task_id, resolved_path=_resolved_path)
+           or _check_binary_document_write(path, task_id, resolved_path=_resolved_path)
+           or _check_protected_instruction_write(
+               [path], task_id, resolved_paths=resolved_paths)
+           or _check_approval_required_write(
+               [path], task_id, resolved_paths=resolved_paths)
+           or (None if cross_profile else _check_cross_profile_path(
+               path,
+               task_id,
+               resolved_path=_resolved_path,
+               host_local=host_local,
+           )))
     if not err and _is_internal_file_tool_content(content):
         err = ("Refusing to write internal read_file display text as file content. "
                "Strip read_file line-number prefixes or reconstruct the intended "
@@ -980,7 +1004,19 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             return collected
         _paths_to_check += collected[0]
         _content_write_paths += collected[1]
-    precheck_err = _write_precheck_error(_paths_to_check, _content_write_paths, task_id, cross_profile)
+    resolved_paths = (
+        {path: _resolved_path}
+        if _resolved_path is not None and mode == "replace" and path is not None
+        else None
+    )
+    precheck_err = _write_precheck_error(
+        _paths_to_check,
+        _content_write_paths,
+        task_id,
+        cross_profile,
+        resolved_paths=resolved_paths,
+        file_ops=_file_ops,
+    )
     if precheck_err:
         return tool_error(precheck_err)
     try:
