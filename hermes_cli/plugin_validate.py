@@ -315,7 +315,7 @@ class RecordingWorkspaces:
     def _blocked(self, *args, **kwargs):
         raise RuntimeError("workspace lifecycle calls are not allowed during plugin registration")
 
-    acquire = renew = reconnect = inspect = release = _blocked
+    acquire = renew = reconnect = inspect = release = recover_interrupted_dispatch = _blocked
 
 
 class RecordingWorkspaceTools:

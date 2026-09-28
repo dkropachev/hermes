@@ -335,6 +335,9 @@ handle = ctx.workspaces.acquire(
 )
 print("HANDLE=" + json.dumps(handle), flush=True)
 with ctx.workspaces._pin_dispatch(handle, dispatch_kind="terminal"):
+    Path(ctx.workspaces.inspect(handle)["path"], "partial.txt").write_text(
+        "preserve this interrupted output", encoding="utf-8",
+    )
     print("PINNED", flush=True)
     os._exit(0)
 """
@@ -368,7 +371,55 @@ with ctx.workspaces._pin_dispatch(handle, dispatch_kind="terminal"):
     with pytest.raises(WorkspaceInUseError, match="operator recovery"):
         ctx.workspaces.acquire("orphaned", intent=ctx.workspaces.new_intent())
 
-    assert Path(home, "plugin-data/pr-review/workspaces/orphaned").is_dir()
+    canonical = Path(home, "plugin-data/pr-review/workspaces/orphaned")
+    assert canonical.is_dir()
+    with pytest.raises(ValueError, match="operator confirmation"):
+        ctx.workspaces.recover_interrupted_dispatch(
+            handle,
+            operator_confirmed_quiescent=False,
+            reason="the child process was checked",
+        )
+    assert canonical.is_dir()
+
+    recovered = ctx.workspaces.recover_interrupted_dispatch(
+        handle,
+        operator_confirmed_quiescent=True,
+        reason="operator verified that the foreground child no longer exists",
+    )
+    assert recovered["state"] == "released"
+    assert recovered["cleanup"]["disposition"] == "quarantined"
+    assert recovered["cleanup"]["operator_confirmed_quiescent"] is True
+    quarantine = Path(recovered["cleanup"]["quarantine_path"])
+    assert quarantine.parent == home / "plugin-data/pr-review/workspace-quarantine"
+    assert (quarantine / "partial.txt").read_text(encoding="utf-8") == (
+        "preserve this interrupted output"
+    )
+    assert not canonical.exists()
+    assert recovered["events"][-2]["type"] == "dispatch_recovery_started"
+    assert recovered["events"][-1]["type"] == "dispatch_recovered"
+    assert recovered["events"][-1]["details"]["reason"].startswith("operator verified")
+    assert recovered["events"][-1]["details"]["resolved_dispatch_receipts"][0][
+        "dispatch_kind"
+    ] == "terminal"
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM workspace_bound_dispatches"
+        ).fetchone()[0] == 0
+
+    # A lost response is harmless, and normal same-name acquisition creates a
+    # fresh directory without reusing the quarantined interrupted contents.
+    assert ctx.workspaces.recover_interrupted_dispatch(
+        handle,
+        operator_confirmed_quiescent=True,
+        reason="retry after a lost response",
+    )["state"] == "released"
+    successor = ctx.workspaces.acquire(
+        "orphaned", intent=ctx.workspaces.new_intent(), ttl_seconds=60,
+    )
+    successor_path = Path(ctx.workspaces.inspect(successor)["path"])
+    assert successor_path == canonical
+    assert successor_path.is_dir()
+    assert not (successor_path / "partial.txt").exists()
 
 
 def test_canonical_file_operations_round_trip_in_workspace(tmp_path: Path) -> None:
