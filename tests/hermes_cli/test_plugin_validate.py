@@ -309,6 +309,39 @@ class TestCapabilityProbe:
         assert not report.ok
         assert any("has_host_feature" in failure for failure in report.failures)
 
+    def test_required_dispatch_host_skips_excluded_legacy_modes(self, tmp_path):
+        d = _make_plugin(
+            tmp_path,
+            manifest={
+                **BASE_MANIFEST,
+                "requires_hermes": ">=0.21.4",
+                "provides_tools": ["dispatch_tool"],
+            },
+            init_py=(
+                "from hermes_cli.plugin_workspace_dispatch import HOST_FEATURE\n"
+                "def register(ctx):\n"
+                "    assert ctx.has_host_feature(HOST_FEATURE)\n"
+                "    assert ctx.workspace_tools is not None\n"
+                "    ctx.register_tool('dispatch_tool', schema={}, handler=lambda **kw: None)\n"
+            ),
+        )
+        report = validate_plugin_dir(d)
+        assert report.ok, report.failures
+
+    def test_ungated_dispatch_import_still_fails_legacy_mode(self, tmp_path):
+        d = _make_plugin(
+            tmp_path,
+            manifest=dict(BASE_MANIFEST),
+            init_py=(
+                "from hermes_cli.plugin_workspace_dispatch import HOST_FEATURE\n"
+                "def register(ctx):\n"
+                "    assert ctx.has_host_feature(HOST_FEATURE)\n"
+            ),
+        )
+        report = validate_plugin_dir(d)
+        assert not report.ok
+        assert any("older host" in failure for failure in report.failures)
+
 
 class TestModelProviderKind:
     def test_import_time_register_provider_is_the_entry_point(self, tmp_path):

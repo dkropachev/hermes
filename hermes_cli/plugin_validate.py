@@ -32,6 +32,8 @@ _CONFIG_TYPES = {
 }
 _PROBE_TIMEOUT = 30
 _PROBE_SENTINEL = "HERMES_VALIDATE_JSON:"
+_WORKSPACE_LEASES_INTRODUCED = (0, 21, 4)
+_WORKSPACE_BOUND_DISPATCH_INTRODUCED = (0, 21, 4)
 
 
 @dataclass
@@ -121,6 +123,36 @@ def _check_requires_hermes(report: ValidationReport, manifest: dict) -> None:
             f"requires_hermes spec {spec!r} does not parse "
             "(expected e.g. \">=0.19\" or \">=0.19, <1.0\")",
         )
+
+
+def _requires_hermes_guarantees_at_least(
+    manifest: dict, introduced: tuple[int, int, int]
+) -> bool:
+    """Whether a valid manifest excludes every host older than ``introduced``.
+
+    This intentionally recognizes only an explicit lower/equal constraint whose
+    target is already at or above the feature version.  In particular, upper
+    bounds and ``!=`` clauses cannot justify skipping an older-host probe, and we
+    do not try to infer the next release after a strict lower bound.
+    """
+    from hermes_cli.plugins_manifest import _VERSION_COMPARATOR_RE, _version_tuple
+
+    spec = str(manifest.get("requires_hermes") or "").strip()
+    if not spec or not _requires_hermes_spec_valid(spec):
+        return False
+    for clause in filter(None, (part.strip() for part in spec.split(","))):
+        match = _VERSION_COMPARATOR_RE.match(clause)
+        operation, target = (
+            (match.group(1), match.group(2)) if match else (">=", clause)
+        )
+        parsed = _version_tuple(target)
+        if (
+            parsed is not None
+            and operation in {">=", ">", "=="}
+            and parsed >= introduced
+        ):
+            return True
+    return False
 
 
 def _check_config_spec(report: ValidationReport, manifest: dict) -> None:
@@ -484,38 +516,52 @@ def _check_capabilities(
         report.add("capability probe", True, "skipped (no __init__.py)")
         return None
 
-    recorded, error = _run_capability_probe(plugin_dir, manifest)
-    if recorded is None:
-        report.add("capability probe", False, error)
-        return None
-    if str(manifest.get("kind") or "") != "model-provider":
-        lease_enabled, lease_error = _run_capability_probe(
-            plugin_dir, manifest, workspace_leases=True,
-        )
-        if lease_enabled is None:
-            report.add(
-                "capability probe", False,
-                f"workspace_leases.v1 mode: {lease_error}",
-            )
-            return None
-        dispatch_enabled, dispatch_error = _run_capability_probe(
+    requires_leases = _requires_hermes_guarantees_at_least(
+        manifest, _WORKSPACE_LEASES_INTRODUCED
+    )
+    requires_dispatch = _requires_hermes_guarantees_at_least(
+        manifest, _WORKSPACE_BOUND_DISPATCH_INTRODUCED
+    )
+    if str(manifest.get("kind") or "") == "model-provider":
+        # Provider plugins register at import and are never handed a
+        # PluginContext, so feature-mode probing does not apply to them.
+        modes = [("legacy", False, False)]
+    elif requires_dispatch:
+        modes = [("workspace_bound_dispatch.v1", True, True)]
+    elif requires_leases:
+        modes = [
+            ("workspace_leases.v1", True, False),
+            ("workspace_bound_dispatch.v1", True, True),
+        ]
+    else:
+        modes = [
+            ("legacy", False, False),
+            ("workspace_leases.v1", True, False),
+            ("workspace_bound_dispatch.v1", True, True),
+        ]
+
+    recorded: Optional[dict] = None
+    for mode_name, workspace_leases, workspace_dispatch in modes:
+        mode_recorded, error = _run_capability_probe(
             plugin_dir,
             manifest,
-            workspace_leases=True,
-            workspace_dispatch=True,
+            workspace_leases=workspace_leases,
+            workspace_dispatch=workspace_dispatch,
         )
-        if dispatch_enabled is None:
-            report.add(
-                "capability probe", False,
-                f"workspace_bound_dispatch.v1 mode: {dispatch_error}",
-            )
+        if mode_recorded is None:
+            detail = error if mode_name == "legacy" else f"{mode_name} mode: {error}"
+            report.add("capability probe", False, detail)
             return None
+        if recorded is None:
+            recorded = mode_recorded
+            continue
         for category in ("tools", "hooks", "middleware", "commands", "providers"):
             recorded[category] = sorted(
                 set(recorded.get(category) or [])
-                | set(lease_enabled.get(category) or [])
-                | set(dispatch_enabled.get(category) or [])
+                | set(mode_recorded.get(category) or [])
             )
+
+    assert recorded is not None
     if recorded.get("providers"):
         report.add(
             "capability probe", True,
