@@ -27,7 +27,13 @@ def _relative_target(root: Path, relative_path: str) -> Path:
     if drive or normalized.startswith("/"):
         raise ValueError("relative_path must not be absolute, drive-qualified, or UNC")
     parts = tuple(part for part in normalized.split("/") if part not in {"", "."})
-    if not parts or any(part == ".." for part in parts):
+    has_unsafe_component = any(
+        part == ".."
+        or bool(ntpath.splitdrive(part)[0])
+        or ntpath.isabs(part)
+        for part in parts
+    )
+    if not parts or has_unsafe_component:
         raise ValueError("relative_path must stay below the leased workspace")
     return root.joinpath(*parts)
 

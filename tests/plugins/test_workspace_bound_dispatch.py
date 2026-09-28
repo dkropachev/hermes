@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 
@@ -115,6 +115,9 @@ def test_dispatch_uses_host_derived_paths_and_canonical_handlers(
         "C:\\temp\\out",
         "C:relative",
         "\\\\server\\share\\out",
+        "safe/D:/outside.txt",
+        "safe/D:\\outside.txt",
+        "safe/D:outside.txt",
         "../out",
         "a/../../out",
     ],
@@ -127,6 +130,19 @@ def test_file_paths_reject_absolute_drive_unc_and_traversal(
     handle = _acquire(ctx)
     with pytest.raises(ValueError, match="relative_path|leased workspace"):
         ctx.workspace_tools.read_file(handle, bad_path)
+
+
+def test_relative_target_preserves_windows_workspace_drive() -> None:
+    from hermes_cli.plugin_workspace_dispatch import _relative_target
+
+    root = PureWindowsPath("C:/leased-workspace")
+    assert _relative_target(root, "src\\package/./main.py") == (
+        root / "src" / "package" / "main.py"
+    )
+
+    for bad_path in ("safe/D:/outside.txt", "safe/D:\\outside.txt"):
+        with pytest.raises(ValueError, match="leased workspace"):
+            _relative_target(root, bad_path)
 
 
 @pytest.mark.parametrize(
