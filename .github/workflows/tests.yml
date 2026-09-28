@@ -146,11 +146,10 @@ jobs:
           source .venv/bin/activate
           scripts/run_tests.sh --files '${{ matrix.slice.files }}'
         env:
-          # A standard public Linux runner has four cores. One pytest file per
-          # core avoids the scheduling starvation seen with the runner's
-          # cpu_count*2 default, while the 12 slices retain suite-level
-          # parallelism.
-          HERMES_TEST_WORKERS: 4
+          # A standard public Linux runner has four cores. Cold pytest imports
+          # also spawn threads and child processes, so keep the suite's
+          # measured half-core policy; the 12 slices provide outer parallelism.
+          HERMES_TEST_WORKERS: 2
           # A cold fork has no healthy-duration cache yet. Give known-heavy
           # files the same bounded first-run headroom that cached runs earn.
           HERMES_TEST_FILE_TIMEOUT: 600
