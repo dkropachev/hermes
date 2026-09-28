@@ -101,15 +101,16 @@ jobs:
         #
         # The trailing extras beyond all/dev are the lazy-install features
         # (tools/lazy_deps.py) that tests exercise for real: provider.anthropic,
-        # stt/tts.mistral, image.fal, terminal.modal, terminal.daytona,
-        # memory.hindsight, search.parallel. The hermetic test env forbids
+        # provider.bedrock, stt/tts.mistral, image.fal, terminal.modal,
+        # terminal.daytona, memory.hindsight, search.parallel. The hermetic
+        # test env forbids
         # mid-run pip installs (HERMES_DISABLE_LAZY_INSTALLS=1 in
         # tests/conftest.py), so the SDKs those tests need must be in the
         # venv up front — resolved from uv.lock like everything else, which
         # also honors the exact supply-chain pins these extras carry.
         uses: ./.github/actions/retry
         with:
-          command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
+          command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra bedrock --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
 
       - name: Minimize uv cache
         # Optimized for CI: prunes pre-built wheels that are cheap to
@@ -145,6 +146,14 @@ jobs:
           source .venv/bin/activate
           scripts/run_tests.sh --files '${{ matrix.slice.files }}'
         env:
+          # A standard public Linux runner has four cores. One pytest file per
+          # core avoids the scheduling starvation seen with the runner's
+          # cpu_count*2 default, while the 12 slices retain suite-level
+          # parallelism.
+          HERMES_TEST_WORKERS: 4
+          # A cold fork has no healthy-duration cache yet. Give known-heavy
+          # files the same bounded first-run headroom that cached runs earn.
+          HERMES_TEST_FILE_TIMEOUT: 600
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
@@ -283,7 +292,7 @@ jobs:
         # in the venv up front.
         uses: ./.github/actions/retry
         with:
-          command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
+          command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra bedrock --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
 
       - name: Minimize uv cache
         # Optimized for CI: prunes pre-built wheels that are cheap to
