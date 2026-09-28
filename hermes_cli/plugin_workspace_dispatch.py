@@ -83,6 +83,7 @@ class PluginWorkspaceTools:
                 )
         with self._workspaces._pin_dispatch(
             handle,
+            dispatch_kind="terminal",
             minimum_ttl_seconds=max(DEFAULT_TTL_SECONDS, FOREGROUND_MAX_TIMEOUT),
         ) as pinned:
             with _profile_runtime(self._workspaces._home_path):
@@ -105,7 +106,9 @@ class PluginWorkspaceTools:
         offset: int = 1,
         limit: int = 2000,
     ) -> str:
-        with self._workspaces._pin_dispatch(handle) as pinned:
+        with self._workspaces._pin_dispatch(
+            handle, dispatch_kind="read_file"
+        ) as pinned:
             target = _relative_target(pinned.path, relative_path)
             with (
                 _profile_runtime(self._workspaces._home_path),
@@ -130,7 +133,9 @@ class PluginWorkspaceTools:
     ) -> str:
         if not isinstance(content, str):
             raise TypeError("content must be a string")
-        with self._workspaces._pin_dispatch(handle) as pinned:
+        with self._workspaces._pin_dispatch(
+            handle, dispatch_kind="write_file"
+        ) as pinned:
             target = _relative_target(pinned.path, relative_path)
             with (
                 _profile_runtime(self._workspaces._home_path),
@@ -158,7 +163,9 @@ class PluginWorkspaceTools:
             raise TypeError("old_string and new_string must be strings")
         if not isinstance(replace_all, bool):
             raise TypeError("replace_all must be a boolean")
-        with self._workspaces._pin_dispatch(handle) as pinned:
+        with self._workspaces._pin_dispatch(
+            handle, dispatch_kind="edit_file"
+        ) as pinned:
             target = _relative_target(pinned.path, relative_path)
             with (
                 _profile_runtime(self._workspaces._home_path),

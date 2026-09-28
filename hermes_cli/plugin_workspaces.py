@@ -250,6 +250,21 @@ def _initialize(conn) -> None:
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS workspace_bound_dispatches (
+            dispatch_id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            lease_id TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            dispatch_kind TEXT NOT NULL
+                CHECK (dispatch_kind IN ('terminal', 'read_file', 'write_file', 'edit_file')),
+            owner_pid INTEGER NOT NULL,
+            owner_create_time REAL,
+            owner_host TEXT NOT NULL,
+            owner_instance TEXT NOT NULL,
+            started_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS workspace_bound_dispatches_workspace
+            ON workspace_bound_dispatches(workspace_id, generation);
         CREATE TABLE IF NOT EXISTS workspace_lease_metadata (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
@@ -433,6 +448,30 @@ def _validated_row(conn, layout: _Layout, handle: Mapping[str, Any]):
     if os.path.normcase(str(expected)) != os.path.normcase(str(row["workspace_path"])):
         raise InvalidWorkspaceHandleError("workspace lease has an invalid persisted path")
     return row
+
+
+def _raise_if_bound_dispatch_inflight(conn, row: Mapping[str, Any]) -> None:
+    """Fence lifecycle reuse after a dispatch owner exits without unwinding.
+
+    Bound dispatch is synchronous, so a surviving receipt means the owning host
+    process did not execute its ``finally`` block. Its foreground child may still
+    be writing below the workspace. Only explicit operator recovery may remove
+    this conservative fence.
+    """
+    dispatch = conn.execute(
+        """SELECT dispatch_id, dispatch_kind, lease_id, generation, owner_pid,
+                  owner_create_time, started_at
+           FROM workspace_bound_dispatches
+           WHERE workspace_id=? ORDER BY started_at, dispatch_id LIMIT 1""",
+        (row["workspace_id"],),
+    ).fetchone()
+    if dispatch is None:
+        return
+    raise WorkspaceInUseError(
+        f"workspace {row['workspace_id']!r} has an unfinished "
+        f"{dispatch['dispatch_kind']} workspace-bound dispatch; "
+        "operator recovery is required before its lease can change"
+    )
 
 
 def _validate_operation(
@@ -786,6 +825,7 @@ class PluginWorkspaces:
                     raise WorkspaceInUseError(
                         f"workspace {workspace_id!r} is being prepared by another live owner"
                     )
+                _raise_if_bound_dispatch_inflight(conn, current)
                 ttl = float(operation["ttl_seconds"])
                 generation = int(current["generation"])
                 cleanup = json.loads(current["cleanup_json"] or "{}")
@@ -840,6 +880,7 @@ class PluginWorkspaces:
                                 f"workspace {workspace_id!r} is already owned by a live process"
                             )
                         reclaimed = "owner_dead"
+                    _raise_if_bound_dispatch_inflight(conn, old)
                     recovered = _recover_transition(conn, layout, old)
                 cleanup = {
                     "classification": "pending", "disposition": "preparing",
@@ -1091,6 +1132,7 @@ class PluginWorkspaces:
             owner, expired = _owner_state(row), float(row["expires_at"]) <= now
             if owner is None:
                 raise WorkspaceOwnershipError("workspace lease still belongs to another live process")
+            _raise_if_bound_dispatch_inflight(conn, row)
             ttl = _ttl(row["ttl_seconds"] if ttl_seconds is None else ttl_seconds)
             _event(conn, row, "reconnect_started", {
                 "operation_id": operation_id, "expired": expired,
@@ -1160,6 +1202,7 @@ class PluginWorkspaces:
             row = _validated_row(conn, layout, handle)
             now = time.time()
             if row["state"] == "released":
+                _raise_if_bound_dispatch_inflight(conn, row)
                 _recover_transition(conn, layout, row)
                 row = conn.execute(
                     "SELECT * FROM workspace_leases WHERE lease_id=?", (row["lease_id"],),
@@ -1170,6 +1213,7 @@ class PluginWorkspaces:
             owner_status = _owner_status(row)
             if owner_status in {"live", "unknown"}:
                 raise WorkspaceOwnershipError("workspace lease still belongs to another live process")
+            _raise_if_bound_dispatch_inflight(conn, row)
             if row["state"] == "active":
                 planned = _planned_detached_path(layout, row["workspace_id"], row["lease_id"])
                 cleanup = {
@@ -1282,6 +1326,7 @@ class PluginWorkspaces:
         self,
         handle: Mapping[str, Any],
         *,
+        dispatch_kind: str,
         minimum_ttl_seconds: float = DEFAULT_TTL_SECONDS,
     ):
         """Fence a synchronous dispatch against release/reconnect/reacquire.
@@ -1290,8 +1335,11 @@ class PluginWorkspaces:
         database validation happens again after acquiring it, so a lifecycle change
         between lock-key lookup and acquisition can only make the handle stale.
         """
+        if dispatch_kind not in {"terminal", "read_file", "write_file", "edit_file"}:
+            raise ValueError("unsupported workspace-bound dispatch kind")
         layout = self._layout()
         workspace_id = self._workspace_id_for_handle(handle)
+        dispatch_id = str(uuid.uuid4())
         with _generation_lock(layout, workspace_id):
             with transaction(_connect(layout), immediate=True) as conn:
                 row = _validated_row(conn, layout, handle)
@@ -1309,6 +1357,7 @@ class PluginWorkspaces:
                 path = Path(str(row["workspace_path"]))
                 _require_workspace_directory(path)
                 generation = int(row["generation"])
+                _raise_if_bound_dispatch_inflight(conn, row)
                 # A dispatch is lease activity. Give the synchronous operation a
                 # complete validity window before releasing the database lock;
                 # cross-process lifecycle calls still apply their owner fencing.
@@ -1332,6 +1381,17 @@ class PluginWorkspaces:
                     raise InvalidWorkspaceHandleError(
                         "workspace lease changed while dispatch was pinned"
                     )
+                pid, created, host, instance = _owner_stamp()
+                conn.execute(
+                    """INSERT INTO workspace_bound_dispatches
+                       (dispatch_id, workspace_id, lease_id, generation, dispatch_kind,
+                        owner_pid, owner_create_time, owner_host, owner_instance, started_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        dispatch_id, workspace_id, row["lease_id"], generation,
+                        dispatch_kind, pid, created, host, instance, now,
+                    ),
+                )
                 task_material = "\0".join((
                     layout.profile_key,
                     layout.plugin_identity_digest,
@@ -1341,9 +1401,20 @@ class PluginWorkspaces:
                 task_id = "plugin-workspace-" + hashlib.sha256(
                     task_material.encode("utf-8")
                 ).hexdigest()[:32]
-            yield _PinnedWorkspace(
-                path=path, task_id=task_id, generation=generation,
-            )
+            try:
+                yield _PinnedWorkspace(
+                    path=path, task_id=task_id, generation=generation,
+                )
+            finally:
+                with transaction(_connect(layout), immediate=True) as conn:
+                    deleted = conn.execute(
+                        "DELETE FROM workspace_bound_dispatches WHERE dispatch_id=?",
+                        (dispatch_id,),
+                    ).rowcount
+                    if deleted != 1:
+                        raise WorkspaceLeaseError(
+                            "workspace-bound dispatch receipt changed during completion"
+                        )
 
 
 __all__ = [

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -14,9 +17,13 @@ import pytest
 from hermes_constants import hermes_home_key
 from hermes_cli.plugin_workspaces import (
     InvalidWorkspaceHandleError,
+    WorkspaceInUseError,
     WorkspaceLeaseExpiredError,
 )
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _context(home: Path, plugin_id: str = "pr-review") -> PluginContext:
@@ -268,6 +275,100 @@ def test_dispatch_pin_renews_a_complete_operation_window(
         snapshot["expiresAt"] - snapshot["heartbeatAt"]
         >= terminal_tool.FOREGROUND_MAX_TIMEOUT
     )
+
+
+def test_dispatch_receipt_is_cleared_after_success_and_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tools.terminal_tool as terminal_tool
+
+    home = tmp_path / "home"
+    ctx = _context(home)
+    handle = _acquire(ctx, "receipt-cleanup")
+    db = home / "plugin-data" / "pr-review" / "workspace-leases.db"
+
+    def receipt_count() -> int:
+        with sqlite3.connect(db) as conn:
+            return int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM workspace_bound_dispatches"
+                ).fetchone()[0]
+            )
+
+    def successful_terminal(*args, **kwargs):
+        assert receipt_count() == 1
+        return json.dumps({"exit_code": 0})
+
+    monkeypatch.setattr(terminal_tool, "terminal_tool", successful_terminal)
+    ctx.workspace_tools.terminal(handle, "pwd")
+    assert receipt_count() == 0
+
+    def failing_terminal(*args, **kwargs):
+        assert receipt_count() == 1
+        raise RuntimeError("simulated terminal failure")
+
+    monkeypatch.setattr(terminal_tool, "terminal_tool", failing_terminal)
+    with pytest.raises(RuntimeError, match="simulated terminal failure"):
+        ctx.workspace_tools.terminal(handle, "pwd")
+    assert receipt_count() == 0
+
+
+def test_crashed_dispatch_owner_fences_workspace_lifecycle(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    script = r"""
+import json
+import os
+import sys
+from pathlib import Path
+from hermes_constants import hermes_home_key
+from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+
+home = Path(sys.argv[1])
+home.mkdir(parents=True, exist_ok=True)
+ctx = PluginContext(
+    PluginManifest(name="pr-review", key="pr-review"),
+    PluginManager(scope_key=hermes_home_key(home)),
+)
+handle = ctx.workspaces.acquire(
+    "orphaned", intent=ctx.workspaces.new_intent(), ttl_seconds=60,
+)
+print("HANDLE=" + json.dumps(handle), flush=True)
+with ctx.workspaces._pin_dispatch(handle, dispatch_kind="terminal"):
+    print("PINNED", flush=True)
+    os._exit(0)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(home)],
+        cwd=PROJECT_ROOT,
+        env=os.environ.copy(),
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=True,
+    )
+    lines = completed.stdout.splitlines()
+    encoded_handle = next(
+        line.removeprefix("HANDLE=") for line in lines if line.startswith("HANDLE=")
+    )
+    handle = json.loads(encoded_handle)
+    assert "PINNED" in lines
+
+    ctx = _context(home)
+    db = home / "plugin-data" / "pr-review" / "workspace-leases.db"
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT dispatch_kind FROM workspace_bound_dispatches"
+        ).fetchone() == ("terminal",)
+
+    with pytest.raises(WorkspaceInUseError, match="operator recovery"):
+        ctx.workspaces.reconnect(handle, intent=ctx.workspaces.new_intent())
+    with pytest.raises(WorkspaceInUseError, match="operator recovery"):
+        ctx.workspaces.release(handle)
+    with pytest.raises(WorkspaceInUseError, match="operator recovery"):
+        ctx.workspaces.acquire("orphaned", intent=ctx.workspaces.new_intent())
+
+    assert Path(home, "plugin-data/pr-review/workspaces/orphaned").is_dir()
 
 
 def test_canonical_file_operations_round_trip_in_workspace(tmp_path: Path) -> None:
