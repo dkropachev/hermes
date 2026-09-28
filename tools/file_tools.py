@@ -615,7 +615,6 @@ def read_file_tool(
     """
     try:
         offset, limit = normalize_read_pagination(offset, limit)
-        file_ops = _file_ops or _get_file_ops(task_id)
 
         # On the RAW model-supplied string, before any expanduser()/resolve():
         # on Windows resolving \??\UNC\host\share already sends SMB auth (NTLM
@@ -632,6 +631,10 @@ def read_file_tool(
                 "block or produce infinite output.")
 
         _resolved = Path(_resolved_path) if _resolved_path is not None else _resolve_path_for_task(path, task_id)
+        # Preserve the guard contract: raw/device-path denials above must not
+        # initialize or contact any file backend. Workspace-bound callers may
+        # inject their already-created host-local backend here.
+        file_ops = _file_ops or _get_file_ops(task_id)
 
         # A read on a FIFO/socket blocks until the exec timeout: a self-shipped DoS.
         if _file_ops_uses_host_paths(file_ops):
