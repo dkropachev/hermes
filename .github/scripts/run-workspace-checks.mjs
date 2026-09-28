@@ -1,4 +1,4 @@
-// Run every workspace check at the same time and report all failures.
+// Run every workspace check with bounded concurrency and report all failures.
 //
 // The unit of work is a CHECK, and not a workspace. A package that declares
 // `check:*` sub-scripts gives one unit for each sub-script. A package with a
@@ -6,8 +6,8 @@
 // used, so the set of commands is unchanged. Only the schedule is different.
 //
 // This is not `npm run --ws check`, because that command is serial and stops
-// at the first workspace that fails. This runs every unit and fails at the
-// end with the full list.
+// at the first workspace that fails. This caps concurrency to the available
+// cores, runs every unit, and fails at the end with the full list.
 //
 // The output of each unit goes to a buffer and prints on completion inside a
 // group that collapses. Children that write to one stdout together interleave
