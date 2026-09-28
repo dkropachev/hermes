@@ -794,8 +794,8 @@ Multi-profile, multi-project collaboration board. Each install can host many boa
 | `boards switch <slug>` / `boards use` | Persist `<slug>` as the active board (writes `~/.hermes/kanban/current`). |
 | `boards show` / `boards current` | Print the currently-active board's name, DB path, and task counts. |
 | `boards rename <slug> "<name>"` | Change a board's display name. Slug is immutable. |
-| `boards rm <slug>` | Archive (default) or hard-delete a board. `--delete` skips the archive step. Archived boards move to `boards/_archived/<slug>-<ts>/`. Refused for `default`. |
-| `create "<title>"` | Create a new task on the active board. Flags: `--body`, `--assignee`, `--parent` (repeatable), `--workspace scratch\|worktree\|worktree:<path>\|dir:<path>`, `--workspace-access read\|write` (default: `write`; `read` requires a worktree), `--tenant`, `--priority`, `--triage`, `--idempotency-key`, `--max-runtime`, `--max-retries`, `--skill` (repeatable). |
+| `boards rm <slug>` | Archive (default) or hard-delete a board. `--delete` skips the archive step. Archived boards move to `boards/_archived/<slug>-<ts>/`. Refused for `default` and while any provider workspace lease is pending; wait for successful release or a dispatcher retry. The pending-lease check has a known [in-flight acquisition race](https://github.com/dkropachev/hermes/blob/main/feature-specs/kanban-workspace-provider.md#known-implementation-gaps). |
+| `create "<title>"` | Create a new task on the active board. Flags: `--body`, `--assignee`, `--parent` (repeatable), `--workspace scratch\|worktree\|worktree:<absolute-path>\|dir:<absolute-path>`, `--workspace-access read\|write` (default: `write`; `read` requires a worktree), `--tenant`, `--priority`, `--triage`, `--idempotency-key`, `--max-runtime`, `--max-retries`, `--skill` (repeatable). |
 | `list` / `ls` | List tasks on the active board. Filter with `--mine`, `--assignee`, `--status`, `--tenant`, `--archived`, `--json`. |
 | `show <id>` | Show a task with comments and events. `--json` for machine output. |
 | `assign <id> <profile>` | Assign or reassign. Use `none` to unassign. Refused while task is running. |
@@ -810,13 +810,28 @@ Multi-profile, multi-project collaboration board. Each install can host many boa
 | `reopen-review <id>...` | Send review task(s) back for changes (`review` → ready/todo). Flag: `--reason` (appended as a comment). |
 | `schedule <id> "<reason>"` | Park time-delay/follow-up work in `scheduled` so it is not shown as a human blocker. |
 | `unblock <id>` | Restore a blocked task to its source phase (`review` or `ready`), or `todo` while dependencies remain open. |
-| `archive <id>` | Hide from default list. `gc` will remove scratch workspaces. |
+| `archive <id>...` | Archive one or more tasks and hide them from the default list. `gc` will remove scratch workspaces. |
+| `archive --rm <already-archived-id>...` | Permanently delete one or more tasks. Every task must already be archived, and deletion is refused while that task has a pending provider workspace lease; wait for successful release or a dispatcher retry. |
 | `tail <id>` | Follow a task's event stream. |
 | `dispatch` | One dispatcher pass on the active board. Flags: `--dry-run`, `--max N`, `--failure-limit N`, `--json`. |
 | `context <id>` | Print the full context a worker would see (title + body + parent results + comments). |
 | `specify <id>` / `specify --all` | Flesh out a triage-column task into a concrete spec (title + body with goal, approach, acceptance criteria) via the auxiliary LLM, then promote it to `todo`. Flags: `--tenant` (scope `--all` to one tenant), `--author`, `--json`. Configure the model under `auxiliary.triage_specifier` in `config.yaml`. |
 | `decompose <id>` / `decompose --all` | Fan a triage-column task out into a graph of child tasks routed to specialist profiles by description. Falls back to specify-style single-task promotion when the LLM decides the task doesn't benefit from fan-out. Same flags as `specify`. Configure the decomposer model under `auxiliary.kanban_decomposer` in `config.yaml`; `kanban.orchestrator_profile` only controls who owns the root/orchestration task after fan-out. Also runs automatically every dispatcher tick when `kanban.auto_decompose: true` (the default). See [Auto vs Manual orchestration](../user-guide/features/kanban.md#auto-vs-manual-orchestration). |
 | `gc` | Remove scratch workspaces for archived tasks. |
+
+`--workspace-access` is coordination metadata for a worktree task and is consulted only when
+`kanban.workspace_provider` selects a provider. `read` does not make the checkout filesystem-read-only
+or by itself prevent publication; the configured provider or a separate publication policy must
+implement any required fencing, such as push restrictions.
+
+Both path-bearing `--workspace` forms require an absolute path. Hermes expands a leading `~` in the
+path portion before enforcing that requirement, so forms such as `dir:~/projects/api` are accepted.
+For `dir:<path>`, that path is the literal workspace target. For `worktree:<path>`, an existing Git
+repository root is an anchor: Hermes plans the task checkout at
+`<repo>/.worktrees/<task-id>`. A concrete non-root path inside that repository is the checkout target
+(an occupied linked worktree on the wrong branch may cause Hermes to choose its per-task fallback).
+Consequently, a workspace provider's `WorkspaceRequest.requested_path` is the resolved checkout plan
+and can differ from the literal repository-root anchor supplied to `--workspace`.
 
 Examples:
 
@@ -1619,6 +1634,16 @@ Unified plugin management — general plugins, memory providers, and context eng
 - **General Plugins** — multi-select checkboxes to enable/disable installed plugins
 - **Provider Plugins** — single-select configuration for Memory Provider and Context Engine. Press ENTER on a category to open a radio picker.
 
+:::warning Native plugins are fully trusted code
+The import performed by `plugins doctor`, and runtime import after `plugins enable`, executes plugin
+Python in-process as the current OS user; `doctor` is not a safe static inspection. Profiles scope
+routing, config, secrets, and terminal work, but are not sandboxes or hostile-tenant isolation, and
+provider registries can use a same-name global fallback. Plugin callbacks must resolve the current
+home, secrets, and config at callback time (or key caches by home), avoid import-time profile reads
+from `os.environ` and bare background threads, and keep credentials only in the secret store or
+profile `.env`—never in IDs, config, or logs.
+:::
+
 | Subcommand | Description |
 |------------|-------------|
 | *(none)* | Composite interactive UI — general plugin toggles + provider plugin configuration. |
@@ -1626,10 +1651,10 @@ Unified plugin management — general plugins, memory providers, and context eng
 | `search [term] [--json]` | Search the Hermes plugin catalog (matches entry names, descriptions, and declared tools; omit `term` to list everything). The catalog is curated in-repo (`plugin-catalog/`), refreshed from the live repo with a 6-hour cache, and falls back to the in-tree copy offline. Cataloged ≠ audited — admission reviews the entry, not the code. |
 | `update <name>` | Pull latest changes for an unpinned installed plugin. Pinned plugins must be reinstalled with `--force --ref <new-commit>` to move. |
 | `remove <name>` (aliases: `rm`, `uninstall`) | Remove an installed plugin. |
-| `enable <name>` | Enable a disabled plugin. |
+| `enable <name>` | Enable a disabled plugin for discovery in subsequent sessions. |
 | `disable <name>` | Disable a plugin without removing it. |
 | `list` (alias: `ls`) | List installed plugins with enabled/disabled status. |
-| `doctor [path-or-id] [--ci]` | Validate a native plugin through the real manifest parser, loader, and registration path. `--ci` exits 1 on errors. |
+| `doctor [path-or-id] [--ci]` | Import and execute a native plugin in-process through the real manifest parser, loader, and registration path, then report validation errors. `--ci` exits 1 on errors. |
 | `pack install <path-or-url> [--force]` | Install a plugin pack (`hermes-pack.yaml`) — a declarative set of plugins each pinned to an exact 40-character commit SHA. Shows a mandatory review screen (every plugin, source, pinned ref, declared capabilities), asks one confirmation for the pack contents, then runs ordinary pinned installs. Each plugin's declared capabilities still go through the standard per-plugin consent — a pack never bulk-grants. Partial failures are reported per plugin; exits non-zero when any plugin failed. Interactive only (no `--yes`). |
 | `pack export [--enabled-only] [--name NAME]` | Emit a pack YAML on stdout from the current install: repo + exact SHA of each git-installed plugin plus sanitized non-secret `plugins.entries` config. Local-only plugins (no git provenance) are listed as warning comments, never as installable entries. Secrets, capability grants, and `allow_*` gates are always stripped. |
 | `pack show <path-or-url>` | Dry-run: parse, validate, and display a pack without installing anything. |
