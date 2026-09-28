@@ -299,10 +299,19 @@ class PluginContext:
             self.plugin_id, self.manifest.skill_namespace, home_path=self._manager.home_path,
         )
 
+    @cached_property
+    def workspace_tools(self):
+        """Terminal and file operations bound to this context's workspace leases."""
+        from hermes_cli.plugin_workspace_dispatch import PluginWorkspaceTools
+
+        return PluginWorkspaceTools(self.workspaces)
+
     def has_host_feature(self, feature: str) -> bool:
         """Probe an additive host API independently of operator-granted capabilities."""
-        from hermes_cli.plugin_workspaces import HOST_FEATURE
-        return feature == HOST_FEATURE
+        from hermes_cli.plugin_workspace_dispatch import HOST_FEATURE as dispatch_feature
+        from hermes_cli.plugin_workspaces import HOST_FEATURE as lease_feature
+
+        return feature in {lease_feature, dispatch_feature}
 
     @cached_property
     def platform_actions(self):

@@ -204,13 +204,17 @@ options = json.loads(sys.argv[3])
 context_methods = set(options["context_methods"])
 provider_kind = options["kind"] == "model-provider"
 workspace_leases = bool(options.get("workspace_leases"))
+workspace_dispatch = bool(options.get("workspace_dispatch"))
 
-if not workspace_leases:
+if not workspace_dispatch:
     class _BlockWorkspaceModule:
         def find_spec(self, fullname, path=None, target=None):
-            if fullname == "hermes_cli.plugin_workspaces":
+            blocked = {"hermes_cli.plugin_workspace_dispatch"}
+            if not workspace_leases:
+                blocked.add("hermes_cli.plugin_workspaces")
+            if fullname in blocked:
                 raise ModuleNotFoundError(
-                    "hermes_cli.plugin_workspaces is unavailable on this simulated older host"
+                    "%s is unavailable in this simulated older host mode" % fullname
                 )
             return None
 
@@ -227,7 +231,12 @@ class RecordingContext:
     def __getattribute__(self, name):
         # The fallback pass models an older Hermes build: neither the feature
         # probe nor its facade exists.  Plugins must use getattr before calling.
-        if not workspace_leases and name in {"has_host_feature", "workspaces"}:
+        unavailable = set()
+        if not workspace_leases:
+            unavailable.update({"has_host_feature", "workspaces", "workspace_tools"})
+        elif not workspace_dispatch:
+            unavailable.add("workspace_tools")
+        if name in unavailable:
             raise AttributeError(name)
         return object.__getattribute__(self, name)
 
@@ -252,13 +261,22 @@ class RecordingContext:
         return default
 
     def has_host_feature(self, feature):
-        return workspace_leases and feature == "workspace_leases.v1"
+        return (
+            (workspace_leases and feature == "workspace_leases.v1")
+            or (workspace_dispatch and feature == "workspace_bound_dispatch.v1")
+        )
 
     @property
     def workspaces(self):
         if not workspace_leases:
             raise AttributeError("workspaces")
         return RecordingWorkspaces()
+
+    @property
+    def workspace_tools(self):
+        if not workspace_dispatch:
+            raise AttributeError("workspace_tools")
+        return RecordingWorkspaceTools()
 
     def __getattr__(self, name):
         # Any other REAL registration surface (platforms, providers, skills,
@@ -267,7 +285,12 @@ class RecordingContext:
         # not have raise AttributeError exactly like it would; handing back a
         # callable made `getattr(ctx, "profile_path", None)` truthy and crashed
         # register() in the probe alone.
-        if not workspace_leases and name in {"has_host_feature", "workspaces"}:
+        unavailable = set()
+        if not workspace_leases:
+            unavailable.update({"has_host_feature", "workspaces", "workspace_tools"})
+        elif not workspace_dispatch:
+            unavailable.add("workspace_tools")
+        if name in unavailable:
             raise AttributeError(name)
         if name in context_methods:
             def _noop(*args, **kwargs):
@@ -293,6 +316,15 @@ class RecordingWorkspaces:
         raise RuntimeError("workspace lifecycle calls are not allowed during plugin registration")
 
     acquire = renew = reconnect = inspect = release = _blocked
+
+
+class RecordingWorkspaceTools:
+    # Shape-only facade; registration probes must never execute host tools.
+
+    def _blocked(self, *args, **kwargs):
+        raise RuntimeError("workspace tool calls are not allowed during plugin registration")
+
+    terminal = read_file = write_file = edit_file = _blocked
 
 
 def emit(payload):
@@ -354,12 +386,18 @@ emit(recorded)
 """
 
 
-def _probe_options(manifest: dict, *, workspace_leases: bool = False) -> dict:
+def _probe_options(
+    manifest: dict,
+    *,
+    workspace_leases: bool = False,
+    workspace_dispatch: bool = False,
+) -> dict:
     from hermes_cli.plugins import PluginContext
 
     return {
         "kind": str(manifest.get("kind") or ""),
         "workspace_leases": workspace_leases,
+        "workspace_dispatch": workspace_dispatch,
         "context_methods": sorted(
             n for n in dir(PluginContext)
             if not n.startswith("_") and callable(getattr(PluginContext, n))
@@ -368,7 +406,11 @@ def _probe_options(manifest: dict, *, workspace_leases: bool = False) -> dict:
 
 
 def _run_capability_probe(
-    plugin_dir: Path, manifest: dict, *, workspace_leases: bool = False,
+    plugin_dir: Path,
+    manifest: dict,
+    *,
+    workspace_leases: bool = False,
+    workspace_dispatch: bool = False,
 ) -> Tuple[Optional[dict], str]:
     """Run the recording probe in a scratch subprocess.
 
@@ -387,7 +429,11 @@ def _run_capability_probe(
                     _PROBE_SCRIPT,
                     str(plugin_dir),
                     _PROBE_SENTINEL,
-                    json.dumps(_probe_options(manifest, workspace_leases=workspace_leases)),
+                    json.dumps(_probe_options(
+                        manifest,
+                        workspace_leases=workspace_leases,
+                        workspace_dispatch=workspace_dispatch,
+                    )),
                 ],
                 capture_output=True,
                 text=True,
@@ -443,18 +489,32 @@ def _check_capabilities(
         report.add("capability probe", False, error)
         return None
     if str(manifest.get("kind") or "") != "model-provider":
-        enabled, enabled_error = _run_capability_probe(
+        lease_enabled, lease_error = _run_capability_probe(
             plugin_dir, manifest, workspace_leases=True,
         )
-        if enabled is None:
+        if lease_enabled is None:
             report.add(
                 "capability probe", False,
-                f"workspace_leases.v1 mode: {enabled_error}",
+                f"workspace_leases.v1 mode: {lease_error}",
+            )
+            return None
+        dispatch_enabled, dispatch_error = _run_capability_probe(
+            plugin_dir,
+            manifest,
+            workspace_leases=True,
+            workspace_dispatch=True,
+        )
+        if dispatch_enabled is None:
+            report.add(
+                "capability probe", False,
+                f"workspace_bound_dispatch.v1 mode: {dispatch_error}",
             )
             return None
         for category in ("tools", "hooks", "middleware", "commands", "providers"):
             recorded[category] = sorted(
-                set(recorded.get(category) or []) | set(enabled.get(category) or [])
+                set(recorded.get(category) or [])
+                | set(lease_enabled.get(category) or [])
+                | set(dispatch_enabled.get(category) or [])
             )
     if recorded.get("providers"):
         report.add(

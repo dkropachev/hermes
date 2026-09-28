@@ -418,7 +418,9 @@ def _special_file_kind(path) -> str | None:
                 "a special (non-regular) file")
 
 
-def _read_extracted_document(path: str, _resolved, offset: int, limit: int, task_id: str) -> str | None:
+def _read_extracted_document(
+    path: str, _resolved, offset: int, limit: int, task_id: str, *, _file_ops=None,
+) -> str | None:
     """Render an extractable document (.docx/.xlsx/.pdf/...) as paginated text.
 
     Returns the JSON result, a tool_error for an actionable extraction failure
@@ -431,7 +433,7 @@ def _read_extracted_document(path: str, _resolved, offset: int, limit: int, task
 
     if not is_extractable_document(str(_resolved)):
         return None
-    file_ops = _get_file_ops(task_id)
+    file_ops = _file_ops or _get_file_ops(task_id)
     try:
         binary = file_ops.read_file_bytes(str(_resolved), max_bytes=MAX_DOCUMENT_BYTES)
         if binary.error or binary.base64_content is None:
@@ -595,7 +597,15 @@ def _record_successful_read(task_data: dict, task_id: str, path: str, resolved_s
     return count
 
 
-def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, task_id: str = "default") -> str:
+def read_file_tool(
+    path: str,
+    offset: int = 1,
+    limit: int = DEFAULT_READ_LIMIT,
+    task_id: str = "default",
+    *,
+    _file_ops=None,
+    _resolved_path: str | None = None,
+) -> str:
     """Read a file with pagination and line numbers.
 
     Guard order: NT/device-namespace prefix (raw string, no resolution) →
@@ -605,6 +615,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
     """
     try:
         offset, limit = normalize_read_pagination(offset, limit)
+        file_ops = _file_ops or _get_file_ops(task_id)
 
         # On the RAW model-supplied string, before any expanduser()/resolve():
         # on Windows resolving \??\UNC\host\share already sends SMB auth (NTLM
@@ -620,10 +631,10 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
                 f"Cannot read '{path}': this is a device file that would "
                 "block or produce infinite output.")
 
-        _resolved = _resolve_path_for_task(path, task_id)
+        _resolved = Path(_resolved_path) if _resolved_path is not None else _resolve_path_for_task(path, task_id)
 
         # A read on a FIFO/socket blocks until the exec timeout: a self-shipped DoS.
-        if _file_ops_uses_host_paths(_get_file_ops(task_id)):
+        if _file_ops_uses_host_paths(file_ops):
             kind = _special_file_kind(_resolved)
             if kind is not None:
                 return json.dumps({
@@ -642,7 +653,9 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
         if block_error:
             return tool_error(block_error)
 
-        extracted = _read_extracted_document(path, _resolved, offset, limit, task_id)
+        extracted = _read_extracted_document(
+            path, _resolved, offset, limit, task_id, _file_ops=file_ops,
+        )
         if extracted is not None:
             return extracted
 
@@ -669,7 +682,6 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
             content_served_in_generation = dedup_key in task_data["dedup_generation_reads"]
         # Same rule as skill_view: the review fork shares the parent's task_id and its
         # read-before-write guard needs a real read, which the stub path never records (#95976).
-        file_ops = _get_file_ops(task_id)
         version_before = _file_metadata(resolved_str) if _file_ops_uses_host_paths(file_ops) else None
         if (cached_version is not None and not is_background_review()
                 and version_before == cached_version and content_served_in_generation):
@@ -816,7 +828,9 @@ _REWRITE_HINT_MIN_UNCHANGED = 0.80
 _REWRITE_HINT_MAX_CHARS = 400_000
 
 
-def _whole_file_rewrite_hint(task_id: str, resolved: str | None, new_content: str) -> str | None:
+def _whole_file_rewrite_hint(
+    task_id: str, resolved: str | None, new_content: str, *, _file_ops=None,
+) -> str | None:
     """Return a hint when ``new_content`` mostly re-sends what is already at ``resolved``.
 
     Reads the OLD content through the task's own file ops (``read_file_raw``, the sandbox/remote
@@ -826,7 +840,7 @@ def _whole_file_rewrite_hint(task_id: str, resolved: str | None, new_content: st
     if not resolved or not (_REWRITE_HINT_MIN_CHARS <= len(new_content) <= _REWRITE_HINT_MAX_CHARS):
         return None
     try:
-        result = _get_file_ops(task_id).read_file_raw(resolved)
+        result = (_file_ops or _get_file_ops(task_id)).read_file_raw(resolved)
         old = getattr(result, "content", None)
         if getattr(result, "error", None) or not isinstance(old, str):
             return None
@@ -852,7 +866,8 @@ def _whole_file_rewrite_hint(task_id: str, resolved: str | None, new_content: st
 
 def write_file_tool(path: str, content: str, task_id: str = "default",
                     cross_profile: bool = False,
-                    session_id: str | None = None) -> str:
+                    session_id: str | None = None, *, _file_ops=None,
+                    _resolved_path: str | None = None) -> str:
     """Write content to a file.
 
     ``cross_profile`` bypasses the sandbox-mirror lost-write guards only
@@ -874,7 +889,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     try:
         # Resolution failure falls back to the legacy unlocked path (the write
         # still proceeds; the per-task staleness check still runs).
-        _resolved = _resolve_or_none(path, task_id)
+        _resolved = _resolved_path if _resolved_path is not None else _resolve_or_none(path, task_id)
         path_to_resolved = {path: _resolved}
         with ExitStack() as _lock:
             if _resolved:
@@ -888,8 +903,10 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             if blocker:
                 return json.dumps(_stale_write_refusal(path, blocker, _resolved), ensure_ascii=False)
             warnings = _edit_warnings([path], path_to_resolved, task_id)
-            rewrite_hint = _whole_file_rewrite_hint(task_id, _resolved, content)
-            result = _get_file_ops(task_id).write_file(_resolved or path, content)
+            rewrite_hint = _whole_file_rewrite_hint(
+                task_id, _resolved, content, _file_ops=_file_ops,
+            )
+            result = (_file_ops or _get_file_ops(task_id)).write_file(_resolved or path, content)
             result_dict = result.to_dict()
             if warnings:
                 result_dict["_warning"] = warnings[0]
@@ -948,7 +965,8 @@ def _collect_v4a_header_paths(patch: str) -> tuple[list[str], list[str]] | str:
 def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                new_string: str = None, replace_all: bool = False, patch: str = None,
                task_id: str = "default", cross_profile: bool = False,
-               session_id: str | None = None) -> str:
+               session_id: str | None = None, *, _file_ops=None,
+               _resolved_path: str | None = None) -> str:
     """Patch a file using replace mode or V4A patch format.
 
     ``cross_profile``: same semantics as ``write_file``'s flag (mirror-guard
@@ -969,12 +987,19 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         # Lock paths in sorted, deduplicated order so concurrent callers with
         # overlapping multi-file patches can't deadlock (every caller locks in
         # the same order). An unresolvable path is simply not locked.
-        _path_to_resolved: dict[str, str] = {_p: _resolve_or_none(_p, task_id) for _p in _paths_to_check}
+        _path_to_resolved: dict[str, str] = {
+            _p: (
+                _resolved_path
+                if _resolved_path is not None and mode == "replace" and _p == path
+                else _resolve_or_none(_p, task_id)
+            )
+            for _p in _paths_to_check
+        }
         with ExitStack() as _locks:
             for _r in sorted({_r for _r in _path_to_resolved.values() if _r}):
                 _locks.enter_context(file_state.lock_path(_r))
             stale_warnings = _edit_warnings(_paths_to_check, _path_to_resolved, task_id)
-            file_ops = _get_file_ops(task_id)
+            file_ops = _file_ops or _get_file_ops(task_id)
 
             # Hand the shell layer the RESOLVED targets so both layers agree on
             # which file is edited even when the shell's cwd differs.

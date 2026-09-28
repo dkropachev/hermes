@@ -20,8 +20,11 @@ import re
 import secrets
 import shutil
 import socket
+import threading
 import time
 import uuid
+import weakref
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -83,6 +86,32 @@ class _Layout:
     workspaces_dir: Path
     quarantine_dir: Path
     db_path: Path
+
+
+@dataclass(frozen=True)
+class _PinnedWorkspace:
+    """Host-derived inputs held stable for one synchronous bound dispatch."""
+
+    path: Path
+    task_id: str
+    generation: int
+
+
+_generation_locks_guard = threading.Lock()
+_generation_locks: weakref.WeakValueDictionary[tuple[str, str, str], threading.RLock] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _generation_lock(layout: _Layout, workspace_id: str) -> threading.RLock:
+    """One process-local mutex for a plugin/profile/workspace name."""
+    key = (layout.profile_key, layout.plugin_identity_digest, workspace_id)
+    with _generation_locks_guard:
+        lock = _generation_locks.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _generation_locks[key] = lock
+        return lock
 
 
 def _plugin_namespace(plugin_id: str, skill_namespace: str) -> str:
@@ -696,6 +725,19 @@ class PluginWorkspaces:
         intent: Mapping[str, Any],
         ttl_seconds: float = DEFAULT_TTL_SECONDS,
     ) -> dict[str, Any]:
+        workspace_id = _validated_workspace_id(workspace_id)
+        with _generation_lock(self._layout(), workspace_id):
+            return self._acquire_locked(
+                workspace_id, intent=intent, ttl_seconds=ttl_seconds,
+            )
+
+    def _acquire_locked(
+        self,
+        workspace_id: str,
+        *,
+        intent: Mapping[str, Any],
+        ttl_seconds: float = DEFAULT_TTL_SECONDS,
+    ) -> dict[str, Any]:
         workspace_id, ttl = _validated_workspace_id(workspace_id), _ttl(ttl_seconds)
         layout = self._layout()
         operation_id, capability = _parse_intent(intent)
@@ -998,6 +1040,19 @@ class PluginWorkspaces:
         intent: Mapping[str, Any],
         ttl_seconds: float | None = None,
     ) -> dict[str, Any]:
+        workspace_id = self._workspace_id_for_reconnect(handle, intent)
+        with _generation_lock(self._layout(), workspace_id):
+            return self._reconnect_locked(
+                handle, intent=intent, ttl_seconds=ttl_seconds,
+            )
+
+    def _reconnect_locked(
+        self,
+        handle: Mapping[str, Any],
+        *,
+        intent: Mapping[str, Any],
+        ttl_seconds: float | None = None,
+    ) -> dict[str, Any]:
         layout = self._layout()
         ttl_was_provided = ttl_seconds is not None
         operation_id, successor_capability = _parse_intent(intent)
@@ -1095,6 +1150,11 @@ class PluginWorkspaces:
             return _public_snapshot(conn, row)
 
     def release(self, handle: Mapping[str, Any]) -> dict[str, Any]:
+        workspace_id = self._workspace_id_for_handle(handle)
+        with _generation_lock(self._layout(), workspace_id):
+            return self._release_locked(handle)
+
+    def _release_locked(self, handle: Mapping[str, Any]) -> dict[str, Any]:
         layout = self._layout()
         with transaction(_connect(layout), immediate=True) as conn:
             row = _validated_row(conn, layout, handle)
@@ -1170,6 +1230,120 @@ class PluginWorkspaces:
             ).fetchone()
             _event(conn, updated, "released", {"cleanup": cleanup})
             return _public_snapshot(conn, updated)
+
+    def _workspace_id_for_handle(self, handle: Mapping[str, Any]) -> str:
+        """Resolve the lock key from a validated handle without exposing a path."""
+        layout = self._layout()
+        with transaction(_connect(layout), immediate=True) as conn:
+            row = _validated_row(conn, layout, handle)
+            return str(row["workspace_id"])
+
+    def _workspace_id_for_reconnect(
+        self, handle: Mapping[str, Any], intent: Mapping[str, Any],
+    ) -> str:
+        """Resolve the generation lock for a request or its committed replay."""
+        layout = self._layout()
+        operation_id, output_capability = _parse_intent(intent)
+        input_lease_id, input_capability = _parse_handle(handle)
+        with transaction(_connect(layout), immediate=True) as conn:
+            try:
+                row = _validated_row(conn, layout, handle)
+                return str(row["workspace_id"])
+            except InvalidWorkspaceHandleError:
+                operation = conn.execute(
+                    "SELECT * FROM workspace_lease_operations WHERE operation_id=?",
+                    (operation_id,),
+                ).fetchone()
+                if operation is None:
+                    raise
+                if (
+                    operation["operation_kind"] != "reconnect"
+                    or operation["input_lease_id"] != input_lease_id
+                    or not hmac.compare_digest(
+                        str(operation["input_capability_hash"] or ""),
+                        _capability_hash(input_capability),
+                    )
+                    or not hmac.compare_digest(
+                        str(operation["output_capability_hash"]),
+                        _capability_hash(output_capability),
+                    )
+                    or not hmac.compare_digest(
+                        str(operation["plugin_identity_digest"]),
+                        layout.plugin_identity_digest,
+                    )
+                ):
+                    raise InvalidWorkspaceIntentError(
+                        "workspace reconnect intent does not match its predecessor"
+                    )
+                return str(operation["workspace_id"])
+
+    @contextmanager
+    def _pin_dispatch(
+        self,
+        handle: Mapping[str, Any],
+        *,
+        minimum_ttl_seconds: float = DEFAULT_TTL_SECONDS,
+    ):
+        """Fence a synchronous dispatch against release/reconnect/reacquire.
+
+        The process-local generation lock remains held for the whole operation. The
+        database validation happens again after acquiring it, so a lifecycle change
+        between lock-key lookup and acquisition can only make the handle stale.
+        """
+        layout = self._layout()
+        workspace_id = self._workspace_id_for_handle(handle)
+        with _generation_lock(layout, workspace_id):
+            with transaction(_connect(layout), immediate=True) as conn:
+                row = _validated_row(conn, layout, handle)
+                now = time.time()
+                if row["state"] != "active":
+                    raise InvalidWorkspaceHandleError("workspace lease is not active")
+                if float(row["expires_at"]) <= now:
+                    raise WorkspaceLeaseExpiredError(
+                        "workspace lease expired; reconnect it before use"
+                    )
+                if _owner_state(row) is not True:
+                    raise WorkspaceOwnershipError(
+                        "workspace lease is not owned by the current process"
+                    )
+                path = Path(str(row["workspace_path"]))
+                _require_workspace_directory(path)
+                generation = int(row["generation"])
+                # A dispatch is lease activity. Give the synchronous operation a
+                # complete validity window before releasing the database lock;
+                # cross-process lifecycle calls still apply their owner fencing.
+                dispatch_ttl = max(
+                    float(row["ttl_seconds"]), _ttl(minimum_ttl_seconds),
+                )
+                conn.execute(
+                    "UPDATE workspace_leases SET ttl_seconds=?, heartbeat_at=?, "
+                    "expires_at=?, updated_at=? WHERE lease_id=? AND state='active' "
+                    "AND generation=?",
+                    (
+                        dispatch_ttl,
+                        now,
+                        now + dispatch_ttl,
+                        now,
+                        row["lease_id"],
+                        generation,
+                    ),
+                )
+                if conn.execute("SELECT changes()").fetchone()[0] != 1:
+                    raise InvalidWorkspaceHandleError(
+                        "workspace lease changed while dispatch was pinned"
+                    )
+                task_material = "\0".join((
+                    layout.profile_key,
+                    layout.plugin_identity_digest,
+                    workspace_id,
+                    str(generation),
+                ))
+                task_id = "plugin-workspace-" + hashlib.sha256(
+                    task_material.encode("utf-8")
+                ).hexdigest()[:32]
+            yield _PinnedWorkspace(
+                path=path, task_id=task_id, generation=generation,
+            )
 
 
 __all__ = [
