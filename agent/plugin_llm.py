@@ -18,7 +18,17 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Union
 
+from agent.auxiliary_failure import attach_llm_failure, response_payload, response_status
+
 logger = logging.getLogger(__name__)
+
+
+class PluginLlmStructuredOutputError(ValueError):
+    """A JSON response that violates the caller's requested schema."""
+
+    def __init__(self, message: str, validation_error: Dict[str, Any]) -> None:
+        super().__init__(message)
+        self.validation_error = validation_error
 
 
 @dataclass
@@ -313,6 +323,68 @@ def _strip_code_fences(text: str) -> str:
     return match.group(1).strip() if match else text.strip()
 
 
+def _json_type_name(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return type(value).__name__
+
+
+def _compact_expected(value: Any) -> str:
+    """Small expectation label for an exception message; full value stays in metadata."""
+    try:
+        rendered = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        rendered = repr(value)
+    if len(rendered) <= 120:
+        return rendered
+    length = len(value) if hasattr(value, "__len__") else None
+    suffix = f" length={length}" if isinstance(length, int) else ""
+    return f"<{_json_type_name(value)}{suffix}>"
+
+
+def _compact_validation_message(exc: Any) -> str:
+    """Actionable schema failure without embedding the invalid instance."""
+    path = "$" + "".join(
+        f"[{part}]" if isinstance(part, int) else f".{part}" for part in exc.absolute_path)
+    instance = exc.instance
+    actual = f"actual_type={_json_type_name(instance)}"
+    if isinstance(instance, (str, list, dict, tuple)):
+        actual += f" actual_length={len(instance)}"
+    return (
+        "Plugin LLM structured output did not match schema: "
+        f"path={path} validator={exc.validator or 'unknown'} "
+        f"expected={_compact_expected(exc.validator_value)} {actual}"
+    )
+
+
+def _compact_validation_detail(exc: Any) -> Dict[str, Any]:
+    """Structured validator facts without the verbose invalid instance/message."""
+    actual: Dict[str, Any] = {"type": _json_type_name(exc.instance)}
+    if isinstance(exc.instance, (str, list, dict, tuple)):
+        actual["length"] = len(exc.instance)
+    return {
+        "type": "json_schema_validation",
+        "message": _compact_validation_message(exc),
+        "validator": str(exc.validator or ""),
+        "expected": _compact_expected(exc.validator_value),
+        "actual": actual,
+        "instance_path": list(exc.absolute_path),
+        "schema_path": list(exc.absolute_schema_path),
+    }
+
+
 def _parse_structured_text(*, text: str, json_mode: bool, json_schema: Optional[Any]) -> tuple[Optional[Any], str]:
     """``(parsed, content_type)``: ``"json"`` when parsing (and schema validation, if
     given) succeeded, ``"text"`` otherwise. Schema violations raise ``ValueError``;
@@ -330,8 +402,45 @@ def _parse_structured_text(*, text: str, json_mode: bool, json_schema: Optional[
         except ImportError:
             logger.debug("jsonschema unavailable; skipping schema validation")
         except jsonschema.ValidationError as exc:  # type: ignore[attr-defined]
-            raise ValueError(f"Plugin LLM structured output did not match schema: {exc.message}") from exc
+            detail = _compact_validation_detail(exc)
+            raise PluginLlmStructuredOutputError(detail["message"], detail) from exc
     return parsed, "json"
+
+
+def _message_reasoning_candidates(response: Any) -> List[str]:
+    """Distinct reasoning text candidates from the first assistant message."""
+    try:
+        message = response.choices[0].message
+    except (AttributeError, IndexError, TypeError):
+        return []
+    parts: List[str] = []
+    for name in ("reasoning", "reasoning_content"):
+        value = getattr(message, name, None)
+        if value is None and isinstance(message, dict):
+            value = message.get(name)
+        if isinstance(value, str) and value.strip() and value.strip() not in parts:
+            parts.append(value.strip())
+    details = getattr(message, "reasoning_details", None)
+    if details is None and isinstance(message, dict):
+        details = message.get("reasoning_details")
+    if isinstance(details, list):
+        for detail in details:
+            if isinstance(detail, dict):
+                value = detail.get("summary") or detail.get("content") or detail.get("text")
+            else:
+                value = getattr(detail, "summary", None) or getattr(detail, "content", None) or getattr(detail, "text", None)
+            if isinstance(value, str) and value.strip() and value.strip() not in parts:
+                parts.append(value.strip())
+    return parts
+
+
+def _message_has_refusal(response: Any) -> bool:
+    try:
+        message = response.choices[0].message
+    except (AttributeError, IndexError, TypeError):
+        return False
+    refusal = message.get("refusal") if isinstance(message, dict) else getattr(message, "refusal", None)
+    return isinstance(refusal, str) and bool(refusal.strip())
 
 
 def _extract_usage(response: Any) -> PluginLlmUsage:
@@ -400,11 +509,17 @@ def _resolve_attribution(*, provider_override: Optional[str], model_override: Op
     return provider, route_info.get("model") or model_override or _main_config_value("_read_main_model", "default")
 
 
-def _json_response_format(*, json_mode: bool, json_schema: Optional[Any]) -> Optional[Dict[str, Any]]:
+def _json_response_format(
+    *, json_mode: bool, json_schema: Optional[Any], schema_name: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     """``extra_body.response_format``; falls back to ``json_object`` without a
     schema so schema-blind providers still get a hint."""
     if json_schema is not None:
-        schema = {"name": "plugin_structured_output", "schema": json_schema, "strict": False}
+        schema = {
+            "name": (schema_name or "plugin_structured_output").strip() or "plugin_structured_output",
+            "schema": json_schema,
+            "strict": True,
+        }
         return {"response_format": {"type": "json_schema", "json_schema": schema}}
     if json_mode:
         return {"response_format": {"type": "json_object"}}
@@ -455,7 +570,7 @@ class PluginLlm:
         ``plugins.entries.<id>.llm.allow_*_override``. ``task`` routes through a
         plugin-registered auxiliary slot (see :func:`_check_task`)."""
         agent, kw = self._gate(provider, model, agent_id, profile, task, messages, temperature, max_tokens, timeout)
-        return self._finish("complete", agent, kw, self._invoke_sync(kw), purpose)
+        return self._complete_sync("complete", agent, kw, purpose)
 
     def complete_structured(
         self, *, instructions: str, input: Sequence[PluginLlmInput], json_schema: Optional[Any] = None,
@@ -471,7 +586,7 @@ class PluginLlm:
         ``jsonschema`` package is installed) into ``result.parsed``."""
         spec = _structured_spec("complete_structured", instructions, input, system_prompt, json_mode, json_schema, schema_name)
         agent, kw = self._gate(provider, model, agent_id, profile, task, None, temperature, max_tokens, timeout, spec)
-        return self._finish("complete_structured", agent, kw, self._invoke_sync(kw), purpose, spec)
+        return self._complete_sync("complete_structured", agent, kw, purpose, spec)
 
     async def acomplete(
         self, messages: List[Dict[str, Any]], *, provider: Optional[str] = None, model: Optional[str] = None,
@@ -481,7 +596,7 @@ class PluginLlm:
     ) -> PluginLlmCompleteResult:
         """Async sibling of :meth:`complete`."""
         agent, kw = self._gate(provider, model, agent_id, profile, task, messages, temperature, max_tokens, timeout)
-        return self._finish("acomplete", agent, kw, await self._invoke_async(kw), purpose)
+        return await self._complete_async("acomplete", agent, kw, purpose)
 
     async def acomplete_structured(
         self, *, instructions: str, input: Sequence[PluginLlmInput], json_schema: Optional[Any] = None,
@@ -493,7 +608,48 @@ class PluginLlm:
         """Async sibling of :meth:`complete_structured`."""
         spec = _structured_spec("acomplete_structured", instructions, input, system_prompt, json_mode, json_schema, schema_name)
         agent, kw = self._gate(provider, model, agent_id, profile, task, None, temperature, max_tokens, timeout, spec)
-        return self._finish("acomplete_structured", agent, kw, await self._invoke_async(kw), purpose, spec)
+        return await self._complete_async("acomplete_structured", agent, kw, purpose, spec)
+
+    def _annotate_call_failure(
+        self, exc: BaseException, agent_id: Optional[str], kw: Dict[str, Any],
+        purpose: Optional[str], spec: Optional[Dict[str, Any]],
+    ) -> None:
+        existing = getattr(exc, "hermes_llm_failure", None)
+        existing = existing if isinstance(existing, dict) else {}
+        provider = existing.get("provider") or kw["provider_override"] or _main_config_value("_read_main_provider", "auto")
+        model = existing.get("model") or kw["model_override"] or _main_config_value("_read_main_model", "default")
+        audit = {
+            "plugin_id": self._plugin_id,
+            "purpose": purpose or "",
+            "profile": kw["profile_override"] or "",
+            "task": kw["task"] or "",
+        }
+        if spec is not None:
+            audit["schema_name"] = spec["schema_name"] or ""
+        attach_llm_failure(
+            exc, provider=provider, model=model, agent_id=agent_id or "default", audit=audit)
+
+    def _complete_sync(
+        self, name: str, agent_id: Optional[str], kw: Dict[str, Any],
+        purpose: Optional[str], spec: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        try:
+            invoked = self._invoke_sync(kw)
+        except Exception as exc:
+            self._annotate_call_failure(exc, agent_id, kw, purpose, spec)
+            raise
+        return self._finish(name, agent_id, kw, invoked, purpose, spec)
+
+    async def _complete_async(
+        self, name: str, agent_id: Optional[str], kw: Dict[str, Any],
+        purpose: Optional[str], spec: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        try:
+            invoked = await self._invoke_async(kw)
+        except Exception as exc:
+            self._annotate_call_failure(exc, agent_id, kw, purpose, spec)
+            raise
+        return self._finish(name, agent_id, kw, invoked, purpose, spec)
 
     def _gate(
         self, provider: Optional[str], model: Optional[str], agent_id: Optional[str], profile: Optional[str],
@@ -513,7 +669,9 @@ class PluginLlm:
         extra_body = None
         if spec is not None:
             messages = _build_structured_messages(**spec)
-            extra_body = _json_response_format(json_mode=spec["json_mode"], json_schema=spec["json_schema"])
+            extra_body = _json_response_format(
+                json_mode=spec["json_mode"], json_schema=spec["json_schema"],
+                schema_name=spec["schema_name"])
         return eff_agent, dict(messages=messages, provider_override=eff_provider, model_override=eff_model,
                                profile_override=eff_profile, temperature=temperature, max_tokens=max_tokens,
                                timeout=timeout, extra_body=extra_body, task=eff_task)
@@ -533,8 +691,41 @@ class PluginLlm:
         log_args = [self._plugin_id, real_provider, real_model, eff_task, purpose or ""]
         cls: Any = PluginLlmCompleteResult
         if spec is not None:
-            parsed, content_type = _parse_structured_text(text=text, json_mode=spec["json_mode"], json_schema=spec["json_schema"])
             audit["schema_name"] = spec["schema_name"] or ""
+            if getattr(response, "_hermes_reasoning_json_recovered", False):
+                audit["reasoning_json_recovered"] = True
+            try:
+                parsed, content_type = _parse_structured_text(
+                    text=text, json_mode=spec["json_mode"], json_schema=spec["json_schema"])
+            except PluginLlmStructuredOutputError as exc:
+                status, finish_reason = response_status(response)
+                attach_llm_failure(
+                    exc, provider=real_provider, model=real_model, agent_id=agent_id or "default",
+                    status=status, finish_reason=finish_reason, raw_response=response_payload(response),
+                    validation_error=exc.validation_error, audit={**audit, "task": eff_task}, usage=usage,
+                )
+                raise
+            status, finish_reason = response_status(response)
+            may_recover_reasoning = (
+                not text
+                and (spec["json_mode"] or spec["json_schema"] is not None)
+                and status.lower() in {"", "completed"}
+                and finish_reason.lower() not in {"incomplete", "content_filter", "refusal", "failed", "cancelled", "canceled"}
+                and not _message_has_refusal(response)
+            )
+            if may_recover_reasoning:
+                for reasoning_text in _message_reasoning_candidates(response):
+                    try:
+                        recovered, recovered_type = _parse_structured_text(
+                            text=reasoning_text, json_mode=spec["json_mode"],
+                            json_schema=spec["json_schema"])
+                    except PluginLlmStructuredOutputError:
+                        recovered, recovered_type = None, "text"
+                    if recovered_type == "json":
+                        text, parsed, content_type = reasoning_text, recovered, recovered_type
+                        fields["text"] = text
+                        audit["reasoning_json_recovered"] = True
+                        break
             fields.update(parsed=parsed, content_type=content_type)
             fmt += "content_type=%s "
             log_args.append(content_type)
@@ -569,7 +760,17 @@ class PluginLlm:
             return self._sync_caller(**kw)
         from agent.auxiliary_client import call_llm
         call_kw, route_info = self._host_kwargs(kw)
-        return self._attributed(kw, call_llm(**call_kw), route_info)
+        try:
+            response = call_llm(**call_kw)
+        except Exception as exc:
+            route_info = route_info or {}
+            attach_llm_failure(
+                exc,
+                provider=route_info.get("provider") or kw["provider_override"],
+                model=route_info.get("model") or kw["model_override"],
+            )
+            raise
+        return self._attributed(kw, response, route_info)
 
     async def _invoke_async(self, kw: Dict[str, Any]) -> tuple[str, str, Any]:
         """Async sibling of :meth:`_invoke_sync` (``async_call_llm`` / ``async_caller``)."""
@@ -577,7 +778,17 @@ class PluginLlm:
             return await self._async_caller(**kw)
         from agent.auxiliary_client import async_call_llm
         call_kw, route_info = self._host_kwargs(kw)
-        return self._attributed(kw, await async_call_llm(**call_kw), route_info)
+        try:
+            response = await async_call_llm(**call_kw)
+        except Exception as exc:
+            route_info = route_info or {}
+            attach_llm_failure(
+                exc,
+                provider=route_info.get("provider") or kw["provider_override"],
+                model=route_info.get("model") or kw["model_override"],
+            )
+            raise
+        return self._attributed(kw, response, route_info)
 
 
 def make_plugin_llm_for_test(*, plugin_id: str, policy: _TrustPolicy, sync_caller: Optional[Callable[..., Any]] = None,
@@ -589,5 +800,6 @@ def make_plugin_llm_for_test(*, plugin_id: str, policy: _TrustPolicy, sync_calle
 
 __all__ = [
     "PluginLlm", "PluginLlmTextInput", "PluginLlmImageInput", "PluginLlmInput", "PluginLlmUsage",
-    "PluginLlmCompleteResult", "PluginLlmStructuredResult", "PluginLlmTrustError", "make_plugin_llm_for_test",
+    "PluginLlmCompleteResult", "PluginLlmStructuredResult", "PluginLlmStructuredOutputError",
+    "PluginLlmTrustError", "make_plugin_llm_for_test",
 ]

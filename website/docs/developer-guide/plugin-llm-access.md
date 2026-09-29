@@ -270,13 +270,23 @@ result = ctx.llm.complete_structured(
 Inputs are typed text or image blocks (raw bytes get base64 encoded
 as a `data:` URL automatically). When `json_schema` or
 `json_mode=True` is supplied, the host requests JSON output via
-`response_format`, parses it locally as a fallback, and validates
-against your schema if `jsonschema` is installed.
+`response_format` (translated to Responses API `text.format` where
+needed), parses it locally as a fallback, and validates against your
+schema if `jsonschema` is installed. Schema requests are strict and
+`schema_name` becomes the provider-visible schema name. If a provider
+rejects structured output, Hermes retries once with prompt compliance.
 
 * `result.content_type == "json"` — `result.parsed` is a Python
   object that matches your schema.
-* `result.content_type == "text"` — parsing or validation failed;
-  inspect `result.text` for the raw model response.
+* `result.content_type == "text"` — JSON parsing did not succeed;
+  inspect `result.text` for the raw model response. A parsed value that
+  violates `json_schema` raises `PluginLlmStructuredOutputError`
+  (a `ValueError` subclass).
+
+When visible content is empty, a JSON value in a reasoning field is
+accepted only after independent parsing and schema validation. Failed,
+incomplete, cancelled, content-filtered, and refusal responses are
+errors, never successful empty results.
 
 ### Async
 
@@ -453,9 +463,9 @@ don't have to:
   before it returns an error to the plugin.
 * **Timeout.** Honours your `timeout=` argument, falling back to
   `auxiliary.<task>.timeout` config or the global aux default.
-* **JSON shaping.** Sends `response_format` to the provider when
-  you ask for JSON, then re-parses locally from a code-fenced
-  response if the provider returned one.
+* **JSON shaping.** Sends strict `response_format` to the provider when
+  you ask for JSON, translates it to native Responses `text.format`,
+  then re-parses locally from a code-fenced response if needed.
 * **Schema validation.** Validates against your `json_schema` when
   `jsonschema` is installed; logs a debug line and skips strict
   validation otherwise.
@@ -472,7 +482,10 @@ don't have to:
   empty inputs and on schema-validation failure. `PluginLlmTrustError`
   fires when the trust gate denies an override. Anything else
   (provider 5xx, no credentials configured, timeout) raises whatever
-  `auxiliary_client.call_llm()` raises.
+  `auxiliary_client.call_llm()` raises. LLM exceptions carry a
+  JSON-safe `hermes_llm_failure` mapping with route/status attribution,
+  usage, compact schema paths when applicable, and the full untruncated
+  failed provider response for internal diagnostics.
 * **Cost.** Every call runs against the user's paid provider. Don't
   loop on `complete()` for every gateway message without thinking
   about token spend.

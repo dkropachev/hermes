@@ -2,28 +2,22 @@
 ``agent.auxiliary_client``.
 
 Auxiliary callers (title generation, plugin structured completions) send an
-OpenAI ``response_format`` request field. Some providers reject the field, or
-its Anthropic translation, with a hard 400:
+OpenAI ``response_format`` request field. Some providers reject the capability
+or its Anthropic translation with a hard 400:
 
-  * vLLM gateways translate ``response_format: json_schema`` into
-    ``guided_grammar`` and fail when the grammar backend is absent
-    (``compile_grammar_error: No module named 'xgrammar'``, #82816).
   * Some OpenAI-compatible endpoints answer
     ``This response_format type is unavailable now`` (#82816).
   * Anthropic-compatible gateways that predate structured outputs reject the
     translated ``output_config`` field with
     ``output_config: Extra inputs are not permitted`` (the documented case is
     the ``bedrock-mantle`` Messages endpoint).
-  * OpenAI-compatible gateways that validate the body with a strict pydantic
-    model reject the OBJECT-form ``response_format.json_schema`` by shape --
-    ``422 ... body.response_format.json_schema: str type expected`` -- instead
-    of naming the feature, so the error never mentions an unsupported option.
+Invalid individual schemas are different: grammar compilation failures and
+schema/body-shape validation errors must surface unchanged. Silently removing
+the schema would turn a caller contract into an unconstrained completion.
 
-Callers tolerate an unconstrained reply: the title prompt demands bare JSON
-and ``_extract_title_text`` has a loose-JSON fallback. The fix is reactive,
-like the temperature retry: when the provider rejects the structured-output
-field, retry once without it. These tests lock in that behaviour for both
-sync and async paths.
+When the route genuinely lacks the capability, callers tolerate a prompt-only
+reply, so Hermes retries once without the field. These tests lock in the
+capability-vs-individual-schema distinction for sync and async paths.
 """
 
 from unittest.mock import patch, MagicMock, AsyncMock
@@ -57,12 +51,6 @@ class TestIsStructuredOutputRejection:
     """The detector must match the phrasings providers actually return."""
 
     @pytest.mark.parametrize("message", [
-        # vLLM guided_grammar / xgrammar (#82816, verbatim from the report)
-        (
-            "Error code: 400 - {'error': {'message': 'guided_grammar "
-            '\'{"additionalProperties":false}\' has compile_grammar_error: '
-            "No module named 'xgrammar'', 'type': 'invalid_request_error'}}"
-        ),
         # Second endpoint from the same report
         "HTTP 400: This response_format type is unavailable now",
         # Strict Anthropic-wire gateways rejecting the raw OpenAI field
@@ -72,10 +60,6 @@ class TestIsStructuredOutputRejection:
         # Generic unsupported-parameter phrasings for both field names
         "Unsupported parameter: response_format",
         "output_config is not supported",
-        # Strict pydantic gateway rejecting the object-form json_schema by SHAPE
-        # (422, verbatim body from the gateway) -- no unsupported-parameter wording
-        'HTTP 422: {"detail":[{"loc":["body","response_format","json_schema"],'
-        '"msg":"str type expected","type":"type_error.str"}]}',
     ])
     def test_matches_real_provider_messages(self, message):
         assert _is_structured_output_rejection(RuntimeError(message)) is True
@@ -89,6 +73,11 @@ class TestIsStructuredOutputRejection:
         "Connection reset by peer",
         # Alternation errors that happen to mention messages
         "messages: Extra inputs are not permitted",
+        # Invalid individual schema/grammar: never retry unconstrained.
+        "Error code: 400 - guided_grammar has compile_grammar_error: No module named 'xgrammar'",
+        'HTTP 422: {"detail":[{"loc":["body","response_format","json_schema"],'
+        '"msg":"str type expected","type":"type_error.str"}]}',
+        "HTTP 400: Invalid schema for text.format: additionalProperties must be false",
     ])
     def test_does_not_match_unrelated_errors(self, message):
         assert _is_structured_output_rejection(RuntimeError(message)) is False
@@ -154,9 +143,6 @@ class TestCallLlmStructuredOutputRetry:
         return client
 
     @pytest.mark.parametrize("error_message", [
-        # vLLM guided_grammar (#82816)
-        "Error code: 400 - guided_grammar has compile_grammar_error: "
-        "No module named 'xgrammar'",
         # Second endpoint flavor from the same report
         "HTTP 400: This response_format type is unavailable now",
         # Strict gateway that rejects the translated Anthropic field
@@ -190,6 +176,38 @@ class TestCallLlmStructuredOutputRetry:
         assert "response_format" not in retry_eb
         assert "response_format" not in retry_kwargs
         assert retry_kwargs["model"] == first_kwargs["model"]
+
+    @pytest.mark.parametrize("error_message", [
+        "Error code: 400 - guided_grammar has compile_grammar_error: No module named 'xgrammar'",
+        'HTTP 422: {"detail":[{"loc":["body","response_format","json_schema"],'
+        '"msg":"str type expected","type":"type_error.str"}]}',
+        "HTTP 400: Invalid schema for text.format: additionalProperties must be false",
+    ])
+    def test_invalid_individual_schema_surfaces_without_downgrade(self, error_message):
+        client = MagicMock()
+        client.base_url = "https://api.openai.com/v1"
+        failure = RuntimeError(error_message)
+        client.chat.completions.create.side_effect = failure
+
+        with (
+            patch("agent.auxiliary_client._resolve_task_provider_model",
+                  return_value=("openai-codex", "gpt-5.5", None, None, None)),
+            patch("agent.auxiliary_client._get_cached_client",
+                  return_value=(client, "gpt-5.5")),
+            patch("agent.auxiliary_client._validate_llm_response",
+                  side_effect=lambda resp, _task, **_kw: resp),
+        ):
+            with pytest.raises(RuntimeError) as raised:
+                call_llm(
+                    task="title_generation",
+                    messages=[{"role": "user", "content": "hi"}],
+                    max_tokens=64,
+                    extra_body={"response_format": dict(_TITLE_RESPONSE_FORMAT)},
+                )
+
+        assert raised.value is failure
+        assert client.chat.completions.create.call_count == 1
+        assert "response_format" in (client.chat.completions.create.call_args.kwargs.get("extra_body") or {})
 
     def test_unrelated_400_does_not_strip_response_format(self):
         """Unrelated 400s must not silently downgrade the schema contract."""
@@ -256,8 +274,7 @@ class TestAsyncCallLlmStructuredOutputRetry:
         client.base_url = "https://api.openai.com/v1"
         client.chat.completions.create = AsyncMock(side_effect=[
             RuntimeError(
-                "Error code: 400 - guided_grammar has compile_grammar_error: "
-                "No module named 'xgrammar'"
+                "HTTP 400: This response_format type is unavailable now"
             ),
             _dummy_response(),
         ])
@@ -284,6 +301,35 @@ class TestAsyncCallLlmStructuredOutputRetry:
         assert "response_format" in (first_kwargs.get("extra_body") or {})
         assert "response_format" not in (retry_kwargs.get("extra_body") or {})
         assert "response_format" not in retry_kwargs
+
+    @pytest.mark.asyncio
+    async def test_async_invalid_schema_surfaces_without_downgrade(self):
+        client = MagicMock()
+        client.base_url = "https://api.openai.com/v1"
+        failure = RuntimeError(
+            "HTTP 400: Invalid schema for text.format: additionalProperties must be false"
+        )
+        client.chat.completions.create = AsyncMock(side_effect=failure)
+
+        with (
+            patch("agent.auxiliary_client._resolve_task_provider_model",
+                  return_value=("openai-codex", "gpt-5.5", None, None, None)),
+            patch("agent.auxiliary_client._get_cached_client",
+                  return_value=(client, "gpt-5.5")),
+            patch("agent.auxiliary_client._validate_llm_response",
+                  side_effect=lambda resp, _task, **_kw: resp),
+        ):
+            with pytest.raises(RuntimeError) as raised:
+                await async_call_llm(
+                    task="title_generation",
+                    messages=[{"role": "user", "content": "hi"}],
+                    max_tokens=64,
+                    extra_body={"response_format": dict(_TITLE_RESPONSE_FORMAT)},
+                )
+
+        assert raised.value is failure
+        assert client.chat.completions.create.await_count == 1
+        assert "response_format" in (client.chat.completions.create.call_args.kwargs.get("extra_body") or {})
 
     @pytest.mark.asyncio
     async def test_async_unrelated_400_does_not_retry(self):

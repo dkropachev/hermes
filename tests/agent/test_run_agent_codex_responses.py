@@ -845,8 +845,8 @@ def test_consume_codex_stream_routes_commentary_phase_deltas_to_reasoning(monkey
     assert response.output_text == ""
 
 
-def test_consume_codex_stream_collects_refusal_deltas_as_text(monkeypatch):
-    """A refusal-only Responses stream yields usable text, not RuntimeError.
+def test_consume_codex_stream_preserves_refusal_delta_type(monkeypatch):
+    """A refusal-only Responses stream yields a refusal part, not ordinary output text.
 
     The model declines and streams the
     explanation via ``response.refusal.delta`` with no output_text and (on
@@ -866,8 +866,10 @@ def test_consume_codex_stream_collects_refusal_deltas_as_text(monkeypatch):
     )
 
     assert response.output_text == "I can't help with that."
-    # Synthesized message item so downstream normalization has content.
+    # Synthesized refusal part lets consumers distinguish a declined request.
     assert response.output and response.output[0].type == "message"
+    assert response.output[0].content[0].type == "refusal"
+    assert response.output[0].content[0].refusal == "I can't help with that."
 
 
 def test_extract_responses_message_text_reads_refusal_parts():

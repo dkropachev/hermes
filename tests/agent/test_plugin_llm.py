@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -20,6 +21,7 @@ from agent.plugin_llm import (
     PluginLlm,
     PluginLlmCompleteResult,
     PluginLlmImageInput,
+    PluginLlmStructuredOutputError,
     PluginLlmStructuredResult,
     PluginLlmTextInput,
     PluginLlmTrustError,
@@ -351,6 +353,84 @@ class TestPluginLlmFacade:
             "confidence": 0.99,
         }
         assert result.content_type == "json"
+
+    def test_complete_structured_requests_strict_named_schema(self):
+        captured: dict = {}
+
+        def fake_caller(**kwargs):
+            captured.update(kwargs)
+            return "openai-codex", "gpt-5.6-sol", _fake_response('{"ok": true}')
+
+        llm = make_plugin_llm_for_test(
+            plugin_id="my-plugin", policy=_TrustPolicy(plugin_id="my-plugin"),
+            sync_caller=fake_caller,
+        )
+        llm.complete_structured(
+            instructions="Return a result", input=[PluginLlmTextInput(text="input")],
+            schema_name="review_observations",
+            json_schema={"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]},
+        )
+
+        response_format = captured["extra_body"]["response_format"]
+        assert response_format["type"] == "json_schema"
+        assert response_format["json_schema"]["name"] == "review_observations"
+        assert response_format["json_schema"]["strict"] is True
+
+    def test_schema_failure_retains_full_raw_response_and_compact_path(self):
+        long_value = "x" * 6000
+        output = '{"observations": [{"text": "' + long_value + '"}, {"text": "second"}]}'
+
+        def fake_caller(**_kwargs):
+            return "openai-codex", "gpt-5.6-sol", _fake_response(output)
+
+        llm = make_plugin_llm_for_test(
+            plugin_id="my-plugin", policy=_TrustPolicy(plugin_id="my-plugin"),
+            sync_caller=fake_caller,
+        )
+        schema = {
+            "type": "object",
+            "properties": {"observations": {"type": "array", "maxItems": 1}},
+            "required": ["observations"],
+        }
+        with pytest.raises(PluginLlmStructuredOutputError) as raised:
+            llm.complete_structured(
+                instructions="Observe", input=[PluginLlmTextInput(text="input")],
+                schema_name="observations", json_schema=schema,
+            )
+
+        failure = raised.value.hermes_llm_failure
+        assert failure["provider"] == "openai-codex"
+        assert failure["model"] == "gpt-5.6-sol"
+        assert failure["validation_error"]["validator"] == "maxItems"
+        assert failure["validation_error"]["instance_path"] == ["observations"]
+        assert failure["validation_error"]["expected"] == "1"
+        assert failure["validation_error"]["actual"] == {"type": "array", "length": 2}
+        assert long_value in str(failure["raw_response"])
+        assert len(str(failure["raw_response"])) > 6000
+        assert str(raised.value) == (
+            "Plugin LLM structured output did not match schema: "
+            "path=$.observations validator=maxItems expected=1 actual_type=array actual_length=2"
+        )
+        assert long_value not in str(raised.value)
+        assert long_value not in json.dumps(failure["validation_error"], ensure_ascii=False)
+
+    def test_empty_content_recovers_only_individually_valid_reasoning_json(self):
+        response = _fake_response("")
+        response.choices[0].message.content = None
+        response.choices[0].message.reasoning = "analysis prose"
+        response.choices[0].message.reasoning_content = '{"ok": true}'
+
+        llm = make_plugin_llm_for_test(
+            plugin_id="my-plugin", policy=_TrustPolicy(plugin_id="my-plugin"),
+            sync_caller=lambda **_kwargs: ("openai-codex", "gpt-5.6-sol", response),
+        )
+        result = llm.complete_structured(
+            instructions="Return JSON", input=[PluginLlmTextInput(text="input")],
+            json_schema={"type": "object", "properties": {"ok": {"const": True}}, "required": ["ok"]},
+        )
+
+        assert result.parsed == {"ok": True}
+        assert result.audit["reasoning_json_recovered"] is True
 
 
 

@@ -2335,6 +2335,32 @@ class TestTransientTransportRetry:
         assert result == {"retried": True}
         assert primary.chat.completions.create.call_count == 2
 
+    @pytest.mark.asyncio
+    async def test_async_transient_retries_match_configured_count_and_backoff(self):
+        primary = MagicMock()
+        primary.base_url = "https://openrouter.ai/api/v1"
+        primary.chat.completions.create = AsyncMock(side_effect=[
+            ConnectionError("connection reset"),
+            ConnectionError("peer closed connection"),
+            {"retried": True},
+        ])
+        sleep = AsyncMock()
+
+        p1, p2, p3 = self._patches(primary)
+        with (
+            p1, p2, p3,
+            patch("agent.auxiliary_client._transient_retry_count", return_value=2),
+            patch("agent.auxiliary_client._TRANSIENT_RETRY_BACKOFF_BASE", 0.5),
+            patch("asyncio.sleep", new=sleep),
+        ):
+            result = await async_call_llm(
+                task="session_search", messages=[{"role": "user", "content": "hi"}]
+            )
+
+        assert result == {"retried": True}
+        assert primary.chat.completions.create.await_count == 3
+        assert [call.args[0] for call in sleep.await_args_list] == [0.5, 1.0]
+
     def test_non_critical_task_still_retries_same_provider_on_timeout(self):
         """The skip is scoped to critical-path tasks. Everything else keeps the
         existing one-shot same-provider retry, so this is not a blanket change.
@@ -4038,16 +4064,13 @@ class TestCodexAuxiliaryAdapterNullOutputRecovery:
 
         assert response.choices[0].message.content == "aux survived"
 
-    def test_handles_final_output_is_none_after_consumer(self):
-        """Regression for #33368 — defense against ``final.output`` being ``None``.
+    def test_final_output_none_is_an_explicit_incomplete_failure(self):
+        """A terminal ``output=None`` must not be mislabeled as a successful stop.
 
         The event-driven consumer always sets ``final.output`` to a list, so this
         shape can't come from our own path. But a mocked client / compatibility
-        shim that returns a typed Response with ``output=None`` directly (or a
-        future code path that wraps a different consumer) would crash on
-        ``for item in getattr(final, "output", [])`` because ``getattr`` returns
-        ``None`` (not the default) when the attribute exists but is ``None``.
-        Coerce with ``or []`` to handle this defensively.
+        shim that returns a typed Response with ``output=None`` directly must
+        produce an auditable incomplete failure instead of a false success.
         """
         # Stream that returns no items but a terminal with output=None.
         # The consumer assembles an empty list. We then mock the consumer's
@@ -4088,10 +4111,11 @@ class TestCodexAuxiliaryAdapterNullOutputRecovery:
             fake_client = SimpleNamespace(responses=FakeResponses())
             adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
 
-            # Should not raise TypeError: 'NoneType' object is not iterable
-            response = adapter.create(messages=[{"role": "user", "content": "x"}])
-            assert response.choices[0].message.content is None
-            assert response.choices[0].finish_reason == "stop"
+            from agent.auxiliary_failure import AuxiliaryResponseFailure
+            with pytest.raises(AuxiliaryResponseFailure) as raised:
+                adapter.create(messages=[{"role": "user", "content": "x"}])
+            assert raised.value.hermes_llm_failure["finish_reason"] == "incomplete"
+            assert raised.value.hermes_llm_failure["raw_response"]["output"] is None
         finally:
             codex_runtime._consume_codex_event_stream = original_consume
 
@@ -4131,6 +4155,190 @@ class TestCodexAuxiliaryAdapterCompletedResponse:
         assert response.usage.prompt_tokens == 11
         assert response.usage.completion_tokens == 3
         assert response.usage.total_tokens == 14
+
+    @pytest.mark.parametrize("valid", [True, False])
+    def test_reasoning_only_structured_json_is_promoted_only_after_schema_validation(self, valid):
+        payload = '{"ok": true}' if valid else '{"ok": "not-a-boolean"}'
+        completed = SimpleNamespace(
+            status="completed", id="resp_reasoning", usage=None,
+            output=[SimpleNamespace(
+                type="reasoning", status="completed", text=None,
+                summary=[SimpleNamespace(type="summary_text", text=payload)],
+                encrypted_content=None,
+            )],
+        )
+
+        class FakeResponses:
+            def create(self, **_kwargs):
+                return completed
+
+        adapter = _CodexCompletionsAdapter(
+            SimpleNamespace(
+                base_url="https://chatgpt.com/backend-api/codex",
+                _hermes_aux_effective_provider="openai-codex",
+                responses=FakeResponses(),
+            ),
+            "gpt-5.6-sol",
+        )
+        def call():
+            return adapter.create(
+                messages=[{"role": "user", "content": "return JSON"}],
+                extra_body={"response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "answer", "strict": True,
+                        "schema": {
+                            "type": "object", "properties": {"ok": {"type": "boolean"}},
+                            "required": ["ok"],
+                        },
+                    },
+                }},
+            )
+        if not valid:
+            from agent.auxiliary_failure import AuxiliaryResponseFailure
+            with pytest.raises(AuxiliaryResponseFailure, match="incomplete"):
+                call()
+            return
+
+        response = call()
+        assert response.choices[0].message.content == payload
+        assert response.choices[0].finish_reason == "stop"
+        assert response._hermes_reasoning_json_recovered is True
+
+    @pytest.mark.parametrize("kind", ["failed", "incomplete", "refusal"])
+    def test_terminal_noncompletion_raises_with_full_raw_diagnostic(self, kind):
+        marker = "raw-provider-payload-" + ("x" * 5000)
+        if kind == "failed":
+            final = SimpleNamespace(
+                status="failed", id="resp_failed", output=[], usage=None,
+                error=SimpleNamespace(code="server_error", message=marker),
+            )
+        elif kind == "incomplete":
+            final = SimpleNamespace(
+                status="incomplete", id="resp_incomplete", output=[], usage=None,
+                incomplete_details=SimpleNamespace(reason=marker),
+            )
+        else:
+            final = SimpleNamespace(
+                status="completed", id="resp_refusal", usage=None,
+                output=[SimpleNamespace(
+                    type="message", status="completed",
+                    content=[SimpleNamespace(type="refusal", refusal=marker)],
+                )],
+            )
+
+        class FakeResponses:
+            def create(self, **_kwargs):
+                return final
+
+        from agent.auxiliary_failure import AuxiliaryResponseFailure
+
+        adapter = _CodexCompletionsAdapter(
+            SimpleNamespace(
+                base_url="https://chatgpt.com/backend-api/codex",
+                _hermes_aux_effective_provider="openai-codex",
+                responses=FakeResponses(),
+            ),
+            "gpt-5.6-sol",
+        )
+        with pytest.raises(AuxiliaryResponseFailure) as raised:
+            adapter.create(messages=[{"role": "user", "content": "review"}])
+
+        failure = raised.value.hermes_llm_failure
+        assert failure["provider"] == "openai-codex"
+        assert failure["model"] == "gpt-5.6-sol"
+        assert marker in str(failure["raw_response"])
+        assert len(str(failure["raw_response"])) > 5000
+
+    def test_streamed_refusal_raises_and_retains_untouched_terminal_payload(self):
+        marker = "terminal-metadata-" + ("z" * 6000)
+        terminal = SimpleNamespace(
+            status="completed", id="resp_stream_refusal", output=None,
+            usage=SimpleNamespace(input_tokens=3, output_tokens=4, total_tokens=7),
+            metadata={"sentinel": marker, "nested": {"kept": True}},
+        )
+        events = [
+            SimpleNamespace(type="response.created"),
+            SimpleNamespace(type="response.refusal.delta", delta="I cannot"),
+            SimpleNamespace(type="response.refusal.delta", delta=" review that."),
+            SimpleNamespace(type="response.completed", response=terminal),
+        ]
+
+        class RefusalStream:
+            def __iter__(self):
+                return iter(events)
+
+            def close(self):
+                pass
+
+        class FakeResponses:
+            def create(self, **_kwargs):
+                return RefusalStream()
+
+        from agent.auxiliary_failure import AuxiliaryResponseFailure
+
+        adapter = _CodexCompletionsAdapter(
+            SimpleNamespace(
+                base_url="https://chatgpt.com/backend-api/codex",
+                _hermes_aux_effective_provider="openai-codex",
+                responses=FakeResponses(),
+            ),
+            "gpt-5.6-sol",
+        )
+        with pytest.raises(AuxiliaryResponseFailure, match="refused") as raised:
+            adapter.create(messages=[{"role": "user", "content": "review"}])
+
+        failure = raised.value.hermes_llm_failure
+        assert failure["finish_reason"] == "refusal"
+        assert failure["raw_response"]["output"] is None
+        assert failure["raw_response"]["metadata"]["sentinel"] == marker
+        assert failure["raw_response"]["metadata"]["nested"] == {"kept": True}
+
+    def test_standalone_stream_error_retains_complete_original_frame(self):
+        marker = "standalone-error-metadata-" + ("q" * 6000)
+        error_event = {
+            "type": "error",
+            "error": {
+                "type": "server_error",
+                "code": "backend_failed",
+                "message": "Backend failed",
+                "param": None,
+                "metadata": {"sentinel": marker, "retry": {"after_ms": 250}},
+            },
+            "sequence_number": 19,
+            "provider_extension": {"trace": marker},
+        }
+
+        class ErrorStream:
+            def __iter__(self):
+                return iter([error_event])
+
+            def close(self):
+                pass
+
+        class FakeResponses:
+            def create(self, **_kwargs):
+                return ErrorStream()
+
+        from run_agent import _StreamErrorEvent
+
+        adapter = _CodexCompletionsAdapter(
+            SimpleNamespace(
+                base_url="https://chatgpt.com/backend-api/codex",
+                _hermes_aux_effective_provider="openai-codex",
+                responses=FakeResponses(),
+            ),
+            "gpt-5.6-sol",
+        )
+        with pytest.raises(_StreamErrorEvent) as raised:
+            adapter.create(messages=[{"role": "user", "content": "review"}])
+
+        failure = raised.value.hermes_llm_failure
+        assert failure["provider"] == "openai-codex"
+        assert failure["model"] == "gpt-5.6-sol"
+        assert failure["status"] == "error"
+        assert failure["raw_response"] == error_event
+        assert len(failure["raw_response"]["error"]["metadata"]["sentinel"]) > 6000
 
 
 class TestCodexAuxiliaryAdapterReservedToolAliases:
@@ -4220,6 +4428,39 @@ class TestAuxiliaryClientPoisonedCacheEviction:
     ``Connection error`` even though the main provider route is healthy.
     See https://github.com/NousResearch/hermes-agent/issues/23432.
     """
+
+    @pytest.mark.parametrize("closed_on_wrapper", [True, False])
+    def test_cached_closed_transport_is_rebuilt_before_checkout(self, closed_on_wrapper):
+        from agent import auxiliary_client as aux
+
+        leaf = SimpleNamespace(is_closed=not closed_on_wrapper)
+        cached = SimpleNamespace(
+            base_url="https://chatgpt.com/backend-api/codex",
+            _real_client=leaf,
+        )
+        if closed_on_wrapper:
+            cached.is_closed = lambda: True
+        else:
+            leaf.is_closed = True
+        fresh = SimpleNamespace(base_url="https://chatgpt.com/backend-api/codex", is_closed=False)
+        key = ("closed-client-test",)
+
+        with aux._client_cache_lock:
+            aux._client_cache.clear()
+            aux._client_cache[key] = (cached, "gpt-5.6-sol", None)
+        try:
+            with (
+                patch.object(aux, "_client_cache_key", return_value=key),
+                patch.object(aux, "_peek_pool_entry", return_value=None),
+                patch.object(aux, "resolve_provider_client", return_value=(fresh, "gpt-5.6-sol")) as rebuild,
+            ):
+                client, model = aux._get_cached_client("openai-codex", "gpt-5.6-sol")
+            assert client is fresh
+            assert model == "gpt-5.6-sol"
+            rebuild.assert_called_once()
+        finally:
+            with aux._client_cache_lock:
+                aux._client_cache.clear()
 
 
 
@@ -5045,6 +5286,32 @@ class TestNoProgressTimeoutTaskConfigGating:
     when the resolved client is a Codex Responses-shim client — forwarding it to a real
     OpenAI-SDK-shaped client's ``chat.completions.create()`` would raise ``TypeError:
     unexpected keyword argument 'no_progress_timeout'``."""
+
+    def test_rebuilt_codex_retry_preserves_task_and_no_progress_timeout(self):
+        from agent import auxiliary_client as aux
+
+        real_client = SimpleNamespace(
+            api_key="k", base_url="https://chatgpt.com/backend-api/codex/",
+            close=lambda: None, responses=SimpleNamespace(),
+        )
+        wrapper = CodexAuxiliaryClient(real_client, "gpt-5.6-sol")
+        rebuilt = MagicMock(return_value=(wrapper, "gpt-5.6-sol"))
+        with (
+            patch.object(aux, "_get_cached_client", rebuilt),
+            patch.object(aux, "_get_task_no_progress_timeout", return_value=300.0),
+        ):
+            _, retry_kwargs = aux._prepare_same_provider_retry(
+                task="pr_review", resolved_provider="openai-codex",
+                resolved_model="gpt-5.6-sol", resolved_base_url=real_client.base_url,
+                resolved_api_key="k", resolved_api_mode="codex_responses",
+                main_runtime={}, final_model="gpt-5.6-sol",
+                messages=[{"role": "user", "content": "review"}], temperature=None,
+                max_tokens=None, tools=None, effective_timeout=600.0,
+                effective_extra_body={}, reasoning_config=None, async_mode=False,
+            )
+
+        assert rebuilt.call_args.kwargs["task"] == "pr_review"
+        assert retry_kwargs["no_progress_timeout"] == 300.0
 
     def test_non_codex_client_never_receives_the_kwarg(self, monkeypatch):
         client = MagicMock()
