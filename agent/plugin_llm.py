@@ -515,8 +515,11 @@ def _json_response_format(
     """``extra_body.response_format``; falls back to ``json_object`` without a
     schema so schema-blind providers still get a hint."""
     if json_schema is not None:
+        raw_name = (schema_name or "plugin_structured_output").strip()
+        wire_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", raw_name).strip("_-")
+        wire_name = (wire_name or "plugin_structured_output")[:64]
         schema = {
-            "name": (schema_name or "plugin_structured_output").strip() or "plugin_structured_output",
+            "name": wire_name,
             "schema": json_schema,
             "strict": True,
         }

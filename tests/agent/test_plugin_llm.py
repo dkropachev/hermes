@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -375,6 +376,28 @@ class TestPluginLlmFacade:
         assert response_format["type"] == "json_schema"
         assert response_format["json_schema"]["name"] == "review_observations"
         assert response_format["json_schema"]["strict"] is True
+
+    def test_complete_structured_normalizes_schema_name_for_responses_wire(self):
+        captured: dict = {}
+
+        def fake_caller(**kwargs):
+            captured.update(kwargs)
+            return "openai-codex", "gpt-5.6-sol", _fake_response('{"ok": true}')
+
+        llm = make_plugin_llm_for_test(
+            plugin_id="my-plugin", policy=_TrustPolicy(plugin_id="my-plugin"),
+            sync_caller=fake_caller,
+        )
+        llm.complete_structured(
+            instructions="Return a result", input=[PluginLlmTextInput(text="input")],
+            schema_name="pr_review.readiness/" + ("x" * 80),
+            json_schema={"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]},
+        )
+
+        wire_name = captured["extra_body"]["response_format"]["json_schema"]["name"]
+        assert re.fullmatch(r"[a-zA-Z0-9_-]+", wire_name)
+        assert wire_name.startswith("pr_review_readiness_")
+        assert len(wire_name) == 64
 
     def test_schema_failure_retains_full_raw_response_and_compact_path(self):
         long_value = "x" * 6000
