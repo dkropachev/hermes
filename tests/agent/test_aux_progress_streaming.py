@@ -438,10 +438,16 @@ class TestContentBearingProgress:
             fence.touch_progress()
 
         def _consume(stream, *, model, on_event):
-            del model
             for event in stream:
                 on_event(event)
-            return SimpleNamespace(output=[], usage=None)
+            return SimpleNamespace(
+                output=[SimpleNamespace(
+                    type="message", role="assistant", status="completed",
+                    content=[SimpleNamespace(type="output_text", text="summary")],
+                )],
+                output_text="summary", usage=None, status="completed",
+                id="resp_progress", model=model, incomplete_details=None, error=None,
+            )
 
         with (
             patch("agent.codex_runtime._consume_codex_event_stream", _consume),

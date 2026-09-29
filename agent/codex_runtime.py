@@ -724,7 +724,13 @@ def _raise_stream_error(event: Any) -> None:
         return _event_field(nested, name) if value is None and nested is not None else value
     raw_message = _error_field("message")
     message = (str(raw_message) if raw_message is not None else "stream emitted error event").strip() or "stream emitted error event"
-    raise _StreamErrorEvent(message, code=_error_field("code"), param=_error_field("param"))
+    error = _StreamErrorEvent(message, code=_error_field("code"), param=_error_field("param"))
+    # The compact SDK-shaped body remains useful to existing classifiers, but
+    # plugin forensics need the complete standalone SSE frame (including
+    # provider-specific nested metadata) without truncation or projection.
+    from agent.auxiliary_failure import attach_llm_failure, json_safe
+    attach_llm_failure(error, status="error", raw_response=json_safe(event))
+    raise error
 
 
 def _message_phase(item: Any) -> str | None:
@@ -765,7 +771,11 @@ class _CodexResponseAssembler:
         # output_index / first-observed sequence per output item, in lockstep, so settled pending calls merge
         # back in stream order.
         self.output_indexes, self.output_sequences = [], []
-        self.text_deltas, self.commentary_text_deltas = [], []
+        self.text_deltas, self.commentary_text_deltas, self.refusal_deltas = [], [], []
+        # Keep the provider's terminal response object untouched. The assembled
+        # projection below deliberately rebuilds output from item/delta events,
+        # but failure diagnostics need every terminal metadata field verbatim.
+        self.terminal_response_raw = None
         # pending_function_calls: announced-but-unconfirmed function calls keyed by item id. announced_output_order:
         # first-observed (sequence, output_index) per announced item id so a later .done keeps its announced position.
         self.pending_function_calls: Dict[str, Dict[str, Any]] = {}
@@ -824,7 +834,11 @@ class _CodexResponseAssembler:
         # part is read by the normalizer; the deltas cover backends that omit the done item.
         refusal_text = _event_field(event, "delta", "")
         if isinstance(refusal_text, str) and refusal_text:
+            # Keep the long-standing output_text projection for callers that
+            # display refusals as assistant text, while retaining a separate
+            # semantic channel so auxiliary callers can fail closed.
             self.text_deltas.append(refusal_text)
+            self.refusal_deltas.append(refusal_text)
 
     def _on_function_call(self, event: Any, event_type: str) -> None:
         self.has_tool_calls = True
@@ -875,6 +889,7 @@ class _CodexResponseAssembler:
         self.saw_terminal = True
         resp_obj = _event_field(event, "response")
         if resp_obj is not None:
+            self.terminal_response_raw = resp_obj
             self.terminal_usage, self.terminal_response_id = _event_field(resp_obj, "usage"), _event_field(resp_obj, "id")
             rstatus = _event_field(resp_obj, "status")
             if isinstance(rstatus, str):
@@ -930,8 +945,12 @@ class _CodexResponseAssembler:
     def result(self) -> SimpleNamespace:
         # With only plain text deltas (no tool calls), synthesize one message item.
         output: List[Any] = list(self.output_items)
-        if not output and self.text_deltas and not self.has_tool_calls:
-            content = [SimpleNamespace(type="output_text", text="".join(self.text_deltas))]
+        if not output and (self.text_deltas or self.refusal_deltas) and not self.has_tool_calls:
+            content = (
+                [SimpleNamespace(type="refusal", refusal="".join(self.refusal_deltas))]
+                if self.refusal_deltas
+                else [SimpleNamespace(type="output_text", text="".join(self.text_deltas))]
+            )
             output = [SimpleNamespace(type="message", role="assistant", status="completed", content=content)]
         # Done items stay authoritative; settlement only fills the gap left by backends that omit
         # per-item done events on a successful completion.
@@ -940,10 +959,13 @@ class _CodexResponseAssembler:
         # No terminal frame AND no usable content = truncated / rejected stream.
         if not self.saw_terminal and not output:
             raise RuntimeError("Codex Responses stream did not emit a terminal response")
-        return SimpleNamespace(
+        response = SimpleNamespace(
             output=output, output_text="".join(self.text_deltas), usage=self.terminal_usage, status=self.terminal_status,
             id=self.terminal_response_id, model=self.model, incomplete_details=self.terminal_incomplete_details,
             error=self.terminal_error)
+        if self.terminal_response_raw is not None:
+            response._hermes_raw_response = self.terminal_response_raw
+        return response
 
 
 def _consume_codex_event_stream(

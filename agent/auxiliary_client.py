@@ -32,7 +32,15 @@ from agent.error_classifier import (
     is_reasoning_required_rejection,
 )
 from agent.auxiliary_reasoning_floor import remember_reasoning_floor, with_reasoning_floor
-from agent.auxiliary_structured_output import remember_structured_output_rejection
+from agent.auxiliary_structured_output import (
+    is_capability_rejection,
+    remember_structured_output_rejection,
+)
+from agent.auxiliary_failure import (
+    AuxiliaryResponseFailure,
+    attach_llm_failure,
+    response_payload,
+)
 from agent.codex_headers import (
     CODEX_AUX_BASE_URL as _CODEX_AUX_BASE_URL,
     apply_required_codex_headers as _apply_required_codex_headers,
@@ -1126,27 +1134,8 @@ def _scoped_key_env(name: str) -> str:
     return (os.getenv(name) or "").strip()
 
 
-# Codex Responses → chat.completions adapter, so aux consumers need no changes.
-def _parse_codex_final_response(final: Any) -> Tuple[List[str], List[Any], Any]:
-    """Split a completed Responses object into (text_parts, tool_calls, usage) in chat.completions shape."""
-    text_parts: List[str] = []
-    tool_calls_raw: List[Any] = []
-    for item in (getattr(final, "output", None) or []):
-        item_type = _field(item, "type")
-        if item_type == "message":
-            for part in (_field(item, "content") or []):
-                part_type = _field(part, "type")
-                if part_type in {"output_text", "text"}:
-                    text_parts.append(_field(part, "text", ""))
-                elif part_type == "refusal":
-                    # A refusal part carries the model's explanation; dropping it turns a
-                    # refusal-only turn into an empty response that gets retried.
-                    text_parts.append(_field(part, "refusal", ""))
-        elif item_type == "function_call":
-            tool_calls_raw.append(SimpleNamespace(
-                id=_field(item, "call_id", ""), type="function",
-                function=SimpleNamespace(
-                    name=_field(item, "name", ""), arguments=_field(item, "arguments", "{}"))))
+def _codex_usage(final: Any) -> Any:
+    """Responses usage projected into the chat-completions shape."""
     usage = None
     resp_usage = getattr(final, "usage", None)
     if resp_usage:
@@ -1155,7 +1144,114 @@ def _parse_codex_final_response(final: Any) -> Tuple[List[str], List[Any], Any]:
         usage = SimpleNamespace(
             prompt_tokens=_u("input_tokens"), completion_tokens=_u("output_tokens"),
             total_tokens=_u("total_tokens"))
-    return text_parts, tool_calls_raw, usage
+    return usage
+
+
+def _codex_refusal(final: Any) -> str:
+    """The first refusal explanation in a Responses output, or ``""``."""
+    for item in (getattr(final, "output", None) or []):
+        if _field(item, "type") != "message":
+            continue
+        for part in (_field(item, "content") or []):
+            if _field(part, "type") == "refusal":
+                return str(_field(part, "refusal", "") or "").strip()
+    return ""
+
+
+def _responses_text_format(response_format: Any) -> Optional[Dict[str, Any]]:
+    """Translate Chat Completions ``response_format`` to Responses ``text.format``."""
+    if not isinstance(response_format, dict):
+        return None
+    format_type = response_format.get("type")
+    if format_type == "json_object":
+        return {"type": "json_object"}
+    if format_type != "json_schema":
+        return None
+    spec = response_format.get("json_schema")
+    if not isinstance(spec, dict) or not isinstance(spec.get("schema"), dict):
+        return None
+    translated: Dict[str, Any] = {
+        "type": "json_schema",
+        "name": str(spec.get("name") or "structured_output"),
+        "schema": spec["schema"],
+        # Plugin schemas are host-validated too, but strict provider enforcement prevents
+        # recoverable shape errors from consuming a durable plugin attempt.
+        "strict": True,
+    }
+    if isinstance(spec.get("description"), str) and spec["description"].strip():
+        translated["description"] = spec["description"].strip()
+    return translated
+
+
+def _responses_text_options(kwargs: Dict[str, Any], extra_body: Any) -> Optional[Dict[str, Any]]:
+    """Merge native Responses text controls and overlay the Chat response format.
+
+    Top-level ``text`` is the base, ``extra_body.text`` overrides it, and an
+    ``extra_body.response_format`` overrides the top-level chat-format sibling.
+    The selected chat format owns ``text.format`` while unrelated options such
+    as ``verbosity`` survive.
+    """
+    merged: Dict[str, Any] = {}
+    if isinstance(kwargs.get("text"), dict):
+        merged.update(kwargs["text"])
+    if isinstance(extra_body, dict) and isinstance(extra_body.get("text"), dict):
+        merged.update(extra_body["text"])
+    response_format = kwargs.get("response_format")
+    if isinstance(extra_body, dict) and extra_body.get("response_format") is not None:
+        response_format = extra_body["response_format"]
+    translated = _responses_text_format(response_format)
+    if translated is not None:
+        merged["format"] = translated
+    return merged or None
+
+
+def _validated_structured_reasoning(final: Any, message: Any, response_format: Any) -> Optional[str]:
+    """First reasoning candidate that is JSON and satisfies ``response_format``.
+
+    This is the sole exception to treating a reasoning-only Responses result as
+    incomplete.  It is intentionally structural: prose is never promoted to
+    visible assistant content.
+    """
+    if not isinstance(response_format, dict) or response_format.get("type") not in {"json_object", "json_schema"}:
+        return None
+    candidates: List[str] = []
+    for name in ("reasoning", "reasoning_content"):
+        value = getattr(message, name, None)
+        if isinstance(value, str) and value.strip() and value.strip() not in candidates:
+            candidates.append(value.strip())
+    try:
+        from agent.codex_responses_adapter import _extract_responses_reasoning_text
+        for item in (getattr(final, "output", None) or []):
+            if _field(item, "type") == "reasoning":
+                value = _extract_responses_reasoning_text(item)
+                if value and value not in candidates:
+                    candidates.append(value)
+    except Exception:
+        logger.debug("Codex auxiliary: reasoning candidate extraction failed", exc_info=True)
+
+    for candidate in candidates:
+        fenced = re.fullmatch(r"\s*```(?:json)?\s*(.*?)\s*```\s*", candidate, re.DOTALL | re.IGNORECASE)
+        payload = fenced.group(1).strip() if fenced else candidate.strip()
+        try:
+            parsed = json.loads(payload)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        if response_format.get("type") == "json_schema":
+            schema = response_format.get("schema")
+            if not isinstance(schema, dict):
+                continue
+            try:
+                import jsonschema  # type: ignore[import-untyped]
+            except ImportError:
+                continue
+            try:
+                jsonschema.validate(parsed, schema)
+            except jsonschema.ValidationError:  # type: ignore[attr-defined]
+                continue
+        return payload
+    return None
 
 
 def _close_quietly(target: Any, failure_note: Optional[str]) -> None:
@@ -1496,6 +1592,9 @@ class _CodexCompletionsAdapter:
             resp_kwargs["extra_headers"] = dict(kwargs["extra_headers"])
         # The Codex endpoint rejects max_output_tokens/temperature (400) — omit.
         extra_body = kwargs.get("extra_body") or {}
+        text_options = _responses_text_options(kwargs, extra_body)
+        if text_options is not None:
+            resp_kwargs["text"] = text_options
         if isinstance(extra_body, dict):
             # service_tier (fast mode) is a top-level Responses field; xAI's endpoint rejects it.
             service_tier = extra_body.get("service_tier")
@@ -1563,6 +1662,8 @@ class _CodexCompletionsAdapter:
         # from ``response.output_item.done``: the high-level ``responses.stream()`` rebuilds from
         # ``response.completed.response.output``, which Codex returns as ``null`` (SDK crash).
         resp_kwargs, model, timeout = self._build_responses_kwargs(kwargs)
+        structured_format = (resp_kwargs.get("text") or {}).get("format")
+        reasoning_json_recovered = False
         wire_aliases = resp_kwargs.pop("_wire_aliases", None) or {}
         total_timeout = timeout if isinstance(timeout, (int, float)) and timeout > 0 else None
         guard = _CodexStreamGuard(self._client, total_timeout, no_progress_timeout=kwargs.get("no_progress_timeout"))
@@ -1591,27 +1692,92 @@ class _CodexCompletionsAdapter:
                 guard.release_stream(event_stream)
             if final is None:
                 raise RuntimeError("Codex auxiliary Responses stream did not return a final response")
-            text_parts, tool_calls_raw, usage = _parse_codex_final_response(final)
+            raw_final = response_payload(final)
+            status = str(_field(final, "status", "") or "").strip().lower()
+            provider = str(getattr(self._client, "_hermes_aux_effective_provider", "") or "openai-codex")
+            failure_kwargs = dict(
+                provider=provider, model=str(_field(final, "model", model) or model),
+                status=status, raw_response=raw_final, usage=_field(final, "usage"),
+            )
+            if status in {"failed", "cancelled", "canceled"}:
+                error = _field(final, "error")
+                code = str(_field(error, "code", "") or "").strip()
+                detail = str(_field(error, "message", "") or error or "").strip()
+                message = ": ".join(part for part in (code, detail) if part)
+                raise AuxiliaryResponseFailure(
+                    f"Codex auxiliary Responses API returned {status}"
+                    + (f": {message}" if message else ""), **failure_kwargs)
+            if status in {"queued", "in_progress", "incomplete"}:
+                detail = _field(final, "incomplete_details")
+                reason = str(_field(detail, "reason", "") or detail or "").strip()
+                raise AuxiliaryResponseFailure(
+                    f"Codex auxiliary Responses API returned incomplete output"
+                    + (f": {reason}" if reason else ""),
+                    finish_reason="incomplete", **failure_kwargs)
+            refusal = _codex_refusal(final)
+            if refusal:
+                raise AuxiliaryResponseFailure(
+                    f"Codex auxiliary Responses API refused the request: {refusal}",
+                    finish_reason="refusal", **failure_kwargs)
+
+            from agent.codex_responses_adapter import (
+                _classify_responses_issuer,
+                _normalize_codex_response,
+                classify_responses_route,
+            )
+            host = str(getattr(self._client, "base_url", "") or "")
+            route = classify_responses_route(SimpleNamespace(provider=provider, base_url=host))
+            issuer = _classify_responses_issuer(base_url=host, **route._asdict())
+            try:
+                message, finish_reason = _normalize_codex_response(
+                    final, issuer_kind=issuer, issuer_model=str(model))
+            except Exception as exc:
+                raise AuxiliaryResponseFailure(
+                    f"Codex auxiliary Responses API returned unusable output: {exc}",
+                    finish_reason="incomplete", **failure_kwargs) from exc
+            if finish_reason == "incomplete" and status == "completed" and not getattr(message, "content", None):
+                promoted = _validated_structured_reasoning(final, message, structured_format)
+                if promoted is not None:
+                    message.content = promoted
+                    finish_reason = "stop"
+                    reasoning_json_recovered = True
+            if finish_reason in {"incomplete", "content_filter"}:
+                raise AuxiliaryResponseFailure(
+                    f"Codex auxiliary Responses API returned {finish_reason} output",
+                    finish_reason=finish_reason, **failure_kwargs)
+            message.role = "assistant"
+            tool_calls_raw = getattr(message, "tool_calls", None) or []
+            usage = _codex_usage(final)
             # Undo only the aliases THIS request emitted, before the call reaches Hermes dispatch.
             for tc in tool_calls_raw or ():
                 if tc.function.name in wire_aliases:
                     tc.function.name = wire_aliases[tc.function.name]
         except Exception as exc:
             if guard.timed_out.is_set():
-                raise TimeoutError(guard.timeout_message()) from exc
+                timeout_exc = TimeoutError(guard.timeout_message())
+                attach_llm_failure(
+                    timeout_exc,
+                    provider=str(getattr(self._client, "_hermes_aux_effective_provider", "") or "openai-codex"),
+                    model=str(model), status="timeout")
+                raise timeout_exc from exc
+            attach_llm_failure(
+                exc,
+                provider=str(getattr(self._client, "_hermes_aux_effective_provider", "") or "openai-codex"),
+                model=str(model))
             logger.debug("Codex auxiliary Responses API call failed: %s", exc)
             raise
         finally:
             guard.finish()
         # Shape the result like chat.completions.
-        message = SimpleNamespace(
-            role="assistant", content="".join(text_parts).strip() or None,
-            tool_calls=tool_calls_raw or None,
-        )
         choice = SimpleNamespace(
-            index=0, message=message, finish_reason="stop" if not tool_calls_raw else "tool_calls"
+            index=0, message=message, finish_reason=finish_reason
         )
-        return SimpleNamespace(choices=[choice], model=model, usage=usage)
+        response = SimpleNamespace(choices=[choice], model=model, usage=usage)
+        response._hermes_raw_response = raw_final
+        response._hermes_response_status = status
+        response._hermes_finish_reason = finish_reason
+        response._hermes_reasoning_json_recovered = reasoning_json_recovered
+        return response
 
 
 class _ChatShim:
@@ -3250,6 +3416,7 @@ def _is_connection_error(exc: Exception) -> bool:
     return _contains_any(str(exc).lower(), (
         "connection refused", "name or service not known", "no route to host",
         "network is unreachable", "timed out", "connection reset",
+        "client has been closed", "client is closed", "cannot send a request, as the client has been closed",
         # httpcore/httpx premature stream close — transient, retry/reroute.
         "incomplete chunked read", "peer closed connection", "response ended prematurely",
         "unexpected eof", "remoteprotocolerror", "localprotocolerror",
@@ -3305,44 +3472,63 @@ def _is_unsupported_parameter_error(exc: Exception, param: str) -> bool:
 
 
 def _is_structured_output_rejection(exc: Exception) -> bool:
-    """Provider 400/422 rejecting the structured-output field, on either wire: OpenAI ``response_format``
-    (incl. vLLM's ``guided_grammar``/xgrammar failures) or Anthropic ``output_config.format`` ("Extra inputs
-    are not permitted"). Callers tolerate an unconstrained reply, so the reaction is one retry without it."""
+    """Whether a route rejects structured output as a capability.
+
+    Only unsupported/unavailable *fields or format types* may degrade to prompt
+    compliance. An invalid individual schema (including grammar compilation,
+    keyword, or shape validation) must surface to its caller unchanged; retrying
+    it without the format would silently discard the caller's contract.
+    """
     status = getattr(exc, "status_code", None)
     if status is not None and status not in {400, 422}:
         return False
     err_lower = str(exc).lower()
-    # vLLM grammar-backend failures name the translated parameter, not ours.
-    if _contains_any(err_lower, ("guided_grammar", "xgrammar", "compile_grammar_error")):
-        return True
-    if "extra inputs are not permitted" in err_lower and (
-        "response_format" in err_lower or "output_config" in err_lower
-    ):
-        return True
-    if "response_format" in err_lower and "unavailable" in err_lower:
-        return True
-    # Gateways that validate the request body with a strict pydantic model reject the
-    # OBJECT-form json_schema by shape ("str type expected" on response_format.json_schema,
-    # 422) rather than by naming the feature. The field is what they refuse; the retry
-    # without it is the same remedy, so treat the shape error as a rejection too.
-    if "response_format" in err_lower and "json_schema" in err_lower:
-        return True
-    return _is_unsupported_parameter_error(exc, "response_format") or _is_unsupported_parameter_error(exc, "output_config")
+    names_structured_field = _contains_any(
+        err_lower,
+        ("response_format", "output_config", "text.format", "text['format']", 'text["format"]'),
+    )
+    return names_structured_field and is_capability_rejection(exc)
 
 
 def _without_structured_output_format(kwargs: dict) -> Optional[dict]:
-    """Copy *kwargs* without ``response_format`` (top-level and ``extra_body``); None when nothing was
-    removed, so call sites don't retry an unchanged request."""
+    """Copy *kwargs* without every structured-output wire control.
+
+    Handles Chat ``response_format`` plus native Responses ``text.format`` at
+    both the top level and in ``extra_body``. Other ``text`` controls (for
+    example ``verbosity``) and unrelated body fields are retained. ``None``
+    means nothing changed, so a recovery rung never repeats an identical call.
+    """
     retry_kwargs = dict(kwargs)
-    changed = retry_kwargs.pop("response_format", None) is not None
+    changed = "response_format" in retry_kwargs
+    retry_kwargs.pop("response_format", None)
+
+    text_options = retry_kwargs.get("text")
+    if isinstance(text_options, dict) and "format" in text_options:
+        remaining_text = {key: value for key, value in text_options.items() if key != "format"}
+        if remaining_text:
+            retry_kwargs["text"] = remaining_text
+        else:
+            retry_kwargs.pop("text", None)
+        changed = True
+
     extra_body = retry_kwargs.get("extra_body")
-    if isinstance(extra_body, dict) and "response_format" in extra_body:
-        remaining = {k: v for k, v in extra_body.items() if k != "response_format"}
-        if remaining:
-            retry_kwargs["extra_body"] = remaining
+    if isinstance(extra_body, dict):
+        remaining_body = dict(extra_body)
+        if "response_format" in remaining_body:
+            remaining_body.pop("response_format")
+            changed = True
+        nested_text = remaining_body.get("text")
+        if isinstance(nested_text, dict) and "format" in nested_text:
+            remaining_text = {key: value for key, value in nested_text.items() if key != "format"}
+            if remaining_text:
+                remaining_body["text"] = remaining_text
+            else:
+                remaining_body.pop("text", None)
+            changed = True
+        if remaining_body:
+            retry_kwargs["extra_body"] = remaining_body
         else:
             retry_kwargs.pop("extra_body", None)
-        changed = True
     return retry_kwargs if changed else None
 
 
@@ -3678,6 +3864,7 @@ def _prepare_same_provider_retry(
         retry_client, retry_model = _get_cached_client(
             resolved_provider, resolved_model, async_mode=async_mode, base_url=resolved_base_url,
             api_key=resolved_api_key, api_mode=resolved_api_mode, main_runtime=main_runtime,
+            task=task,
         )
         effective_provider = _effective_provider_for_client(retry_client, resolved_provider)
     if retry_client is None:
@@ -3685,11 +3872,16 @@ def _prepare_same_provider_retry(
             f"Auxiliary {task or 'call'}: provider {resolved_provider} could not be rebuilt after recovery"
         )
     retry_base = str(getattr(retry_client, "base_url", "") or "")
+    no_progress_timeout = (
+        _get_task_no_progress_timeout(task)
+        if isinstance(retry_client, (CodexAuxiliaryClient, AsyncCodexAuxiliaryClient)) else None
+    )
     retry_kwargs = _build_call_kwargs(
         effective_provider or resolved_provider, retry_model or final_model, messages,
         temperature=temperature, max_tokens=max_tokens, tools=tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
         base_url=retry_base or resolved_base_url, task=task,
+        no_progress_timeout=no_progress_timeout,
     )
     # Preserve per-request attribution headers (e.g. Copilot ``x-initiator``) so the retry keeps capability gating.
     if extra_headers:
@@ -3707,8 +3899,17 @@ def _retry_same_provider_sync(*, resolved_provider: str, resolved_api_mode: Opti
     retry_client, retry_kwargs = _prepare_same_provider_retry(
         task=task, resolved_provider=resolved_provider, resolved_api_mode=resolved_api_mode, async_mode=False, **prep,
     )
+    request_provider = _effective_provider_for_client(retry_client, resolved_provider)
+    retry_base = str(getattr(retry_client, "base_url", "") or prep.get("resolved_base_url") or "")
     return _validate_llm_response(
-        _relay_sync_completion(retry_client, retry_kwargs, provider=resolved_provider, api_mode=resolved_api_mode), task,
+        _relay_sync_completion(
+            retry_client, retry_kwargs, provider=request_provider, api_mode=resolved_api_mode,
+            create=lambda request: _create_with_progress(
+                retry_client, request, task,
+                force_stream=_provider_requires_stream(request_provider, retry_base),
+            ),
+        ),
+        task, provider=request_provider, base_url=retry_base,
     )
 
 
@@ -3716,9 +3917,17 @@ async def _retry_same_provider_async(*, resolved_provider: str, resolved_api_mod
     retry_client, retry_kwargs = _prepare_same_provider_retry(
         task=task, resolved_provider=resolved_provider, resolved_api_mode=resolved_api_mode, async_mode=True, **prep,
     )
+    request_provider = _effective_provider_for_client(retry_client, resolved_provider)
+    retry_base = str(getattr(retry_client, "base_url", "") or prep.get("resolved_base_url") or "")
     return _validate_llm_response(
-        await _relay_async_completion(retry_client, retry_kwargs, provider=resolved_provider, api_mode=resolved_api_mode),
-        task,
+        await _relay_async_completion(
+            retry_client, retry_kwargs, provider=request_provider, api_mode=resolved_api_mode,
+            create=lambda request: _acreate_with_progress(
+                retry_client, request, task,
+                force_stream=_provider_requires_stream(request_provider, retry_base),
+            ),
+        ),
+        task, provider=request_provider, base_url=retry_base,
     )
 
 
@@ -5890,6 +6099,43 @@ def _compat_model(client: Any, model: Optional[str], cached_default: Optional[st
     return model or cached_default
 
 
+def _client_is_closed(client: Any) -> bool:
+    """Whether a cached wrapper or one of its transport leaves is closed.
+
+    ``is_closed`` exists as both a bool property (httpx) and a method (OpenAI).
+    Static lookup avoids treating a mock's dynamically-created attribute as a
+    true closed signal in tests and provider shims.
+    """
+    pending = [client]
+    seen: set[int] = set()
+    while pending:
+        candidate = pending.pop()
+        if candidate is None or id(candidate) in seen:
+            continue
+        seen.add(id(candidate))
+        try:
+            declared = inspect.getattr_static(candidate, "is_closed", None)
+        except (AttributeError, TypeError):
+            declared = None
+        if declared is not None:
+            try:
+                value = getattr(candidate, "is_closed")
+                value = value() if callable(value) else value
+            except Exception:
+                value = False
+            if isinstance(value, bool) and value:
+                return True
+        for name in ("_real_client", "_client"):
+            try:
+                nested_declared = inspect.getattr_static(candidate, name, None)
+            except (AttributeError, TypeError):
+                nested_declared = None
+            if nested_declared is not None:
+                with contextlib.suppress(Exception):
+                    pending.append(getattr(candidate, name))
+    return False
+
+
 def _get_cached_client(
     provider: str, model: str = None, async_mode: bool = False, base_url: str = None,
     api_key: str = None, api_mode: str = None, main_runtime: Optional[Dict[str, Any]] = None,
@@ -5916,11 +6162,13 @@ def _get_cached_client(
             loop_ok = not async_mode or (
                 cached_loop is not None and cached_loop is current_loop and not cached_loop.is_closed()
             )
-            if loop_ok:
+            client_closed = _client_is_closed(cached_client)
+            if loop_ok and not client_closed:
                 return cached_client, _compat_model(cached_client, model, cached_default)
             # Stale async entry — evict. Only a closed owner loop may be awaited here; a live
             # foreign loop stays force-neutered.
-            _close_cached_client(cached_client, close_async=cached_loop is not None and cached_loop.is_closed())
+            if not client_closed:
+                _close_cached_client(cached_client, close_async=cached_loop is not None and cached_loop.is_closed())
             del _client_cache[cache_key]
     # Build outside the lock. For pool-backed providers derive the key from the pool entry:
     # resolve_api_key_provider_credentials prefers env vars, which would bypass pool rotation
@@ -7975,7 +8223,11 @@ def _call_llm_impl(
                             task or "call", _attempt, _max_transient_retries, _backoff, _last_transient)
                 time.sleep(_backoff)
                 try:
-                    return _primary()
+                    return _retry_same_provider_sync(
+                        resolved_provider=req.resolved_provider,
+                        resolved_model=req.resolved_model,
+                        **retry_kwargs,
+                    )
                 except Exception as retry_transient:
                     if not _is_transient_transport_error(retry_transient):
                         raise
@@ -8125,9 +8377,28 @@ async def _async_call_llm_impl(
             # The async Codex adapter wraps the sync stream via to_thread: same TimeoutError here.
             if not _should_retry_same_provider(task, transient_err, " (async)"):
                 raise
-            logger.info("Auxiliary %s (async): transient transport error; retrying "
-                        "once on the same provider before fallback: %s", task or "call", transient_err)
-            return await _primary()
+            import asyncio
+            max_transient_retries = _transient_retry_count()
+            last_transient = transient_err
+            for attempt in range(1, max_transient_retries + 1):
+                backoff = min(_TRANSIENT_RETRY_BACKOFF_BASE * (2.0 ** (attempt - 1)), 8.0)
+                logger.info(
+                    "Auxiliary %s (async): transient transport error (attempt %d/%d); "
+                    "retrying same provider after %.1fs before fallback: %s",
+                    task or "call", attempt, max_transient_retries, backoff, last_transient,
+                )
+                await asyncio.sleep(backoff)
+                try:
+                    return await _retry_same_provider_async(
+                        resolved_provider=req.resolved_provider,
+                        resolved_model=req.resolved_model,
+                        **retry_kwargs,
+                    )
+                except Exception as retry_transient:
+                    if not _is_transient_transport_error(retry_transient):
+                        raise
+                    last_transient = retry_transient
+            raise last_transient
     except Exception as first_err:
         async def _perform(step: _LadderStep) -> Any:
             kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)
