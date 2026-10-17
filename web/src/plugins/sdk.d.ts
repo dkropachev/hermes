@@ -143,6 +143,11 @@ export interface HermesPluginSDK {
   fetchJSON: FetchJSON;
   /** Authenticated raw fetch for uploads / blob downloads. */
   authedFetch: AuthedFetch;
+  /** Router hooks for plugins to follow host navigation and profile selection. */
+  navigation?: {
+    useLocation: () => { pathname: string; search: string; hash: string };
+    useNavigate: () => (to: string, options?: { replace?: boolean }) => void | Promise<void>;
+  };
   /** Build an auth'd WebSocket URL for the active mode. */
   buildWsUrl: BuildWsUrl;
   /** Resolve just the WS auth query-param pair. */

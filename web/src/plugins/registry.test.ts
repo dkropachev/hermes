@@ -43,4 +43,10 @@ describe("plugin SDK dialog/toast surface", () => {
     expect(typeof sdk.hooks.useState).toBe("function");
     expect(typeof sdk.hooks.useCallback).toBe("function");
   });
+  it("exposes host router hooks without creating a second router", () => {
+    exposePluginSDK();
+    const sdk = window.__HERMES_PLUGIN_SDK__;
+    expect(typeof sdk?.navigation?.useLocation).toBe("function");
+    expect(typeof sdk?.navigation?.useNavigate).toBe("function");
+  });
 });

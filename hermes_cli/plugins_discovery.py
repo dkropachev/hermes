@@ -139,7 +139,7 @@ def scan_directory(
 
 
 def collect_directory_manifests() -> List[PluginManifest]:
-    """Read directory manifests in full-discovery order (bundled top-level, bundled/platforms, user, opt-in
+    """Read directory manifests in full-discovery order (bundled top-level, bundled/platforms, managed-root user, profile user, opt-in
     project) without loading or mutating anything, so startup probes share the exact precedence/containment
     rules of the real discovery sweep."""
     from hermes_cli import plugins as _origin  # patched names resolve through the origin
@@ -155,7 +155,15 @@ def collect_directory_manifests() -> List[PluginManifest]:
     logger.debug("Scanning bundled plugins: %s", repo_plugins)
     _scan("bundled (top-level)", repo_plugins, "bundled", {"memory", "context_engine", "platforms", "model-providers"})
     _scan("bundled/platforms", repo_plugins / "platforms", "bundled")
-    user_dir = get_hermes_home() / "plugins"
+    user_home = get_hermes_home()
+    from hermes_constants import named_profile_home
+    named = named_profile_home(user_home)
+    if named is not None and named.resolve(strict=False) == user_home.resolve(strict=False):
+        # Installations can be shared from a managed profile's own root.
+        # Profile-local packages retain precedence and enablement stays scoped.
+        root_dir = named.parent.parent / 'plugins'
+        _scan('root user', root_dir, 'user')
+    user_dir = user_home / "plugins"
     logger.debug("Scanning user plugins: %s", user_dir)
     _scan("user", user_dir, "user")
     if _origin._env_enabled("HERMES_ENABLE_PROJECT_PLUGINS"):
