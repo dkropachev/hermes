@@ -112,11 +112,36 @@ def session_config(codex_config: dict, *, workspace: Path, private: Path,
 
 async def open_session(ctx, *, task, key, workspace_handle, instructions, tools,
                        resume=None, extensions=(), on_event=None, on_tool_call=None,
-                       execution_permission="read", child_limit=4):
+                       execution_permission="read", child_limit=4, consumer_key=None):
+    try:
+        session = await _prepare_session(ctx, task=task, key=key, workspace_handle=workspace_handle,
+                                         instructions=instructions, tools=tools, resume=resume, extensions=extensions,
+                                         on_event=on_event, on_tool_call=on_tool_call,
+                                         execution_permission=execution_permission, child_limit=child_limit, consumer_key=consumer_key)
+    except BaseException as exc:
+        exc.native_execution_started = False
+        raise
+    try:
+        await session._open()
+        session._registration = ctx._track("llm_session", key, session._request_close)
+        if session._done.done():
+            session._registration.dispose()
+    except BaseException:
+        await session.close()
+        raise
+    return session
+
+
+async def _prepare_session(ctx, *, task, key, workspace_handle, instructions, tools,
+                           resume, extensions, on_event, on_tool_call,
+                           execution_permission, child_limit, consumer_key):
     if ctx.manifest.source not in {"bundled", "user", "entrypoint"}:
         raise PermissionError("Native execution sessions require an installed trusted plugin")
     if not key or not isinstance(instructions, str):
         raise ValueError("Session key and instructions are required")
+    if consumer_key is not None and (not isinstance(consumer_key, str) or not 1 <= len(consumer_key) <= 256
+                                     or any(ord(char) < 32 for char in consumer_key)):
+        raise ValueError("Consumer key must be a bounded nonempty string")
     # Validate before acquiring a workspace pin or starting a native process.
     if execution_permission not in {"read", "write"}:
         raise ValueError("Execution permission must be read or write")
@@ -144,28 +169,22 @@ async def open_session(ctx, *, task, key, workspace_handle, instructions, tools,
                     "permissions": session_config({}, workspace=Path("workspace"), private=Path("private"),
                                                   execution_permission=execution_permission, child_limit=child_limit)})}
     if resume and resume.get("binding") != binding:
-        raise ValueError("Session reference belongs to another binding or configuration")
+        error = ValueError("Session reference belongs to another binding or configuration")
+        error.resume_binding_changed = True
+        raise error
     owner = (binding["profile"], binding["plugin"], key)
     with _live_lock:
         if owner in _live:
             raise RuntimeError("A session is already open for this conversation")
         session = PluginLlmSession(ctx, owner, binding, workspace_handle, snapshot, instructions,
-                                   tools, resume, on_event, on_tool_call, settings)
+                                   tools, resume, on_event, on_tool_call, settings, consumer_key)
         _live[owner] = session
-    try:
-        await session._open()
-        session._registration = ctx._track("llm_session", key, session._request_close)
-        if session._done.done():
-            session._registration.dispose()
-    except BaseException:
-        await session.close()
-        raise
     return session
 
 
 class PluginLlmSession:
     def __init__(self, ctx, owner, binding, handle, snapshot, instructions, tools,
-                 resume, on_event, on_tool_call, settings):
+                 resume, on_event, on_tool_call, settings, consumer_key=None):
         self._ctx, self._owner, self._binding = ctx, owner, binding
         self._handle, self._snapshot = handle, snapshot
         self._instructions, self._tools = instructions, json.loads(json.dumps(tools))
@@ -199,12 +218,18 @@ class PluginLlmSession:
         self._root_agent_waits = set()
         self._execution_id = uuid.uuid4().hex
         self._state_root = None
+        self._consumer_key = consumer_key
+        self._new_thread = not bool(resume)
+        self._turn_submitted = False
+        self._native_spawn_attempted = False
 
     @property
     def reference(self):
         return json.loads(json.dumps({"version": 1, "binding": self._binding,
                                       "threadId": self._thread_id, "accountId": self._account_id,
-                                      "childThreadIds": sorted(self._children), "executionId": self._execution_id}))
+                                      "childThreadIds": sorted(self._children), "executionId": self._execution_id,
+                                      "consumerKey": self._consumer_key,
+                                      "newThread": self._new_thread, "turnSubmissionAttempted": self._turn_submitted}))
 
     @property
     def is_closed(self):
@@ -550,6 +575,8 @@ class PluginLlmSession:
                 from agent.plugin_session_recovery import execution, persist_reference
                 supervision = execution(root, self._binding, dispatch_id=pinned.dispatch_id)
                 self._execution_id = supervision["nonce"]
+                persist_reference(root, self.reference)
+                self._native_spawn_attempted = True
                 client = CodexAppServerClient(codex_bin=codex_bin, codex_home=str(root),
                                               extra_args=[arg for k, v in selected.items()
                                                           for arg in ("-c", f"{k}={_toml(v)}")],
@@ -586,6 +613,11 @@ class PluginLlmSession:
                 finally:
                     client.close()
         except BaseException as exc:
+            if not self._native_spawn_attempted:
+                # Configuration and pin acquisition can fail before any native
+                # process exists. Preserve the original exception type while
+                # distinguishing this known pre-execution failure for callers.
+                exc.native_execution_started = False
             worker_failure = exc
             if not self._ready.done():
                 self._ready.set_exception(exc)
@@ -681,6 +713,12 @@ class PluginLlmSession:
             elif method == "$error":
                 result = client.respond_error(params["id"], -32601, "Unsupported plugin session request")
             else:
+                if method in {"turn/start", "turn/steer"}:
+                    from agent.plugin_session_recovery import persist_reference
+                    # Write ahead of the RPC. Absence of native history alone
+                    # never proves that a submitted turn did not run.
+                    self._turn_submitted = True
+                    persist_reference(self._state_root, self.reference)
                 result = client.request(method, params)
                 if method == "turn/start":
                     self._turn_id = result["turn"]["id"]

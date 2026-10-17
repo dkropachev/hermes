@@ -127,3 +127,20 @@ def test_missing_or_malformed_receipt_is_not_cleanup_proof(tmp_path):
     assert supervisor.proof(path, nonce="n", binding="b")["quiescent"] is False
     supervisor.write_receipt(path, {"version": 1, "nonce": "n", "binding": "b", "state": "quiescent"})
     assert supervisor.proof(path, nonce="n", binding="b")["quiescent"] is False
+
+
+def test_client_close_before_protocol_initialization_preserves_cleanup_proof(tmp_path):
+    from agent.transports.codex_app_server import CodexAppServerClient
+    native = tmp_path / "native"
+    native.write_text("#!" + sys.executable + "\nimport time\ntime.sleep(120)\n")
+    native.chmod(0o700)
+    config = configuration(tmp_path / "receipt.json")
+    client = CodexAppServerClient(codex_bin=str(native), supervision=config)
+    try:
+        # Do not await a handshake or a receipt; shutdown must allow an
+        # independently starting supervisor to establish and finish its proof.
+        client.close()
+        assert client.is_quiescent()
+        assert supervisor.read_receipt(config["receipt"])["state"] == "quiescent"
+    finally:
+        client.close()

@@ -30,8 +30,31 @@ def execution(root, binding, *, dispatch_id=None):
 
 def persist_reference(root, reference):
     from agent.plugin_llm_sessions import _digest
-    write_receipt(Path(root) / "reference.json", {"reference": reference,
-                                                "bindingDigest": _digest(reference["binding"]), "updatedAt": time.time()})
+    value = {"reference": reference, "bindingDigest": _digest(reference["binding"]), "updatedAt": time.time()}
+    # A new native root or resume must not erase an earlier execution's
+    # recoverable identity. Children may be added within the same execution.
+    write_receipt(_reference_path(root, reference), value)
+    write_receipt(Path(root) / "reference.json", value)
+
+
+def _reference_path(root, reference):
+    identity = reference.get("executionId", "")
+    if not isinstance(identity, str) or not re.fullmatch(r"[0-9a-f]{32}", identity):
+        raise ValueError("Native reference lacks durable execution identity")
+    return Path(root) / ("execution-" + identity + "-reference.json")
+
+
+def _saved_reference(root, reference):
+    from agent.plugin_llm_sessions import _digest
+    path = _reference_path(root, reference)
+    # Earlier host versions kept only the latest reference. Accept that record
+    # only when it still identifies this exact execution.
+    stored = read_receipt(path if path.exists() else Path(root) / "reference.json")
+    saved = stored.get("reference", {})
+    if (stored.get("bindingDigest") != _digest(reference["binding"])
+            or any(saved.get(key) != reference.get(key) for key in ("binding", "threadId", "executionId", "accountId", "consumerKey"))):
+        raise ValueError("Native reference does not match its host-owned history")
+    return saved
 
 
 def _raw_history(root, thread):
@@ -86,7 +109,6 @@ def _native_descendants(client, thread_id):
 
 
 def _scope(ctx, task, reference):
-    from agent.plugin_llm_sessions import _digest
     if ctx.manifest.source not in {"bundled", "user", "entrypoint"}:
         raise PermissionError("Native history requires an installed trusted plugin")
     if not supported():
@@ -98,11 +120,12 @@ def _scope(ctx, task, reference):
     )) or not isinstance(binding.get("key"), str) or not binding["key"]:
         raise ValueError("Native history belongs to another profile, plugin or auxiliary task")
     root = session_root(ctx, binding)
-    if not isinstance(reference.get("threadId"), str) or not re.fullmatch(r"[0-9a-f]{32}", reference.get("executionId", "")):
+    if (reference.get("threadId") is not None and not isinstance(reference["threadId"], str)
+            or not re.fullmatch(r"[0-9a-f]{32}", reference.get("executionId", ""))):
         raise ValueError("Native reference lacks durable execution identity")
-    stored = read_receipt(root / "reference.json")
-    if stored.get("bindingDigest") != _digest(binding) or stored.get("reference", {}).get("threadId") != reference["threadId"]:
-        raise ValueError("Native reference does not match its host-owned history")
+    saved = _saved_reference(root, reference)
+    if reference.get("threadId") is None and not (saved.get("newThread") is True and saved.get("turnSubmissionAttempted") is False):
+        raise ValueError("Native execution lacks a thread or unsubmitted startup evidence")
     return root, binding
 
 
@@ -117,6 +140,12 @@ def _inspect(ctx, task, reference):
     cleanup = proof(receipt, nonce=reference["executionId"], binding=_digest(binding))
     if not cleanup["quiescent"]:
         return {"reference": reference, "cleanup": cleanup, "thread": None, "children": []}
+    saved = _saved_reference(root, reference)
+    if saved.get("newThread") is True and saved.get("turnSubmissionAttempted") is False:
+        # The native server does not persist a fresh thread until its first
+        # turn. Report host evidence explicitly; do not invent native history.
+        return {"reference": reference, "cleanup": cleanup, "thread": None, "children": [],
+                "rawHistory": {}, "noTurnSubmitted": True}
     settings = _session_settings(ctx.workspaces._home_path, task)
     binary = settings["binary"]
     if check_codex_binary(binary, PROTOCOL_BASELINE) != (True, "0.161.0"):
@@ -130,7 +159,7 @@ def _inspect(ctx, task, reference):
     threads = {}
     try:
         client.initialize(capabilities={"experimentalApi": True})
-        latest = read_receipt(root / "reference.json")["reference"]
+        latest = _saved_reference(root, reference)
         pending = {reference["threadId"], *reference.get("childThreadIds", []), *latest.get("childThreadIds", []),
                    *_native_descendants(client, reference["threadId"])}
         while pending:
@@ -197,7 +226,8 @@ async def list_sessions(ctx, *, task, key):
         layout = ctx.workspaces._layout()
         result = []
         root = Path(ctx.workspaces._home_path) / "plugin-sessions" / layout.plugin_identity_digest
-        for path in root.glob("*/reference.json"):
+        seen = set()
+        for path in [*root.glob("*/execution-*-reference.json"), *root.glob("*/reference.json")]:
             value = read_receipt(path)
             ref = value.get("reference", {})
             binding = ref.get("binding", {})
@@ -206,6 +236,10 @@ async def list_sessions(ctx, *, task, key):
             ):
                 continue
             _scope(ctx, task, ref)
+            identity = (path.parent, ref["executionId"])
+            if identity in seen:
+                continue
+            seen.add(identity)
             result.append({"reference": ref, "updatedAt": value["updatedAt"]})
         return sorted(result, key=lambda r: r["updatedAt"])
     return await asyncio.to_thread(read)

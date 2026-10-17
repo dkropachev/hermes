@@ -230,8 +230,18 @@ class CodexAppServerClient:
             if self._proc.stdin and not self._proc.stdin.closed:
                 self._proc.stdin.close()
         try:
-            self._proc.terminate()
-            self._proc.wait(timeout=timeout)
+            if self._supervision is None:
+                self._proc.terminate()
+                self._proc.wait(timeout=timeout)
+            else:
+                # EOF lets the supervisor establish its receipt and handlers
+                # even if close races its Python startup. An immediate signal
+                # could kill it before either exists, losing cleanup proof.
+                try:
+                    self._proc.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    self._proc.terminate()
+                    self._proc.wait(timeout=max(7.0, timeout))
         except subprocess.TimeoutExpired:
             with contextlib.suppress(Exception):
                 kill_process_tree(self._proc.pid)

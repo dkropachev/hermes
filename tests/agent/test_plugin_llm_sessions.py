@@ -83,6 +83,26 @@ def context(home):
 
 
 @pytest.mark.asyncio
+async def test_configuration_failure_proves_no_native_spawn_and_releases_workspace(tmp_path, monkeypatch):
+    monkeypatch.setattr(sessions, "check_codex_binary", lambda *a: (True, "0.161.0"))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    spawned = []
+    monkeypatch.setattr(sessions, "CodexAppServerClient", lambda **kwargs: spawned.append(kwargs))
+
+    def invalid_configuration(*args):
+        raise ValueError("Invalid auxiliary configuration")
+
+    monkeypatch.setattr(sessions.PluginLlmSession, "_configure_native", invalid_configuration)
+    ctx = context(tmp_path / "profile")
+    handle = ctx.workspaces.acquire("startup", intent=ctx.workspaces.new_intent())
+    with pytest.raises(ValueError) as failure:
+        await sessions.open_session(ctx, task="test", key="startup", workspace_handle=handle, instructions="Stable", tools=[])
+    assert failure.value.native_execution_started is False
+    assert spawned == []
+    ctx.workspaces.release(handle)
+
+
+@pytest.mark.asyncio
 async def test_pin_scope_resume_and_nonblocking_tool(tmp_path, monkeypatch):
     monkeypatch.setattr(sessions, "CodexAppServerClient", Transport)
     monkeypatch.setattr(sessions, "check_codex_binary", lambda *a: (True, "0.161.0"))
@@ -379,9 +399,23 @@ async def test_real_app_server_registers_function_and_resumes(tmp_path, monkeypa
             "parents": [p.pid for p in child.parents()],
         }
         resumed = await sessions.open_session(ctx, **kwargs, resume=reference)
-        assert {k: v for k, v in resumed.reference.items() if k != "executionId"} == {k: v for k, v in reference.items() if k != "executionId"}
+        for key in ("binding", "threadId", "accountId", "childThreadIds", "consumerKey"):
+            assert resumed.reference[key] == reference[key]
         assert resumed.reference["executionId"] != reference["executionId"]
         await resumed.close()
+        replacement = await sessions.open_session(ctx, **kwargs)
+        assert replacement.reference["binding"] == reference["binding"]
+        assert replacement.reference["threadId"] != reference["threadId"]
+        await replacement.close()
+        # A different root with the same binding must not orphan either earlier
+        # execution, or mix its descendants into the older native history.
+        older = await ctx.llm.ainspect_session(task="test", reference=reference)
+        assert older["thread"]["id"] == reference["threadId"]
+        assert older["cleanup"]["quiescent"]
+        saved = await ctx.llm.alist_sessions(task="test", key="native")
+        assert {item["reference"]["executionId"] for item in saved} == {
+            reference["executionId"], resumed.reference["executionId"], replacement.reference["executionId"]}
+        assert len(calls) == 4
         recovered = await ctx.llm.arecover_session(task="test", reference=resumed.reference, workspace_handle=handle,
                                                   intent=ctx.workspaces.new_intent())
         assert recovered["cleanup"]["quiescent"]
@@ -415,8 +449,10 @@ async def test_permissions_and_child_limits_are_resume_bindings(tmp_path, monkey
     finally:
         await session.close()
     for changes in ({"execution_permission": "write"}, {"child_limit": 1}):
-        with pytest.raises(ValueError, match="another binding"):
+        with pytest.raises(ValueError, match="another binding") as failure:
             await sessions.open_session(ctx, **kwargs, resume=ref, **changes)
+        assert failure.value.resume_binding_changed is True
+        assert failure.value.native_execution_started is False
     for limit in (-1, 0, 5, True):
         with pytest.raises(ValueError, match="child limit"):
             await sessions.open_session(ctx, **kwargs, child_limit=limit)

@@ -530,6 +530,7 @@ session = await ctx.llm.aopen_session(
     extensions=(),
     execution_permission="read",  # default; write only after domain approval
     child_limit=4,  # bounded native child threads, from one through four
+    consumer_key=task_generation_key,  # optional durable application correlation
     on_event=handle_event,
     on_tool_call=handle_tool_call,
 )
@@ -588,6 +589,36 @@ network. Other workspaces and
 credential files are outside the readable roots. Shell environments exclude
 provider and GitHub credentials. Cleanup uncertainty retains the durable
 workspace dispatch receipt and must be inspected before reconnect or release.
+
+Probe `plugin_llm_inspection.v1` and `plugin_session_supervision.v1` before cold
+recovery. `await ctx.llm.alist_sessions(task=..., key=...)` discovers references
+owned by the current profile and plugin, including earlier executions of the same
+native thread or binding. `consumer_key` labels the application's task generation;
+it does not change resume bindings. Each execution has its own durable reference.
+The host records it before native initialization and updates it before readiness.
+
+`await ctx.llm.ainspect_session(task=..., reference=...)` reads native history only
+after an independent Linux supervisor proves descendant cleanup. It returns the
+root, verified descendant threads and complete raw transcripts, including a flag
+for an incomplete final record. It does not start an inference turn. Missing or
+inconsistent proof keeps recovery blocked. A fresh startup which provably never
+attempted a turn returns `noTurnSubmitted: true` and `thread: null`; the native
+server has no durable history yet. This is host evidence, not a fabricated turn.
+
+`await ctx.llm.arecover_session(task=..., reference=..., workspace_handle=...,
+intent=...)` additionally validates the exact workspace generation and reconnects
+its preserved contents. Persist and reuse the same host intent across retries.
+This operation never replays commands or authorizes implementation; the plugin
+must reconcile delivery, artifacts and domain approvals from the saved evidence.
+If opening fails before the host attempts any native spawn, the original exception
+type is preserved and its `native_execution_started` attribute is `False`. This
+positive pre-execution signal allows the application to request corrected settings
+without claiming that missing history proves cleanup. Other opening failures still
+require inspection and process proof.
+For a resume-binding mismatch the same pre-execution error also exposes
+`resume_binding_changed: True`. A caller which has already drained the prior run
+may open a fresh root without `resume`, retaining its application conversation
+history. This does not permit resubmission after an uncertain native RPC.
 
 ## Reference
 
