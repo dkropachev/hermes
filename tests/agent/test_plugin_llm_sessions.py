@@ -1,5 +1,6 @@
 """Session isolation, resumability and asynchronous callback contracts."""
 import asyncio
+import base64
 import json
 import queue
 import shlex
@@ -15,6 +16,13 @@ from agent import plugin_llm_sessions as sessions
 from hermes_cli.plugin_workspaces import InvalidWorkspaceHandleError, WorkspaceInUseError, WorkspaceLeaseError
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 from hermes_constants import hermes_home_key
+
+
+@pytest.fixture(autouse=True)
+def isolate_session_credentials(monkeypatch):
+    # Real protocol fixtures select a provider without authentication. Fake
+    # transports must never resolve a developer's production OAuth grant.
+    monkeypatch.setattr(sessions, "session_credentials", lambda *a, **k: None)
 
 
 class Transport:
@@ -36,6 +44,8 @@ class Transport:
             return {"thread": {"id": params.get("threadId", "thread-1")}}
         if method == "turn/start":
             return {"turn": {"id": "turn-1"}}
+        if method == "thread/read":
+            return {"thread": {"id": params["threadId"], "turns": []}}
         return {}
 
     def respond(self, rid, result):
@@ -177,13 +187,27 @@ async def test_active_turn_deadline_survives_question_suspension(tmp_path, monke
 @pytest.mark.asyncio
 @pytest.mark.linux_only
 @pytest.mark.live_system_guard_bypass
-async def test_real_app_server_registers_function_and_resumes(tmp_path, monkeypatch):
+@pytest.mark.parametrize("execution_permission", ["read", "write"])
+@pytest.mark.parametrize("external_auth", [False, True])
+async def test_real_app_server_registers_function_and_resumes(tmp_path, monkeypatch, execution_permission, external_auth):
     """Real Codex, local inference fixture: tools, completion and persisted resume."""
     ok, version = sessions.check_codex_binary("codex", sessions.PROTOCOL_BASELINE)
     if not ok or version != "0.161.0":
         pytest.skip("Pinned Codex 0.161.0 is not installed")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     calls = []
+    refreshes = []
+    unauthorized = [False]
+    access_token = "header." + base64.urlsafe_b64encode(json.dumps({
+        "email": "fixture@example.invalid", "exp": 4102444800,
+        "https://api.openai.com/auth": {"chatgpt_account_id": "fixture-account", "chatgpt_plan_type": "plus"},
+    }).encode()).decode().rstrip("=") + ".signature"
+    if external_auth:
+        def credentials(*args, **kwargs):
+            if kwargs.get("rejected_token"):
+                refreshes.append(kwargs)
+            return {"accessToken": access_token, "chatgptAccountId": "fixture-account"}
+        monkeypatch.setattr(sessions, "session_credentials", credentials)
     clients = []
     real_client = sessions.CodexAppServerClient
 
@@ -196,15 +220,18 @@ async def test_real_app_server_registers_function_and_resumes(tmp_path, monkeypa
     forbidden = tmp_path / "unrelated-secret"
     forbidden.write_text("test-only-secret")
     probe = (
-        "import os, pathlib, urllib.request\n"
-        "pathlib.Path('workspace-probe').write_text('ok')\n"
+        "import os, pathlib, urllib.request\n" +
+        ("pathlib.Path('workspace-probe').write_text('ok')\n" if execution_permission == "write" else
+         "try:\n pathlib.Path('workspace-probe').write_text('unsafe')\n"
+         "except (PermissionError, OSError):\n pass\n"
+         "else:\n raise AssertionError('Read session modified repository source')\n") +
         "assert 'GITHUB_USER_TOKEN' not in os.environ\n"
         f"p=pathlib.Path({str(forbidden)!r})\n"
         "try:\n p.read_text()\nexcept (PermissionError, FileNotFoundError):\n pass\n"
         "else:\n raise AssertionError('Unrelated file was readable')\n"
     )
     command_events = []
-    child_script = "import os,pathlib,time;pathlib.Path('child-pid').write_text(str(os.getpid()));time.sleep(120)"
+    child_script = "import time;time.sleep(120)"
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -216,7 +243,18 @@ async def test_real_app_server_registers_function_and_resumes(tmp_path, monkeypa
             self.wfile.write(b"network-ok")
 
         def do_POST(self):
+            if external_auth:
+                assert self.headers.get("Authorization") == "Bearer " + access_token
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if external_auth and not unauthorized[0]:
+                unauthorized[0] = True
+                data = b'{"error":{"message":"Fixture requests host credential refresh","type":"invalid_request_error"}}'
+                self.send_response(401)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(data)
+                return
             calls.append(body)
             item = ({"type": "function_call", "id": "fc_0", "call_id": "call_0",
                      "name": "exec_command", "arguments": json.dumps({"cmd": "python3 -c " + shlex.quote(probe), "max_output_tokens": 1000})} if len(calls) == 1 else
@@ -249,7 +287,8 @@ async def test_real_app_server_registers_function_and_resumes(tmp_path, monkeypa
     codex_home.mkdir()
     (codex_home / "config.toml").write_text(
         'model="fixture"\nmodel_provider="fixture"\n[model_providers.fixture]\n'
-        'name="Local fixture"\nwire_api="responses"\nrequires_openai_auth=false\n'
+        'name="Local fixture"\nwire_api="responses"\n'
+        f'requires_openai_auth={str(external_auth).lower()}\n'
         f'base_url="http://127.0.0.1:{server.server_port}/v1"\nsupports_websockets=false\n')
     completed, tool_called = asyncio.Event(), asyncio.Event()
     pending_requests = []
@@ -269,6 +308,8 @@ async def test_real_app_server_registers_function_and_resumes(tmp_path, monkeypa
     (tmp_path / "profile" / ".env").write_text("GITHUB_USER_TOKEN=test-only-token\n")
     handle = ctx.workspaces.acquire("native", intent=ctx.workspaces.new_intent())
     kwargs = dict(task="test", key="native", workspace_handle=handle, instructions="Stable",
+                  execution_permission=execution_permission,
+                  child_limit=1 if execution_permission == "read" else 4,
                   tools=[{"type": "function", "name": "save", "description": "Save private result",
                           "inputSchema": {"type": "object", "properties": {}}}],
                   on_event=on_event, on_tool_call=on_tool_call)
@@ -284,12 +325,21 @@ async def test_real_app_server_registers_function_and_resumes(tmp_path, monkeypa
         await asyncio.wait_for(completed.wait(), 20)
         assert tool_called.is_set()
         assert len(calls) == 4
+        if external_auth:
+            assert refreshes
+            assert all(refresh["previous_account"] == "fixture-account" for refresh in refreshes)
         assert any(t.get("name") == "exec_command" for t in calls[0]["tools"]), calls[0]["tools"]
         assert command_events, calls[1]
         assert command_events[0]["exitCode"] == 0, command_events[0].get("aggregatedOutput")
         assert "PROBE_OK" in command_events[0].get("aggregatedOutput", ""), command_events
         workspace = Path(ctx.workspaces.inspect(handle)["path"])
-        assert (workspace / "workspace-probe").read_text() == "ok"
+        if execution_permission == "write":
+            assert (workspace / "workspace-probe").read_text() == "ok"
+        else:
+            assert not (workspace / "workspace-probe").exists()
+        history = await session.inspect()
+        assert history["reference"] == session.reference
+        assert history["thread"]["turns"]
         # The sandbox has its own PID namespace; a PID written from within it
         # must never be interpreted as an unrelated host process identity.
         children = []
@@ -319,3 +369,169 @@ async def test_real_app_server_registers_function_and_resumes(tmp_path, monkeypa
             child.kill()
         server.shutdown()
         server.server_close()
+
+
+@pytest.mark.asyncio
+async def test_permissions_and_child_limits_are_resume_bindings(tmp_path, monkeypatch):
+    monkeypatch.setattr(sessions, "CodexAppServerClient", Transport)
+    monkeypatch.setattr(sessions, "check_codex_binary", lambda *a: (True, "0.161.0"))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    ctx = context(tmp_path / "profile")
+    handle = ctx.workspaces.acquire("permissions", intent=ctx.workspaces.new_intent())
+    kwargs = dict(task="test", key="permissions", workspace_handle=handle, instructions="Stable", tools=[])
+    session = await sessions.open_session(ctx, **kwargs)
+    try:
+        native = Transport.instances[-1]
+        assert (await session.inspect())["thread"]["id"] == session.reference["threadId"]
+        config = sessions.session_config({}, workspace=Path("/source"), private=tmp_path)
+        assert config["permissions"]["plugin-workspace"]["filesystem"]["/source"] == "read"
+        ref = session.reference
+    finally:
+        await session.close()
+    for changes in ({"execution_permission": "write"}, {"child_limit": 1}):
+        with pytest.raises(ValueError, match="another binding"):
+            await sessions.open_session(ctx, **kwargs, resume=ref, **changes)
+    for limit in (-1, 0, 5, True):
+        with pytest.raises(ValueError, match="child limit"):
+            await sessions.open_session(ctx, **kwargs, child_limit=limit)
+    with pytest.raises(ValueError, match="permission"):
+        await sessions.open_session(ctx, **kwargs, execution_permission="unrestricted")
+    native_config = tmp_path / ".codex" / "config.toml"
+    native_config.parent.mkdir(exist_ok=True)
+    native_config.write_text('model="changed-model"\n')
+    with pytest.raises(ValueError, match="another binding"):
+        await sessions.open_session(ctx, **kwargs, resume=ref)
+    assert not native.alive
+    ctx.workspaces.release(handle)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["item/tool/requestUserInput", "mcpServer/elicitation/request"])
+async def test_native_question_routes_and_callback_failure(tmp_path, monkeypatch, method):
+    monkeypatch.setattr(sessions, "CodexAppServerClient", Transport)
+    monkeypatch.setattr(sessions, "check_codex_binary", lambda *a: (True, "0.161.0"))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    ctx = context(tmp_path / "profile")
+    handle = ctx.workspaces.acquire("question", intent=ctx.workspaces.new_intent())
+    delivered = asyncio.Event()
+
+    def on_event(event):
+        if event["method"] == "session/question":
+            assert event["kind"] == method
+            delivered.set()
+            return None
+
+    session = await sessions.open_session(ctx, task="test", key="question", workspace_handle=handle,
+                                         instructions="Stable", tools=[], on_event=on_event)
+    try:
+        native = Transport.instances[-1]
+        native.requests.put({"id": 7, "method": method, "params": {}})
+        await asyncio.wait_for(delivered.wait(), 5)
+        assert 7 in (await session.inspect())["pendingRequestIds"]
+        await session.respond(7, {"answers": {}})
+        assert native.replies == [(7, {"answers": {}})]
+        with pytest.raises(ValueError, match="already answered"):
+            await session.respond(7, {})
+        session._on_event = lambda event: (_ for _ in ()).throw(RuntimeError("Persistence unavailable"))
+        await session._dispatch({"id": 8, "method": method, "params": {}}, True)
+        assert native.replies[-1][0] == 8
+        assert native.replies[-1][1] == -32601
+        assert not session._waiting
+    finally:
+        await session.close()
+        ctx.workspaces.release(handle)
+
+
+@pytest.mark.asyncio
+async def test_child_events_are_scoped_and_native_limit_violation_retires_execution(tmp_path, monkeypatch):
+    monkeypatch.setattr(sessions, "CodexAppServerClient", Transport)
+    monkeypatch.setattr(sessions, "check_codex_binary", lambda *a: (True, "0.161.0"))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    ctx = context(tmp_path / "profile")
+    handle = ctx.workspaces.acquire("children", intent=ctx.workspaces.new_intent())
+    child_seen, failed = asyncio.Event(), asyncio.Event()
+    observed = []
+
+    def event(note):
+        observed.append(note)
+        if note["method"] == "item/completed":
+            child_seen.set()
+        if note["method"] == "session/failed":
+            failed.set()
+
+    session = await sessions.open_session(ctx, task="test", key="children", workspace_handle=handle,
+                                         instructions="Stable", tools=[], child_limit=1, on_event=event)
+    native = Transport.instances[-1]
+    native.notes.put({"method": "thread/started", "params": {"thread": {"id": "child-1", "parentThreadId": "thread-1"}}})
+    native.notes.put({"method": "item/completed", "params": {"threadId": "foreign", "item": {"id": "foreign-command"}}})
+    native.notes.put({"method": "item/completed", "params": {"threadId": "child-1", "item": {"id": "child-command"}}})
+    await asyncio.wait_for(child_seen.wait(), 5)
+    assert not any(n.get("params", {}).get("threadId") == "foreign" for n in observed)
+    assert observed[-1]["params"]["sessionRootThreadId"] == "thread-1"
+    assert session.reference["childThreadIds"] == ["child-1"]
+    native.notes.put({"method": "thread/started", "params": {"thread": {"id": "child-2", "parentThreadId": "child-1"}}})
+    await asyncio.wait_for(failed.wait(), 5)
+    with pytest.raises(RuntimeError, match="child thread limit"):
+        await session.close()
+    assert session.is_closed
+    assert not native.alive
+    ctx.workspaces.release(handle)
+
+
+@pytest.mark.asyncio
+async def test_cancel_open_does_not_cancel_worker_ready_or_leak_pin(tmp_path, monkeypatch):
+    entered, proceed = threading.Event(), threading.Event()
+
+    def version(*args):
+        entered.set()
+        assert proceed.wait(timeout=5)
+        return True, "0.161.0"
+
+    monkeypatch.setattr(sessions, "CodexAppServerClient", Transport)
+    monkeypatch.setattr(sessions, "check_codex_binary", version)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    ctx = context(tmp_path / "profile")
+    handle = ctx.workspaces.acquire("cancel-open", intent=ctx.workspaces.new_intent())
+    opening = asyncio.create_task(sessions.open_session(ctx, task="test", key="cancel-open", workspace_handle=handle,
+                                                       instructions="Stable", tools=[]))
+    assert await asyncio.to_thread(entered.wait, 5)
+    opening.cancel()
+    proceed.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(opening, 5)
+    assert not Transport.instances[-1].alive
+    ctx.workspaces.release(handle)
+
+
+@pytest.mark.asyncio
+async def test_async_notifications_preserve_native_order(tmp_path, monkeypatch):
+    monkeypatch.setattr(sessions, "CodexAppServerClient", Transport)
+    monkeypatch.setattr(sessions, "check_codex_binary", lambda *a: (True, "0.161.0"))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    ctx = context(tmp_path / "profile")
+    handle = ctx.workspaces.acquire("events", intent=ctx.workspaces.new_intent())
+    first, release, second = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    saved = []
+
+    async def event(note):
+        if note["method"] == "first":
+            first.set()
+            await release.wait()
+        saved.append(note["method"])
+        if note["method"] == "second":
+            second.set()
+
+    session = await sessions.open_session(ctx, task="test", key="events", workspace_handle=handle,
+                                         instructions="Stable", tools=[], on_event=event)
+    try:
+        native = Transport.instances[-1]
+        native.notes.put({"method": "first", "params": {}})
+        native.notes.put({"method": "second", "params": {}})
+        await asyncio.wait_for(first.wait(), 5)
+        assert not second.is_set()
+        release.set()
+        await asyncio.wait_for(second.wait(), 5)
+        assert saved == ["first", "second"]
+    finally:
+        await session.close()
+        ctx.workspaces.release(handle)

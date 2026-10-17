@@ -565,7 +565,8 @@ class PluginLlm:
 
     async def aopen_session(self, *, task: str, key: str, workspace_handle: dict,
                             instructions: str, tools: list[dict], resume: Optional[dict] = None,
-                            extensions: Sequence[str] = (), on_event=None, on_tool_call=None):
+                            extensions: Sequence[str] = (), on_event=None, on_tool_call=None,
+                            execution_permission: str = "read", child_limit: int = 4):
         """Open a host-owned, workspace-confined Codex session for an owned task.
 
         Completions remain independent of this additive API. Session references
@@ -581,6 +582,7 @@ class PluginLlm:
             self._session_context, task=resolved, key=key, workspace_handle=workspace_handle,
             instructions=instructions, tools=tools, resume=resume, extensions=extensions,
             on_event=on_event, on_tool_call=on_tool_call,
+            execution_permission=execution_permission, child_limit=child_limit,
         )
 
     def complete(

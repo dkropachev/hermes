@@ -528,6 +528,8 @@ session = await ctx.llm.aopen_session(
     }],
     resume=saved_reference,
     extensions=(),
+    execution_permission="read",  # default; write only after domain approval
+    child_limit=4,  # bounded native child threads, from one through four
     on_event=handle_event,
     on_tool_call=handle_tool_call,
 )
@@ -535,9 +537,14 @@ await session.start_turn("Investigate the pinned source.")
 saved_reference = session.reference
 ```
 
-The session exposes `start_turn`, `steer`, `respond`, `interrupt`, and `close`.
+The session exposes `start_turn`, `steer`, `respond`, `inspect`, `interrupt`, and
+`close`. `is_closed` reports worker exit; always await `close()` to establish
+cleanup or surface an unproven workspace dispatch. `inspect()` returns native
+history for the bound thread without starting a turn. Inspection alone does not
+prove process cleanup or authorize replay of commands.
 Its serializable reference binds the profile, plugin identity, task, conversation
-key, workspace generation, and instruction/tool fingerprints. A changed binding
+key, workspace generation, execution permission, child limit, account identity,
+and resolved model configuration and instruction/tool fingerprints. A changed binding
 requires another session generation. Never send native request IDs to a browser;
 application questions need durable logical interaction IDs.
 
@@ -556,6 +563,17 @@ raw command, tool and execution events must not be forwarded to users. A failed
 persistence callback retires execution. The caller must durably record the
 reference and recover missing threads from application state.
 
+Repository access defaults to read-only. Writable execution must be selected by
+the trusted plugin after validating its current domain approval. Both modes may
+write to their private HOME and temporary directory. Notification callbacks run
+in native order; server-request callbacks remain independent so questions and
+Stop do not block one another. Closing cancels and drains pending callbacks.
+
+For Codex authentication, Hermes supplies access tokens from its credential
+manager and handles native refresh requests. Concurrent sessions adopt a peer's
+token rotation through the host resolver. Session homes never receive rotating
+refresh tokens; account changes require explicitly opening another session.
+
 The registered auxiliary task selects model and reasoning settings. An unset
 model uses Codex configuration, independent of the main agent's model. Session
 capacity defaults to two active turns per profile, with the plugin setting
@@ -564,8 +582,9 @@ waiting questions release execution capacity. Turns expire after 30 minutes,
 idle processes close after two minutes, and native children are limited to four.
 
 A dedicated worker pins the host workspace until process cleanup completes.
-The permission profile allows workspace writes, a private home and temporary
-directory, required runtime reads, and outbound network. Other workspaces and
+The permission profile grants selected read/write access to the workspace, writes
+to a private home and temporary directory, required runtime reads, and outbound
+network. Other workspaces and
 credential files are outside the readable roots. Shell environments exclude
 provider and GitHub credentials. Cleanup uncertainty retains the durable
 workspace dispatch receipt and must be inspected before reconnect or release.

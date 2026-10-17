@@ -20,6 +20,7 @@ import tomllib
 from pathlib import Path
 
 from agent.transports.codex_app_server import CodexAppServerClient, check_codex_binary
+from agent.plugin_session_credentials import session_credentials
 
 PROTOCOL_BASELINE = (0, 161, 0)
 _live: dict[tuple[str, str, str], "PluginLlmSession"] = {}
@@ -38,13 +39,36 @@ def _toml(value):
     return json.dumps(value)
 
 
-def session_config(codex_config: dict, *, workspace: Path, private: Path) -> dict:
+def _session_settings(profile_home, task):
+    from agent.auxiliary_client import _get_auxiliary_task_config
+    from hermes_cli.config import load_config_readonly
+    from hermes_cli.codex_runtime_switch import get_configured_codex_binary
+    from hermes_cli.plugins_loader import _plugin_home_scope
+
+    with _plugin_home_scope(profile_home):
+        config = load_config_readonly() or {}
+        codex_home = Path.home() / ".codex"
+        native = tomllib.loads((codex_home / "config.toml").read_text()) if (codex_home / "config.toml").exists() else {}
+        auxiliary = _get_auxiliary_task_config(task)
+        return {"binary": get_configured_codex_binary(config),
+                "native": {k: v for k, v in native.items() if k in {
+                    "model", "model_provider", "model_providers", "model_reasoning_effort",
+                    "preferred_auth_method", "cli_auth_credentials_store"}},
+                "auxiliary": {k: v for k, v in auxiliary.items() if k in {"provider", "model", "reasoning_effort"}}}
+
+
+def session_config(codex_config: dict, *, workspace: Path, private: Path,
+                   execution_permission="read", child_limit=4) -> dict:
     """Construct an isolated configuration; never inherit installed extensions.
 
     A minimal filesystem allowlist protects other homes/workspaces by default.
     The shell inherits only session-owned HOME/TMPDIR and a normal executable
     search path. Provider credentials remain in the app-server process.
     """
+    if execution_permission not in {"read", "write"}:
+        raise ValueError("Execution permission must be read or write")
+    if type(child_limit) is not int or not 1 <= child_limit <= 4:
+        raise ValueError("Native child limit must be between one and four")
     selected = {k: v for k, v in codex_config.items() if k in {
         "model", "model_provider", "model_providers", "model_reasoning_effort",
         "preferred_auth_method", "cli_auth_credentials_store",
@@ -52,7 +76,7 @@ def session_config(codex_config: dict, *, workspace: Path, private: Path) -> dic
     selected.update({
         "default_permissions": "plugin-workspace",
         "permissions": {"plugin-workspace": {
-            "filesystem": {":minimal": "read", str(workspace): "write",
+            "filesystem": {":minimal": "read", str(workspace): execution_permission,
                            str(private / "tmp"): "write", str(private / "home"): "write"},
             "network": {"enabled": True},
         }},
@@ -60,7 +84,7 @@ def session_config(codex_config: dict, *, workspace: Path, private: Path) -> dic
         "mcp_servers": {}, "plugins": {}, "notify": [],
         "features": {"apps": False, "plugins": False, "shell_snapshot": False,
                      "codex_hooks": False},
-        "agents": {"max_threads": 4},
+        "agents": {"max_threads": child_limit},
         "shell_environment_policy": {"inherit": "none", "set": {
             "PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": str(private / "home"),
             "TMPDIR": str(private / "tmp"), "LANG": "C.UTF-8",
@@ -70,11 +94,17 @@ def session_config(codex_config: dict, *, workspace: Path, private: Path) -> dic
 
 
 async def open_session(ctx, *, task, key, workspace_handle, instructions, tools,
-                       resume=None, extensions=(), on_event=None, on_tool_call=None):
+                       resume=None, extensions=(), on_event=None, on_tool_call=None,
+                       execution_permission="read", child_limit=4):
     if ctx.manifest.source not in {"bundled", "user", "entrypoint"}:
         raise PermissionError("Native execution sessions require an installed trusted plugin")
     if not key or not isinstance(instructions, str):
         raise ValueError("Session key and instructions are required")
+    # Validate before acquiring a workspace pin or starting a native process.
+    if execution_permission not in {"read", "write"}:
+        raise ValueError("Execution permission must be read or write")
+    if type(child_limit) is not int or not 1 <= child_limit <= 4:
+        raise ValueError("Native child limit must be between one and four")
     # Extension code must be selected and loaded by the host before it can run.
     # Domain read integrations use ctx.call_mcp through the plugin's scoped tool.
     if extensions:
@@ -85,11 +115,14 @@ async def open_session(ctx, *, task, key, workspace_handle, instructions, tools,
     if len({t["name"] for t in tools}) != len(tools):
         raise ValueError("Duplicate dynamic tool name")
     snapshot = await asyncio.to_thread(ctx.workspaces.inspect, workspace_handle)
+    settings = await asyncio.to_thread(_session_settings, ctx.workspaces._home_path, task)
     layout = ctx.workspaces._layout()
     binding = {"profile": str(layout.profile_key), "plugin": layout.plugin_identity_digest,
                "key": key, "task": task, "workspace": snapshot["workspaceId"],
                "generation": snapshot["generation"],
-               "instructions": _digest(instructions), "tools": _digest(tools), "extensions": []}
+               "instructions": _digest(instructions), "tools": _digest(tools), "extensions": [],
+               "executionPermission": execution_permission, "childLimit": child_limit,
+               "configuration": _digest(settings)}
     if resume and resume.get("binding") != binding:
         raise ValueError("Session reference belongs to another binding or configuration")
     owner = (binding["profile"], binding["plugin"], key)
@@ -97,7 +130,7 @@ async def open_session(ctx, *, task, key, workspace_handle, instructions, tools,
         if owner in _live:
             raise RuntimeError("A session is already open for this conversation")
         session = PluginLlmSession(ctx, owner, binding, workspace_handle, snapshot, instructions,
-                                   tools, resume, on_event, on_tool_call)
+                                   tools, resume, on_event, on_tool_call, settings)
         _live[owner] = session
     try:
         await session._open()
@@ -112,10 +145,11 @@ async def open_session(ctx, *, task, key, workspace_handle, instructions, tools,
 
 class PluginLlmSession:
     def __init__(self, ctx, owner, binding, handle, snapshot, instructions, tools,
-                 resume, on_event, on_tool_call):
+                 resume, on_event, on_tool_call, settings):
         self._ctx, self._owner, self._binding = ctx, owner, binding
         self._handle, self._snapshot = handle, snapshot
         self._instructions, self._tools = instructions, json.loads(json.dumps(tools))
+        self._settings = settings
         self._loop = asyncio.get_running_loop()
         self._commands = queue.Queue()
         self._ready = concurrent.futures.Future()
@@ -133,17 +167,28 @@ class PluginLlmSession:
         self._active_elapsed = 0.0
         self._reference = None
         self._registration = None
+        self._credentials = None
+        self._account_id = resume.get("accountId") if resume else None
+        self._event_lock = asyncio.Lock()
+        self._children = set(resume.get("childThreadIds", [])) if resume else set()
+        self._active_children = set()
 
     @property
     def reference(self):
         return json.loads(json.dumps({"version": 1, "binding": self._binding,
-                                      "threadId": self._thread_id}))
+                                      "threadId": self._thread_id, "accountId": self._account_id,
+                                      "childThreadIds": sorted(self._children)}))
+
+    @property
+    def is_closed(self):
+        """The worker exited; close() still establishes cleanup or raises."""
+        return self._done.done()
 
     async def _open(self):
         context = contextvars.copy_context()
         threading.Thread(target=context.run, args=(self._worker,), daemon=True,
                          name="plugin-codex-session").start()
-        await asyncio.wrap_future(self._ready)
+        await asyncio.shield(asyncio.wrap_future(self._ready))
 
     async def _rpc(self, method, params=None):
         if self._closed:
@@ -172,17 +217,42 @@ class PluginLlmSession:
     async def steer(self, inputs):
         if not self._turn_id:
             return {"accepted": False}
+        turn_id = self._turn_id
         items = [{"type": "text", "text": inputs}] if isinstance(inputs, str) else inputs
         await self._rpc("turn/steer", {"threadId": self._thread_id,
-                                      "expectedTurnId": self._turn_id, "input": items})
-        return {"accepted": True}
+                                      "expectedTurnId": turn_id, "input": items})
+        return {"accepted": True, "turnId": turn_id}
+
+    async def inspect(self):
+        """Read native history for this bound thread without starting a turn.
+
+        This reports native state only. The caller must also inspect the pinned
+        workspace and prove process cleanup before continuing expired execution.
+        """
+        result = await self._rpc("thread/read", {"threadId": self._thread_id, "includeTurns": True})
+        thread = result["thread"]
+        if thread["id"] != self._thread_id:
+            raise RuntimeError("Inspected another Codex thread")
+        children = []
+        for child in sorted(self._children):
+            inspected = await self._rpc("thread/read", {"threadId": child, "includeTurns": True})
+            if inspected["thread"]["id"] != child:
+                raise RuntimeError("Inspected another native child thread")
+            children.append(inspected["thread"])
+        return {"reference": self.reference, "thread": thread,
+                "children": children, "activeTurnId": self._turn_id,
+                "pendingRequestIds": list(self._requests)}
 
     async def respond(self, request_id, result):
         if request_id not in self._requests:
             raise ValueError("Unknown or already answered session request")
+        # Consume the request before yielding to fence competing operators. A
+        # transport failure is uncertain delivery and must not be replayed.
         self._requests.remove(request_id)
-        self._clear_waiting(request_id)
-        return await self._rpc("$respond", {"id": request_id, "result": result})
+        try:
+            return await self._rpc("$respond", {"id": request_id, "result": result})
+        finally:
+            self._clear_waiting(request_id)
 
     def _wait_for_response(self, request_id):
         now = time.monotonic()
@@ -213,13 +283,16 @@ class PluginLlmSession:
 
     async def close(self):
         self._request_close()
-        await asyncio.wrap_future(self._done)
-        for callback in list(self._callbacks):
-            if callback is not asyncio.current_task():
+        try:
+            await asyncio.shield(asyncio.wrap_future(self._done))
+        finally:
+            callbacks = [task for task in self._callbacks if task is not asyncio.current_task()]
+            for callback in callbacks:
                 callback.cancel()
-        with _live_lock:
-            if _live.get(self._owner) is self:
-                del _live[self._owner]
+            await asyncio.gather(*callbacks, return_exceptions=True)
+            with _live_lock:
+                if self._done.done() and _live.get(self._owner) is self:
+                    del _live[self._owner]
 
     async def _dispatch(self, message, server_request=False):
         try:
@@ -263,9 +336,12 @@ class PluginLlmSession:
                     return
                 await self.respond(request_id, result)
             elif self._on_event:
-                result = self._on_event(message)
-                if inspect.isawaitable(result):
-                    await result
+                # Preserve native notification order across async persistence
+                # callbacks. Server requests remain independent for Stop/answers.
+                async with self._event_lock:
+                    result = self._on_event(message)
+                    if inspect.isawaitable(result):
+                        await result
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -299,13 +375,9 @@ class PluginLlmSession:
             profile_home = self._ctx.workspaces._home_path
             home_token = set_hermes_home_override(profile_home)
             secret_token = set_secret_scope(build_profile_secret_scope(profile_home))
-            from agent.auxiliary_client import _get_auxiliary_task_config
-            from hermes_cli.config import load_config_readonly
-            from hermes_cli.codex_runtime_switch import get_configured_codex_binary
             from hermes_constants import get_hermes_home
 
-            config = load_config_readonly() or {}
-            codex_bin = get_configured_codex_binary(config)
+            codex_bin = self._settings["binary"]
             ok, version = check_codex_binary(codex_bin, PROTOCOL_BASELINE)
             if not ok or version != ".".join(map(str, PROTOCOL_BASELINE)):
                 raise RuntimeError("Plugin sessions require the protocol-tested Codex 0.161.0")
@@ -314,12 +386,13 @@ class PluginLlmSession:
             for name in ("tmp", "home"):
                 (root / name).mkdir(mode=0o700, exist_ok=True)
             # Codex auth stays outside the readable permission roots.
-            codex_home = Path.home() / ".codex"
-            codex_config = tomllib.loads((codex_home / "config.toml").read_text()) if (codex_home / "config.toml").exists() else {}
-            if (codex_home / "auth.json").exists():
-                shutil.copyfile(codex_home / "auth.json", root / "auth.json")
-                (root / "auth.json").chmod(0o600)
-            selected = session_config(codex_config, workspace=Path(self._snapshot["path"]), private=root)
+            codex_config = self._settings["native"]
+            # Remove credentials left by older session implementations. Native
+            # execution never owns a rotating refresh token.
+            (root / "auth.json").unlink(missing_ok=True)
+            selected = session_config(codex_config, workspace=Path(self._snapshot["path"]), private=root,
+                                      execution_permission=self._binding["executionPermission"],
+                                      child_limit=self._binding["childLimit"])
             # Codex re-execs its own binary inside bwrap. User installations
             # commonly live under ~/.codex; allow the executable files only,
             # while keeping authentication and all other package state hidden.
@@ -329,7 +402,7 @@ class PluginLlmSession:
             code_host = executable.parent / "codex-code-mode-host"
             if code_host.is_file():
                 runtime_files[str(code_host)] = "read"
-            task_config = _get_auxiliary_task_config(self._binding["task"])
+            task_config = self._settings["auxiliary"]
             provider = str(task_config.get("provider") or "auto")
             if provider not in {"auto", "openai-codex", "codex"}:
                 raise ValueError("The session auxiliary task must select Codex")
@@ -337,6 +410,14 @@ class PluginLlmSession:
                 selected["model"] = task_config["model"]
             if task_config.get("reasoning_effort"):
                 selected["model_reasoning_effort"] = task_config["reasoning_effort"]
+            selected_provider = selected.get("model_provider", "openai")
+            provider_config = selected.get("model_providers", {}).get(selected_provider, {})
+            if selected_provider == "openai" or provider_config.get("requires_openai_auth", False):
+                self._credentials = session_credentials(self._binding["profile"], previous_account=self._account_id)
+                if self._credentials:
+                    self._account_id = self._credentials["chatgptAccountId"]
+            elif self._account_id:
+                raise PermissionError("Resumed session provider no longer owns its account")
             (root / "config.toml").write_text("\n".join(f"{json.dumps(k)} = {_toml(v)}" for k, v in selected.items()))
             (root / "config.toml").chmod(0o600)
             # Native shell execution uses the existing durable terminal pin. Its
@@ -350,6 +431,8 @@ class PluginLlmSession:
                                               env={"TMPDIR": str(root / "tmp")})
                 try:
                     client.initialize(capabilities={"experimentalApi": True})
+                    if self._credentials:
+                        client.request("account/login/start", {"type": "chatgptAuthTokens", **self._credentials})
                     params = {"cwd": self._snapshot["path"], "permissions": "plugin-workspace",
                               "approvalPolicy": "never", "developerInstructions": self._instructions,
                               "dynamicTools": self._tools, "experimentalRawEvents": False}
@@ -359,6 +442,17 @@ class PluginLlmSession:
                         result = client.request("thread/resume", {**params, "threadId": self._thread_id})
                         if result["thread"]["id"] != self._thread_id:
                             raise RuntimeError("Resumed another Codex thread")
+                        pending = set(self._children)
+                        verified = {self._thread_id}
+                        while pending:
+                            before = len(pending)
+                            for child in list(pending):
+                                native = client.request("thread/read", {"threadId": child, "includeTurns": False})["thread"]
+                                if native["id"] == child and native.get("parentThreadId") in verified:
+                                    verified.add(child)
+                                    pending.remove(child)
+                            if len(pending) == before:
+                                raise ValueError("Resume reference contains unrelated native child threads")
                     else:
                         self._thread_id = client.request("thread/start", params)["thread"]["id"]
                     self._ready.set_result(True)
@@ -430,15 +524,46 @@ class PluginLlmSession:
                         future.set_exception(exc)
             while note := client.take_notification():
                 params = note.get("params") or {}
-                if params.get("threadId") not in {None, self._thread_id}:
+                thread = params.get("thread") or {}
+                if note["method"] == "thread/started" and thread.get("parentThreadId") in {self._thread_id, *self._children}:
+                    child = thread["id"]
+                    if child not in self._active_children and len(self._active_children) >= self._binding["childLimit"]:
+                        raise RuntimeError("Native session exceeded its child thread limit")
+                    self._children.add(child)
+                    self._active_children.add(child)
+                observed_thread = params.get("threadId") or thread.get("id")
+                if observed_thread not in {None, self._thread_id, *self._children}:
                     continue
-                if note["method"] == "turn/completed":
+                if note["method"] == "thread/closed":
+                    self._active_children.discard(observed_thread)
+                if observed_thread in self._children:
+                    note = {**note, "params": {**params, "sessionRootThreadId": self._thread_id}}
+                if observed_thread not in self._children and note["method"] == "turn/completed" and (
+                    (params.get("turn") or {}).get("id") == self._turn_id
+                ):
                     self._turn_id = None
                     self._started_at = None
                     self._active_elapsed = 0.0
                     self._last_activity = now
                 self._deliver(note)
             while request := client.take_server_request():
-                self._deliver(request, True)
+                request_thread = (request.get("params") or {}).get("threadId")
+                if request_thread not in {None, self._thread_id, *self._children}:
+                    client.respond_error(request["id"], -32602, "Request belongs to another native thread")
+                    continue
+                if request.get("method") == "account/chatgptAuthTokens/refresh":
+                    try:
+                        if self._credentials is None:
+                            raise PermissionError("No host-owned Codex credential for this session")
+                        self._credentials = session_credentials(
+                            self._binding["profile"], rejected_token=self._credentials["accessToken"],
+                            previous_account=(request.get("params") or {}).get("previousAccountId")
+                                             or self._credentials["chatgptAccountId"])
+                        client.respond(request["id"], self._credentials)
+                    except Exception:
+                        client.respond_error(request["id"], -32000, "Host credential refresh failed")
+                        raise RuntimeError("Host credential refresh failed") from None
+                else:
+                    self._deliver(request, True)
         if not self._closed:
             raise RuntimeError("Codex transport exited during the session")
