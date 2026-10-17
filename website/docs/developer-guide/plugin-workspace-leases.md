@@ -98,6 +98,26 @@ lease generation so read-before-write state stays scoped to that generation.
 and lease plus bound dispatch. The recording `workspace_tools` facade exposes the production method
 shape in the third mode, but all tool calls are rejected during registration.
 
+### Binary source trees
+
+Probe `workspace_trees.v1` before using `ctx.workspace_tools.materialize_tree(handle,
+entries)` or `snapshot_tree(handle)`. This additive feature requires directory-relative,
+no-follow file operations. Each entry contains a normalized `path`, Git file mode
+(`100644`, `100755`, or `120000`), base64 `data`, and an optional verified `sha256`.
+Snapshot results contain sorted entries, `totalBytes`, and `complete: true`.
+
+Materialization requires an empty lease directory and validates all entries before
+writing. A partial filesystem failure preserves the partial contents for inspection;
+it never erases or overwrites an existing workspace. Symlink entries preserve the
+link text; host tree operations do not follow them. Special files, ambiguous path
+aliases, path traversal and file/directory collisions are rejected.
+
+Transfers are bounded at 100,000 entries, 64 MiB per file and 512 MiB total. These
+are operational transfer bounds, independent of a consumer's patch-size advice.
+Both operations hold the normal workspace dispatch pin. Close native sessions and
+establish descendant cleanup before capturing a tree. The API executes no shell,
+Git hooks, repository scripts or repository-supplied configuration.
+
 ## Lifecycle API
 
 The facade has seven methods. `acquire` and `reconnect` require an idempotency intent that the caller

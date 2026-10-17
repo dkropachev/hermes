@@ -1501,7 +1501,7 @@ class TestForceReloadSymmetry:
         assert _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE in result
         hold.set()
 
-    def test_force_reload_of_one_profile_does_not_orphan_another(self, monkeypatch):
+    def test_force_reload_of_one_profile_does_not_orphan_another(self, monkeypatch, tmp_path):
         """Real two-manager regression: force-reloading profile A's plugin
         manager must leave profile B's shell hook registered exactly once —
         not duplicated, not dropped (#92682 review).
@@ -1516,12 +1516,12 @@ class TestForceReloadSymmetry:
             PluginManager, "_discover_and_load_inner", lambda self_inner: None,
         )
 
-        monkeypatch.setenv("HERMES_HOME", "/tmp/profile-a")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-a"))
         mgr_a = PluginManager()
         plugins_mod._plugin_manager = mgr_a
         shell_hooks_mod.register_from_config(cfg, accept_hooks=True)
 
-        monkeypatch.setenv("HERMES_HOME", "/tmp/profile-b")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-b"))
         mgr_b = PluginManager()
         plugins_mod._plugin_manager = mgr_b
         shell_hooks_mod.register_from_config(cfg, accept_hooks=True)
@@ -1539,7 +1539,7 @@ class TestForceReloadSymmetry:
         # B's later adapter reconnect re-runs register_from_config(); its
         # idempotence key must still be intact, so this must be a no-op
         # rather than appending a second callback to B's live manager.
-        monkeypatch.setenv("HERMES_HOME", "/tmp/profile-b")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-b"))
         second = shell_hooks_mod.register_from_config(cfg, accept_hooks=True)
 
         assert second == []

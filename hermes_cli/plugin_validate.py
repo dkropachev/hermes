@@ -295,7 +295,7 @@ class RecordingContext:
     def has_host_feature(self, feature):
         return (
             (workspace_leases and feature == "workspace_leases.v1")
-            or (workspace_dispatch and feature == "workspace_bound_dispatch.v1")
+            or (workspace_dispatch and feature in {"workspace_bound_dispatch.v1", "workspace_trees.v1"})
         )
 
     @property
@@ -356,7 +356,7 @@ class RecordingWorkspaceTools:
     def _blocked(self, *args, **kwargs):
         raise RuntimeError("workspace tool calls are not allowed during plugin registration")
 
-    terminal = read_file = write_file = edit_file = _blocked
+    terminal = read_file = write_file = edit_file = materialize_tree = snapshot_tree = _blocked
 
 
 def emit(payload):

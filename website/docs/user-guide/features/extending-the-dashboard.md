@@ -509,6 +509,10 @@ SDK.hooks.useRef
 SDK.hooks.useContext
 SDK.hooks.createContext
 
+// Host router hooks (call inside registered React components)
+SDK.navigation.useLocation   // pathname, search and hash from the dashboard router
+SDK.navigation.useNavigate   // navigate(to, { replace?: boolean })
+
 // UI components (shadcn/ui primitives)
 SDK.components.Card
 SDK.components.CardHeader
@@ -548,6 +552,17 @@ SDK.fetchJSON("/api/plugins/my-plugin/data")
 ```
 
 `fetchJSON` injects the session auth token, surfaces errors as thrown exceptions, and parses JSON automatically.
+
+Use `SDK.navigation` when plugin state follows the URL. Its hooks share the host
+router, so profile-selector changes, browser history and plugin navigation update
+the same location. Avoid a separate router or direct `history.pushState` calls.
+Older hosts may omit this additive capability; check for it before rendering a
+component that calls the hooks.
+
+Managed named profiles can load general plugins installed under their root home's
+`plugins/` directory. A profile-local installation takes precedence. Each profile
+still needs its own plugin enablement and keeps its own settings, credentials and
+runtime state; sharing an installation shares code only.
 
 #### Calling built-in Hermes endpoints
 

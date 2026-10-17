@@ -508,6 +508,118 @@ tool the agent invokes, use `register_tool`. If it needs to react
 to a lifecycle event, use `register_hook`. If it needs to make its
 own model call — for any reason, structured or not — `ctx.llm`.
 
+## Workspace execution sessions
+
+Installed trusted plugins can open a persistent Codex thread through the additive
+`ctx.llm.aopen_session` API. Probe `plugin_llm_sessions.v1` and
+`workspace_codex_execution.v1` with `ctx.has_host_feature` first. This API requires
+Codex 0.161.0; other versions fail closed until protocol conformance is verified.
+
+```python
+session = await ctx.llm.aopen_session(
+    task="workspace_analysis",  # registered by this plugin
+    key=conversation_id,
+    workspace_handle=lease_handle,
+    instructions=stable_instructions,
+    tools=[{
+        "type": "function", "name": "save_result",
+        "description": "Save a private validated result",
+        "inputSchema": {"type": "object", "properties": {}},
+    }],
+    resume=saved_reference,
+    extensions=(),
+    execution_permission="read",  # default; write only after domain approval
+    child_limit=4,  # bounded native child threads, from one through four
+    consumer_key=task_generation_key,  # optional durable application correlation
+    on_event=handle_event,
+    on_tool_call=handle_tool_call,
+)
+await session.start_turn("Investigate the pinned source.")
+saved_reference = session.reference
+```
+
+The session exposes `start_turn`, `steer`, `respond`, `inspect`, `interrupt`, and
+`close`. `is_closed` reports worker exit; always await `close()` to establish
+cleanup or surface an unproven workspace dispatch. `inspect()` returns native
+history for the bound thread without starting a turn. Inspection alone does not
+prove process cleanup or authorize replay of commands.
+Its serializable reference binds the profile, plugin identity, task, conversation
+key, workspace generation, execution permission, child limit, account identity,
+and resolved model configuration and instruction/tool fingerprints. A changed binding
+requires another session generation. Never send native request IDs to a browser;
+application questions need durable logical interaction IDs.
+
+Tool callbacks receive the tool arguments and a host-injected `requestId`. Return
+a JSON value for an immediate result, or `None` after persisting a durable
+interaction. Later `session.respond(request_id, result)` supplies the native
+protocol response. Dynamic-tool responses use `contentItems` and `success`.
+Question callbacks receive `session/question`; their result uses the question's
+native response schema. Permission escalation requests are declined. Unselected
+native extensions are disabled; nonempty `extensions` is currently rejected.
+Selected external read integrations can use scoped dynamic tools and `ctx.call_mcp`.
+
+Callbacks execute on the caller's event loop without blocking transport event
+processing. The application must validate domain results and adapt public events;
+raw command, tool and execution events must not be forwarded to users. A failed
+persistence callback retires execution. The caller must durably record the
+reference and recover missing threads from application state.
+
+Repository access defaults to read-only. Writable execution must be selected by
+the trusted plugin after validating its current domain approval. Both modes may
+write to their private HOME and temporary directory. Notification callbacks run
+in native order; server-request callbacks remain independent so questions and
+Stop do not block one another. Closing cancels and drains pending callbacks.
+
+For Codex authentication, Hermes supplies access tokens from its credential
+manager and handles native refresh requests. Concurrent sessions adopt a peer's
+token rotation through the host resolver. Session homes never receive rotating
+refresh tokens; account changes require explicitly opening another session.
+
+The registered auxiliary task selects model and reasoning settings. An unset
+model uses Codex configuration, independent of the main agent's model. Session
+capacity defaults to two active turns per profile, with the plugin setting
+`active_agent_sessions` bounded from one to four. One turn runs per session key;
+waiting questions release execution capacity. Turns expire after 30 minutes,
+idle processes close after two minutes, and native children are limited to four.
+
+A dedicated worker pins the host workspace until process cleanup completes.
+The permission profile grants selected read/write access to the workspace, writes
+to a private home and temporary directory, required runtime reads, and outbound
+network. Other workspaces and
+credential files are outside the readable roots. Shell environments exclude
+provider and GitHub credentials. Cleanup uncertainty retains the durable
+workspace dispatch receipt and must be inspected before reconnect or release.
+
+Probe `plugin_llm_inspection.v1` and `plugin_session_supervision.v1` before cold
+recovery. `await ctx.llm.alist_sessions(task=..., key=...)` discovers references
+owned by the current profile and plugin, including earlier executions of the same
+native thread or binding. `consumer_key` labels the application's task generation;
+it does not change resume bindings. Each execution has its own durable reference.
+The host records it before native initialization and updates it before readiness.
+
+`await ctx.llm.ainspect_session(task=..., reference=...)` reads native history only
+after an independent Linux supervisor proves descendant cleanup. It returns the
+root, verified descendant threads and complete raw transcripts, including a flag
+for an incomplete final record. It does not start an inference turn. Missing or
+inconsistent proof keeps recovery blocked. A fresh startup which provably never
+attempted a turn returns `noTurnSubmitted: true` and `thread: null`; the native
+server has no durable history yet. This is host evidence, not a fabricated turn.
+
+`await ctx.llm.arecover_session(task=..., reference=..., workspace_handle=...,
+intent=...)` additionally validates the exact workspace generation and reconnects
+its preserved contents. Persist and reuse the same host intent across retries.
+This operation never replays commands or authorizes implementation; the plugin
+must reconcile delivery, artifacts and domain approvals from the saved evidence.
+If opening fails before the host attempts any native spawn, the original exception
+type is preserved and its `native_execution_started` attribute is `False`. This
+positive pre-execution signal allows the application to request corrected settings
+without claiming that missing history proves cleanup. Other opening failures still
+require inspection and process proof.
+For a resume-binding mismatch the same pre-execution error also exposes
+`resume_binding_changed: True`. A caller which has already drained the prior run
+may open a fresh root without `resume`, retaining its application conversation
+history. This does not permit resubmission after an uncertain native RPC.
+
 ## Reference
 
 * Implementation: [`agent/plugin_llm.py`](https://github.com/NousResearch/hermes-agent/blob/main/agent/plugin_llm.py)

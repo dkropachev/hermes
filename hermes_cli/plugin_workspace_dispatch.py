@@ -67,6 +67,18 @@ class PluginWorkspaceTools:
     def __init__(self, workspaces: PluginWorkspaces) -> None:
         self._workspaces = workspaces
 
+    def materialize_tree(self, handle: Mapping[str, Any], entries: list[dict]) -> dict:
+        """Materialize verified binary entries into an empty pinned workspace."""
+        from hermes_cli.plugin_workspace_trees import materialize
+        with self._workspaces._pin_dispatch(handle, dispatch_kind="write_file") as pinned:
+            return materialize(pinned.path, entries)
+
+    def snapshot_tree(self, handle: Mapping[str, Any]) -> dict:
+        """Capture actual binary contents after native execution has quiesced."""
+        from hermes_cli.plugin_workspace_trees import snapshot
+        with self._workspaces._pin_dispatch(handle, dispatch_kind="read_file") as pinned:
+            return snapshot(pinned.path)
+
     def terminal(
         self,
         handle: Mapping[str, Any],

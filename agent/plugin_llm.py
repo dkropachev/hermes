@@ -555,11 +555,56 @@ class PluginLlm:
         self, *, plugin_id: str, policy_loader: Optional[Callable[[str], _TrustPolicy]] = None,
         sync_caller: Optional[Callable[..., Any]] = None,
         async_caller: Optional[Callable[..., Awaitable[Any]]] = None,
+        session_context: Any = None,
     ) -> None:
         self._plugin_id = plugin_id
         self._policy_loader = policy_loader or _resolve_trust_policy
         self._sync_caller = sync_caller
         self._async_caller = async_caller
+        self._session_context = session_context
+
+    async def aopen_session(self, *, task: str, key: str, workspace_handle: dict,
+                            instructions: str, tools: list[dict], resume: Optional[dict] = None,
+                            extensions: Sequence[str] = (), on_event=None, on_tool_call=None,
+                            execution_permission: str = "read", child_limit: int = 4,
+                            consumer_key: Optional[str] = None):
+        """Open a host-owned, workspace-confined Codex session for an owned task.
+
+        Completions remain independent of this additive API. Session references
+        contain identity and thread IDs, never credentials or process handles.
+        """
+        resolved = self._owned_session_task(task)
+        from agent.plugin_llm_sessions import open_session
+        return await open_session(
+            self._session_context, task=resolved, key=key, workspace_handle=workspace_handle,
+            instructions=instructions, tools=tools, resume=resume, extensions=extensions,
+            on_event=on_event, on_tool_call=on_tool_call,
+            execution_permission=execution_permission, child_limit=child_limit, consumer_key=consumer_key,
+        )
+
+    def _owned_session_task(self, task):
+        resolved = str(task or "").strip()
+        registration = (self._session_context._manager._aux_tasks.get(resolved)
+                        if self._session_context is not None else None)
+        if not registration or registration.get("plugin") != self._plugin_id:
+            raise PluginLlmTrustError("Sessions require a context-bound, registered auxiliary task")
+        return resolved
+
+    async def ainspect_session(self, *, task: str, reference: dict):
+        """Inspect saved native history only after independent cleanup proof."""
+        from agent.plugin_session_recovery import inspect_session
+        return await inspect_session(self._session_context, task=self._owned_session_task(task), reference=reference)
+
+    async def arecover_session(self, *, task: str, reference: dict, workspace_handle: dict, intent: dict):
+        """Reconnect preserved contents only after proving the exact dispatch stopped."""
+        from agent.plugin_session_recovery import recover_session
+        return await recover_session(self._session_context, task=self._owned_session_task(task), reference=reference,
+                                     workspace_handle=workspace_handle, intent=intent)
+
+    async def alist_sessions(self, *, task: str, key: str):
+        """Discover this installed plugin's durable native references for a key."""
+        from agent.plugin_session_recovery import list_sessions
+        return await list_sessions(self._session_context, task=self._owned_session_task(task), key=key)
 
     def complete(
         self, messages: List[Dict[str, Any]], *, provider: Optional[str] = None, model: Optional[str] = None,

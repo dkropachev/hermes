@@ -663,6 +663,10 @@ async def auth_middleware(request: Request, call_next):
         and not _has_valid_query_token(request, path)
     ):
         return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    if path.startswith("/api/") and path not in _PUBLIC_API_PATHS:
+        # Plugins consume this marker only after all authentication gates have
+        # allowed the request through to their router. No credential is exposed.
+        request.state.dashboard_authenticated = True
     return await call_next(request)
 
 
