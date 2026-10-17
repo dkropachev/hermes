@@ -311,7 +311,8 @@ class PluginContext:
         from hermes_cli.plugin_workspace_dispatch import HOST_FEATURE as dispatch_feature
         from hermes_cli.plugin_workspaces import HOST_FEATURE as lease_feature
 
-        return feature in {lease_feature, dispatch_feature}
+        return feature in {lease_feature, dispatch_feature, "plugin_llm_sessions.v1",
+                           "workspace_codex_execution.v1"}
 
     @cached_property
     def platform_actions(self):
@@ -411,7 +412,7 @@ class PluginContext:
         ``plugins.entries.<plugin_id>.llm.*``."""
         if self._llm is None:
             from agent.plugin_llm import PluginLlm
-            self._llm = PluginLlm(plugin_id=self.plugin_id)
+            self._llm = PluginLlm(plugin_id=self.plugin_id, session_context=self)
         return self._llm
 
     @cached_property

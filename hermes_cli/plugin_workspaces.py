@@ -1535,6 +1535,7 @@ class PluginWorkspaces:
         *,
         dispatch_kind: str,
         minimum_ttl_seconds: float = DEFAULT_TTL_SECONDS,
+        require_quiescent=None,
     ):
         """Fence a synchronous dispatch against release/reconnect/reacquire.
 
@@ -1618,6 +1619,10 @@ class PluginWorkspaces:
                 raise
             finally:
                 try:
+                    if require_quiescent is not None and not require_quiescent():
+                        raise WorkspaceLeaseError(
+                            "Execution descendants may still be running; retaining workspace dispatch receipt"
+                        )
                     with transaction(_connect(layout), immediate=True) as conn:
                         # A configured terminal timeout may be longer than the
                         # conservative window reserved before dispatch. Refresh

@@ -555,11 +555,33 @@ class PluginLlm:
         self, *, plugin_id: str, policy_loader: Optional[Callable[[str], _TrustPolicy]] = None,
         sync_caller: Optional[Callable[..., Any]] = None,
         async_caller: Optional[Callable[..., Awaitable[Any]]] = None,
+        session_context: Any = None,
     ) -> None:
         self._plugin_id = plugin_id
         self._policy_loader = policy_loader or _resolve_trust_policy
         self._sync_caller = sync_caller
         self._async_caller = async_caller
+        self._session_context = session_context
+
+    async def aopen_session(self, *, task: str, key: str, workspace_handle: dict,
+                            instructions: str, tools: list[dict], resume: Optional[dict] = None,
+                            extensions: Sequence[str] = (), on_event=None, on_tool_call=None):
+        """Open a host-owned, workspace-confined Codex session for an owned task.
+
+        Completions remain independent of this additive API. Session references
+        contain identity and thread IDs, never credentials or process handles.
+        """
+        resolved = str(task or "").strip()
+        registration = (self._session_context._manager._aux_tasks.get(resolved)
+                        if self._session_context is not None else None)
+        if not registration or registration.get("plugin") != self._plugin_id:
+            raise PluginLlmTrustError("Sessions require a context-bound, registered auxiliary task")
+        from agent.plugin_llm_sessions import open_session
+        return await open_session(
+            self._session_context, task=resolved, key=key, workspace_handle=workspace_handle,
+            instructions=instructions, tools=tools, resume=resume, extensions=extensions,
+            on_event=on_event, on_tool_call=on_tool_call,
+        )
 
     def complete(
         self, messages: List[Dict[str, Any]], *, provider: Optional[str] = None, model: Optional[str] = None,

@@ -50,13 +50,19 @@ class CodexAppServerTransportError(CodexAppServerError):
 _TRANSPORT_LOST_CODE = -32000
 
 
+class _DescendantSnapshot(list):
+    def __init__(self, children=(), *, complete=True):
+        super().__init__(children)
+        self.complete = complete
+
+
 def _snapshot_descendants(pid: int) -> list[Any]:
     """psutil handles for ``pid``'s current descendants ([] when psutil is unavailable)."""
     try:
         import psutil
-        return psutil.Process(int(pid)).children(recursive=True)
+        return _DescendantSnapshot(psutil.Process(int(pid)).children(recursive=True))
     except Exception:
-        return []
+        return _DescendantSnapshot(complete=False)
 
 
 def _reap_snapshotted(descendants: list[Any]) -> None:
@@ -156,6 +162,8 @@ class CodexAppServerClient:
         self._stderr_lock = threading.Lock()
         self._closed = False
         self._initialized = False
+        self._retired_descendants: list[Any] = []
+        self._cleanup_observed = False
 
         self._reader = threading.Thread(target=self._read_stdout, daemon=True)
         self._stderr_reader = threading.Thread(target=self._read_stderr, daemon=True)
@@ -190,6 +198,8 @@ class CodexAppServerClient:
         self._closed = True
         self._fail_pending_requests("codex app-server client is closing")
         descendants = _snapshot_descendants(self._proc.pid)
+        self._retired_descendants = descendants
+        self._cleanup_observed = getattr(descendants, "complete", False)
         with contextlib.suppress(Exception):
             if self._proc.stdin and not self._proc.stdin.closed:
                 self._proc.stdin.close()
@@ -202,6 +212,26 @@ class CodexAppServerClient:
                 self._proc.wait(timeout=1.0)
         finally:
             _reap_snapshotted(descendants)
+
+    def is_quiescent(self) -> bool:
+        """Prove the retired root and snapshotted descendants have stopped.
+
+        Workspace owners must retain their durable dispatch pin if a process
+        survives cleanup; a close attempt alone is insufficient evidence.
+        """
+        if self._proc.poll() is None or not self._cleanup_observed:
+            return False
+        for child in self._retired_descendants:
+            try:
+                if child.is_running() and child.status() != "zombie":
+                    return False
+            except Exception as exc:
+                # psutil retains PID creation time and reports disappearance as
+                # NoSuchProcess. Other inspection failures do not prove exit.
+                import psutil
+                if not isinstance(exc, psutil.NoSuchProcess):
+                    return False
+        return True
 
     def _fail_pending_requests(self, reason: str) -> None:
         """Unblock every thread currently sitting in request() instead of
