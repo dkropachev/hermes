@@ -310,6 +310,13 @@ class PluginContext:
         """Probe an additive host API independently of operator-granted capabilities."""
         from hermes_cli.plugin_workspace_dispatch import HOST_FEATURE as dispatch_feature
         from hermes_cli.plugin_workspaces import HOST_FEATURE as lease_feature
+        from hermes_cli.plugin_workspace_trees import HOST_FEATURE as tree_feature, supported
+
+        if feature == tree_feature:
+            return supported()
+        if feature in {"plugin_llm_inspection.v1", "plugin_session_supervision.v1"}:
+            from agent.transports.codex_app_server_supervisor import supported as supervision_supported
+            return supervision_supported()
 
         return feature in {lease_feature, dispatch_feature, "plugin_llm_sessions.v1",
                            "workspace_codex_execution.v1"}

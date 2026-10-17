@@ -14,6 +14,8 @@ import queue
 import re
 import subprocess
 import threading
+import sys
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -97,6 +99,7 @@ class CodexAppServerClient:
     def __init__(
         self, codex_bin: str = "codex", codex_home: Optional[str] = None,
         extra_args: Optional[list[str]] = None, env: Optional[dict[str, str]] = None,
+        supervision: Optional[dict] = None,
     ) -> None:
         self._codex_bin = codex_bin
         # codex needs LLM provider creds but must not receive Tier-1 Hermes secrets (gateway/GitHub/infra tokens).
@@ -149,10 +152,27 @@ class CodexAppServerClient:
         # See #56747.
         from hermes_cli._subprocess_compat import windows_hide_flags
 
+        self._supervision = supervision
+        if supervision is not None:
+            from agent.transports.codex_app_server_supervisor import supported
+            if not supported():
+                raise RuntimeError("Plugin sessions require native process supervision")
+            cmd = [sys.executable, "-I", str(Path(__file__).with_name("codex_app_server_supervisor.py")),
+                   json.dumps(supervision, separators=(",", ":")), *cmd]
+
         self._proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             bufsize=0, env=spawn_env, creationflags=windows_hide_flags(),
+            cwd=str(Path(supervision["receipt"]).parent) if supervision is not None else None,
         )
+        self._supervised_root = None
+        if supervision is not None:
+            import psutil
+            try:
+                self._supervised_root = psutil.Process(self._proc.pid)
+                self._supervised_root.create_time()
+            except psutil.NoSuchProcess:
+                pass  # The durable receipt, not a recycled PID, establishes cleanup.
         self._next_id = 1
         self._pending: dict[int, queue.Queue] = {}  # request id -> single-slot reply queue
         self._pending_lock = threading.Lock()
@@ -197,7 +217,13 @@ class CodexAppServerClient:
             return
         self._closed = True
         self._fail_pending_requests("codex app-server client is closing")
-        descendants = _snapshot_descendants(self._proc.pid)
+        if self._supervision is None:
+            descendants = _snapshot_descendants(self._proc.pid)
+        else:
+            try:
+                descendants = _DescendantSnapshot(self._supervised_root.children(recursive=True)) if self._supervised_root is not None else _DescendantSnapshot(complete=False)
+            except Exception:
+                descendants = _DescendantSnapshot(complete=False)
         self._retired_descendants = descendants
         self._cleanup_observed = getattr(descendants, "complete", False)
         with contextlib.suppress(Exception):
@@ -219,7 +245,13 @@ class CodexAppServerClient:
         Workspace owners must retain their durable dispatch pin if a process
         survives cleanup; a close attempt alone is insufficient evidence.
         """
-        if self._proc.poll() is None or not self._cleanup_observed:
+        if self._proc.poll() is None:
+            return False
+        if self._supervision is not None:
+            from agent.transports.codex_app_server_supervisor import proof
+            status = proof(self._supervision["receipt"], nonce=self._supervision["nonce"], binding=self._supervision["binding"])
+            return bool(status["quiescent"])
+        if not self._cleanup_observed:
             return False
         for child in self._retired_descendants:
             try:
@@ -358,6 +390,7 @@ class CodexAppServerClient:
             # requests still waiting, so fail them now instead of letting each
             # ride out its per-call timeout.
             self._fail_pending_requests("codex app-server stdout closed")
+            self._proc.stdout.close()
 
     def _dispatch(self, msg: dict) -> None:
         if "id" in msg and ("result" in msg or "error" in msg):  # reply
@@ -373,8 +406,9 @@ class CodexAppServerClient:
         if self._proc.stderr is None:
             return
         with contextlib.suppress(Exception):  # pragma: no cover
-            for line in iter(self._proc.stderr.readline, b""):
-                self._append_stderr(line.decode("utf-8", "replace").rstrip())
+            with self._proc.stderr:
+                for line in iter(self._proc.stderr.readline, b""):
+                    self._append_stderr(line.decode("utf-8", "replace").rstrip())
 
 
 def parse_codex_version(output: str) -> Optional[tuple[int, int, int]]:

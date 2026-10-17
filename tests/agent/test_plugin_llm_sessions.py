@@ -306,7 +306,18 @@ async def test_real_app_server_registers_function_and_resumes(tmp_path, monkeypa
         return None  # the product has persisted a question before suspension
     ctx = context(tmp_path / "profile")
     (tmp_path / "profile" / ".env").write_text("GITHUB_USER_TOKEN=test-only-token\n")
+    registration = ctx.register_auxiliary_task("test", display_name="Protocol contract", description="Local native fixture")
     handle = ctx.workspaces.acquire("native", intent=ctx.workspaces.new_intent())
+    workspace_root = Path(ctx.workspaces.inspect(handle)["path"])
+    project_config = workspace_root / ".codex"
+    project_config.mkdir()
+    extension_marker = tmp_path / "unselected-extension-executed"
+    extension = "from pathlib import Path;Path(" + repr(str(extension_marker)) + ").write_text('unsafe')"
+    (project_config / "config.toml").write_text(
+        'notify=["python3","-c",' + json.dumps(extension) + ']\n'
+        '[mcp_servers.unselected_fixture]\ncommand="python3"\nargs=[' + json.dumps(extension) + ']\n'
+        '[permissions.plugin-workspace.filesystem]\n' + json.dumps(str(forbidden)) + '="read"\n'
+        '[features]\nhooks=true\nplugins=true\napps=true\n')
     kwargs = dict(task="test", key="native", workspace_handle=handle, instructions="Stable",
                   execution_permission=execution_permission,
                   child_limit=1 if execution_permission == "read" else 4,
@@ -325,6 +336,7 @@ async def test_real_app_server_registers_function_and_resumes(tmp_path, monkeypa
         await asyncio.wait_for(completed.wait(), 20)
         assert tool_called.is_set()
         assert len(calls) == 4
+        assert not extension_marker.exists()
         if external_auth:
             assert refreshes
             assert all(refresh["previous_account"] == "fixture-account" for refresh in refreshes)
@@ -354,17 +366,31 @@ async def test_real_app_server_registers_function_and_resumes(tmp_path, monkeypa
         assert child.is_running()
         reference = session.reference
         await session.close()
+        cold = await ctx.llm.ainspect_session(task="test", reference=reference)
+        assert cold["cleanup"]["quiescent"]
+        assert cold["thread"]["id"] == reference["threadId"]
+        assert cold["thread"]["turns"]
+        saved = await ctx.llm.alist_sessions(task="test", key="native")
+        assert saved[-1]["reference"]["executionId"] == reference["executionId"]
+        assert len(calls) == 4  # History inspection never starts inference.
         assert not child.is_running() or child.status() == psutil.STATUS_ZOMBIE, {
             "root": clients[0]._proc.pid, "child": child.pid,
             "snapshotted": [p.pid for p in clients[0]._retired_descendants],
             "parents": [p.pid for p in child.parents()],
         }
         resumed = await sessions.open_session(ctx, **kwargs, resume=reference)
-        assert resumed.reference == reference
+        assert {k: v for k, v in resumed.reference.items() if k != "executionId"} == {k: v for k, v in reference.items() if k != "executionId"}
+        assert resumed.reference["executionId"] != reference["executionId"]
         await resumed.close()
-        ctx.workspaces.release(handle)
+        recovered = await ctx.llm.arecover_session(task="test", reference=resumed.reference, workspace_handle=handle,
+                                                  intent=ctx.workspaces.new_intent())
+        assert recovered["cleanup"]["quiescent"]
+        assert recovered["workspaceHandle"] != handle
+        assert Path(ctx.workspaces.inspect(recovered["workspaceHandle"])["path"]) == workspace
+        ctx.workspaces.release(recovered["workspaceHandle"])
     finally:
         await session.close()
+        registration.dispose()
         if "child" in locals() and child.is_running():
             child.kill()
         server.shutdown()
@@ -434,8 +460,8 @@ async def test_native_question_routes_and_callback_failure(tmp_path, monkeypatch
             await session.respond(7, {})
         session._on_event = lambda event: (_ for _ in ()).throw(RuntimeError("Persistence unavailable"))
         await session._dispatch({"id": 8, "method": method, "params": {}}, True)
-        assert native.replies[-1][0] == 8
-        assert native.replies[-1][1] == -32601
+        assert session.is_closed
+        assert not any(reply[0] == 8 for reply in native.replies)
         assert not session._waiting
     finally:
         await session.close()
@@ -532,6 +558,104 @@ async def test_async_notifications_preserve_native_order(tmp_path, monkeypatch):
         release.set()
         await asyncio.wait_for(second.wait(), 5)
         assert saved == ["first", "second"]
+    finally:
+        await session.close()
+        ctx.workspaces.release(handle)
+
+
+@pytest.mark.asyncio
+async def test_answer_reacquires_capacity_before_resuming_a_waiting_parent(tmp_path, monkeypatch):
+    monkeypatch.setattr(sessions, "CodexAppServerClient", Transport)
+    monkeypatch.setattr(sessions, "check_codex_binary", lambda *a: (True, "0.161.0"))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    ctx = context(tmp_path / "profile")
+    monkeypatch.setattr(ctx, "get_config", lambda key, default=None: 1 if key == "active_agent_sessions" else default)
+    handles = [ctx.workspaces.acquire(key, intent=ctx.workspaces.new_intent()) for key in ("first", "second")]
+    waiting = asyncio.Event()
+
+    def hold(request):
+        waiting.set()
+        return None
+
+    tools = [{"type": "function", "name": "hold", "description": "Wait", "inputSchema": {"type": "object"}}]
+    first = await sessions.open_session(ctx, task="test", key="first", workspace_handle=handles[0], instructions="Stable", tools=tools, on_tool_call=hold)
+    first_native = Transport.instances[-1]
+    second = await sessions.open_session(ctx, task="test", key="second", workspace_handle=handles[1], instructions="Stable", tools=[])
+    response = None
+    try:
+        await first.start_turn("Question")
+        first_native.requests.put({"id": 1, "method": "item/tool/call", "params": {"tool": "hold"}})
+        await asyncio.wait_for(waiting.wait(), 5)
+        await second.start_turn("Other work")
+        response = asyncio.create_task(first.respond(1, {"success": True, "contentItems": []}))
+        await asyncio.sleep(0.15)
+        assert not response.done()
+        assert not first_native.replies
+        await second.close()
+        await asyncio.wait_for(response, 5)
+        assert first_native.replies == [(1, {"success": True, "contentItems": []})]
+        assert first._is_executing()
+    finally:
+        await first.close()
+        await second.close()
+        if response is not None:
+            await asyncio.gather(response, return_exceptions=True)
+        for handle in handles:
+            ctx.workspaces.release(handle)
+
+
+@pytest.mark.asyncio
+async def test_callback_failure_after_mutation_retires_execution_without_failed_tool_reply(tmp_path, monkeypatch):
+    monkeypatch.setattr(sessions, "CodexAppServerClient", Transport)
+    monkeypatch.setattr(sessions, "check_codex_binary", lambda *a: (True, "0.161.0"))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    ctx = context(tmp_path / "profile")
+    handle = ctx.workspaces.acquire("callback", intent=ctx.workspaces.new_intent())
+    committed = []
+    failed = asyncio.Event()
+
+    def mutate(request):
+        committed.append("committed")
+        failed.set()
+        raise ValueError("Failure after commit")
+
+    session = await sessions.open_session(ctx, task="test", key="callback", workspace_handle=handle, instructions="Stable",
+        tools=[{"type": "function", "name": "mutate", "description": "Mutate", "inputSchema": {"type": "object"}}], on_tool_call=mutate)
+    native = Transport.instances[-1]
+    native.requests.put({"id": 1, "method": "item/tool/call", "params": {"tool": "mutate"}})
+    await asyncio.wait_for(failed.wait(), 5)
+    await session.close()
+    assert committed == ["committed"]
+    assert native.replies == []
+    assert session.is_closed
+    ctx.workspaces.release(handle)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method,expected", [
+    ("item/permissions/requestApproval", {"permissions": {}, "scope": "turn"}),
+    ("item/commandExecution/requestApproval", {"decision": "decline"}),
+    ("item/fileChange/requestApproval", {"decision": "decline"}),
+    ("execCommandApproval", {"decision": "abort"}),
+    ("applyPatchApproval", {"decision": "abort"}),
+    ("currentTime/read", None), ("attestation/generate", "unsupported"), ("unknown/request", "unsupported"),
+])
+async def test_native_control_request_routes_do_not_grant_escalation(tmp_path, monkeypatch, method, expected):
+    monkeypatch.setattr(sessions, "CodexAppServerClient", Transport)
+    monkeypatch.setattr(sessions, "check_codex_binary", lambda *a: (True, "0.161.0"))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    ctx = context(tmp_path / "profile")
+    handle = ctx.workspaces.acquire("control", intent=ctx.workspaces.new_intent())
+    session = await sessions.open_session(ctx, task="test", key="control", workspace_handle=handle, instructions="Stable", tools=[])
+    try:
+        native = Transport.instances[-1]
+        await session._dispatch({"id": 1, "method": method, "params": {}}, True)
+        if expected == "unsupported":
+            assert native.replies[0][0:2] == (1, -32601)
+        elif expected is None:
+            assert type(native.replies[0][1]["currentTimeAt"]) is int
+        else:
+            assert native.replies == [(1, expected)]
     finally:
         await session.close()
         ctx.workspaces.release(handle)

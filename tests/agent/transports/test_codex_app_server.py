@@ -24,6 +24,8 @@ def _bare_client() -> CodexAppServerClient:
     client._pending = {}
     client._pending_lock = threading.Lock()
     client._next_id = 1
+    client._supervision = None
+    client._supervised_root = None
     client._proc = Mock(stdin=None, terminate=Mock(), kill=Mock(), wait=Mock(return_value=0))
     return client
 
@@ -96,4 +98,4 @@ def test_stdout_eof_fails_in_flight_request_promptly():
     assert "stdout closed" in str(outcome["err"])
     assert client._pending == {}
     client._fail_pending_requests("codex app-server client is closing")  # idempotent
-    client._proc.stdout.close()
+    assert client._proc.stdout.closed

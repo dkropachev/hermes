@@ -212,6 +212,8 @@ while True:
         client = mod.CodexAppServerClient.__new__(mod.CodexAppServerClient)
         client._proc = proc
         client._closed = False
+        client._supervision = None
+        client._supervised_root = None
         client._pending, client._pending_lock = {}, threading.Lock()
         client.close(timeout=0.01)
 
@@ -447,4 +449,3 @@ class TestSpawnEnvSecretStripping:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-codex-needs-this")
         env = self._capture_spawn_env(monkeypatch)
         assert env.get("OPENAI_API_KEY") == "sk-codex-needs-this"
-

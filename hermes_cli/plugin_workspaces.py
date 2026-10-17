@@ -95,6 +95,7 @@ class _PinnedWorkspace:
     path: Path
     task_id: str
     generation: int
+    dispatch_id: str
 
 
 _generation_locks_guard = threading.Lock()
@@ -1242,6 +1243,50 @@ class PluginWorkspaces:
                 reason=reason,
             )
 
+    def _complete_supervised_dispatch(self, handle, *, binding, cleanup):
+        """Host-only proof path for the exact native dispatch; preserve contents."""
+        receipt = cleanup.get("receipt", {})
+        if cleanup.get("quiescent") is not True or not receipt.get("dispatchId"):
+            raise WorkspaceLeaseError("Native dispatch has no completed supervision proof")
+        layout = self._layout()
+        workspace_id = self._workspace_id_for_handle(handle)
+        with _generation_lock(layout, workspace_id), transaction(_connect(layout), immediate=True) as conn:
+            row = _validated_row(conn, layout, handle)
+            if _owner_status(row) not in {"self", "dead"}:
+                raise WorkspaceOwnershipError("Native dispatch still belongs to another live or unknown owner")
+            if (binding.get("workspace"), binding.get("generation")) != (row["workspace_id"], row["generation"]):
+                raise WorkspaceLeaseError("Native proof belongs to another workspace generation")
+            pending = _dispatch_receipts(conn, row)
+            if not pending:
+                return
+            owner = receipt.get("owner", {})
+            if len(pending) != 1 or any(pending[0][key] != expected for key, expected in (
+                ("dispatch_id", receipt["dispatchId"]), ("lease_id", row["lease_id"]),
+                ("generation", receipt.get("generation")), ("workspace_id", receipt.get("workspace")),
+                ("owner_pid", owner.get("pid")), ("owner_create_time", owner.get("created"))
+            )):
+                raise WorkspaceLeaseError("Native supervision proof does not match the unfinished dispatch")
+            if conn.execute("DELETE FROM workspace_bound_dispatches WHERE dispatch_id=?", (receipt["dispatchId"],)).rowcount != 1:
+                raise WorkspaceLeaseError("Native dispatch changed during proof reconciliation")
+            _event(conn, row, "supervised_dispatch_completed", {"dispatch_id": receipt["dispatchId"],
+                                                               "proof_nonce": receipt["nonce"], "reason": cleanup["reason"]})
+
+    def _validate_recovery_binding(self, handle, *, intent, binding):
+        workspace_id = self._workspace_id_for_reconnect(handle, intent)
+        layout = self._layout()
+        with transaction(_connect(layout), immediate=True) as conn:
+            try:
+                row = _validated_row(conn, layout, handle)
+                generation = row["generation"]
+            except InvalidWorkspaceHandleError:
+                operation_id, _capability = _parse_intent(intent)
+                operation = conn.execute("SELECT * FROM workspace_lease_operations WHERE operation_id=?", (operation_id,)).fetchone()
+                if operation is None or operation["state"] != "committed":
+                    raise InvalidWorkspaceIntentError("Native recovery has no committed reconnect")
+                generation = operation["result_generation"] - 1
+            if (binding.get("workspace"), binding.get("generation")) != (workspace_id, generation):
+                raise WorkspaceLeaseError("Native recovery reference belongs to another workspace generation")
+
     def _recover_interrupted_dispatch_locked(
         self,
         handle: Mapping[str, Any],
@@ -1612,7 +1657,7 @@ class PluginWorkspaces:
             body_error: BaseException | None = None
             try:
                 yield _PinnedWorkspace(
-                    path=path, task_id=task_id, generation=generation,
+                    path=path, task_id=task_id, generation=generation, dispatch_id=dispatch_id,
                 )
             except BaseException as exc:
                 body_error = exc
