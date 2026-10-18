@@ -1,6 +1,12 @@
 name: Tests
 
 on:
+  workflow_dispatch:
+    inputs:
+      native_sessions_only:
+        description: Run the pinned native-session acceptance suite
+        type: boolean
+        default: true
   workflow_call:
     inputs:
       slice_count:
@@ -17,7 +23,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  native-sessions:
+    if: github.event_name == 'workflow_dispatch' && inputs.native_sessions_only
+    uses: ./.github/workflows/plugin-native-sessions.yml
+
   generate:
+    if: github.event_name != 'workflow_dispatch' || !inputs.native_sessions_only
     name: Generate test slices
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -238,6 +249,7 @@ jobs:
           key: test-durations-${{ github.run_id }}
 
   e2e:
+    if: github.event_name != 'workflow_dispatch' || !inputs.native_sessions_only
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
