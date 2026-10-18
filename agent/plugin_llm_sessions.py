@@ -13,7 +13,6 @@ import hashlib
 import inspect
 import json
 import queue
-import shutil
 import threading
 import time
 import tomllib
@@ -523,12 +522,10 @@ class PluginLlmSession:
         # Codex re-execs its own binary inside bwrap. User installations
         # commonly live under ~/.codex; allow the executable files only,
         # while keeping authentication and all other package state hidden.
-        executable = Path(shutil.which(codex_bin) or codex_bin).resolve()
+        from agent.plugin_session_runtime import codex_runtime_files
         runtime_files = selected["permissions"]["plugin-workspace"]["filesystem"]
-        runtime_files[str(executable)] = "read"
-        code_host = executable.parent / "codex-code-mode-host"
-        if code_host.is_file():
-            runtime_files[str(code_host)] = "read"
+        for executable in codex_runtime_files(codex_bin):
+            runtime_files[str(executable)] = "read"
         task_config = self._settings["auxiliary"]
         provider = str(task_config.get("provider") or "auto")
         if provider not in {"auto", "openai-codex", "codex"}:

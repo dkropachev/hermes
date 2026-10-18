@@ -1,0 +1,67 @@
+name: Plugin native sessions
+
+on:
+  pull_request:
+    paths:
+      - agent/plugin_*.py
+      - agent/transports/codex_app_server*.py
+      - hermes_cli/plugin_workspace*.py
+      - tests/agent/test_plugin_*.py
+      - tests/agent/transports/test_codex_app_server*.py
+      - tests/plugins/test_workspace_trees.py
+      - .github/workflows/plugin-native-sessions.yml
+  push:
+    branches: [main]
+    paths:
+      - agent/plugin_*.py
+      - agent/transports/codex_app_server*.py
+      - hermes_cli/plugin_workspace*.py
+      - tests/agent/test_plugin_*.py
+      - tests/agent/transports/test_codex_app_server*.py
+      - tests/plugins/test_workspace_trees.py
+      - .github/workflows/plugin-native-sessions.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plugin-native-sessions-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    name: Native session acceptance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.11.19"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install locked host and test dependencies
+        run: uv sync --locked --extra dev --python 3.11
+      - name: Install accepted native runtime through npm
+        run: |
+          npm install --prefix "$RUNNER_TEMP/native-runtime" --no-save --ignore-scripts --no-audit --no-fund @openai/codex@0.161.0
+          test "$("$RUNNER_TEMP/native-runtime/node_modules/.bin/codex" --version)" = 'codex-cli 0.161.0'
+          echo "$RUNNER_TEMP/native-runtime/node_modules/.bin" >>"$GITHUB_PATH"
+      - name: Exercise native sessions, isolation and recovery
+        run: |
+          .venv/bin/python -m pytest -q \
+            tests/agent/test_plugin_session_runtime.py \
+            tests/agent/test_plugin_llm_sessions.py \
+            tests/agent/test_plugin_native_questions.py \
+            tests/agent/test_plugin_session_children.py \
+            tests/agent/test_plugin_session_credentials.py \
+            tests/agent/test_plugin_session_image_scope.py \
+            tests/agent/test_plugin_session_recovery.py \
+            tests/agent/transports/test_codex_app_server_supervisor.py \
+            tests/plugins/test_workspace_trees.py \
+            --junitxml="$RUNNER_TEMP/native-session-results.xml"
+          .venv/bin/python -c 'import sys,xml.etree.ElementTree as E; suites=E.parse(sys.argv[1]).getroot().iter("testsuite"); assert sum(int(s.get("skipped", "0")) for s in suites)==0, "Native acceptance must not skip"' "$RUNNER_TEMP/native-session-results.xml"
