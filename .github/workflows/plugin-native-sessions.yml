@@ -10,6 +10,8 @@ on:
       - tests/agent/test_plugin_*.py
       - tests/agent/transports/test_codex_app_server*.py
       - tests/plugins/test_workspace_trees.py
+      - scripts/ci/plugin_native_sandbox.sh
+      - tests/scripts/test_plugin_native_sandbox.py
       - .github/workflows/plugin-native-sessions.yml
   push:
     branches: [main]
@@ -20,6 +22,8 @@ on:
       - tests/agent/test_plugin_*.py
       - tests/agent/transports/test_codex_app_server*.py
       - tests/plugins/test_workspace_trees.py
+      - scripts/ci/plugin_native_sandbox.sh
+      - tests/scripts/test_plugin_native_sandbox.py
       - .github/workflows/plugin-native-sessions.yml
   workflow_dispatch:
 
@@ -52,6 +56,8 @@ jobs:
           npm install --prefix "$RUNNER_TEMP/native-runtime" --no-save --ignore-scripts --no-audit --no-fund @openai/codex@0.161.0
           test "$("$RUNNER_TEMP/native-runtime/node_modules/.bin/codex" --version)" = 'codex-cli 0.161.0'
           echo "$RUNNER_TEMP/native-runtime/node_modules/.bin" >>"$GITHUB_PATH"
+      - name: Prepare scoped native sandbox support
+        run: bash scripts/ci/plugin_native_sandbox.sh
       - name: Exercise native sessions, isolation and recovery
         run: |
           .venv/bin/python -m pytest -q \
@@ -64,5 +70,6 @@ jobs:
             tests/agent/test_plugin_session_recovery.py \
             tests/agent/transports/test_codex_app_server_supervisor.py \
             tests/plugins/test_workspace_trees.py \
+            tests/scripts/test_plugin_native_sandbox.py \
             --junitxml="$RUNNER_TEMP/native-session-results.xml"
           .venv/bin/python -c 'import sys,xml.etree.ElementTree as E; suites=E.parse(sys.argv[1]).getroot().iter("testsuite"); assert sum(int(s.get("skipped", "0")) for s in suites)==0, "Native acceptance must not skip"' "$RUNNER_TEMP/native-session-results.xml"
