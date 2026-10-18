@@ -6,6 +6,13 @@ description: "Run any LLM call from inside a plugin via ctx.llm — chat or stru
 
 # Plugin LLM Access
 
+Native workspace sessions support both direct Codex executables and the official
+npm installation. For npm, Hermes resolves the platform package's actual native
+executable before granting sandbox access. Only that executable and its optional
+code-mode companion are readable; package directories and credential files do not
+become readable with them. Native acceptance runs through the npm launcher as well
+as a direct executable, with read/write isolation and interrupted-process recovery.
+
 `ctx.llm` is the supported way for a plugin to make an LLM call.
 Chat completion, structured extraction, sync, async, with or without
 images — same surface, same trust gate, same host-owned credentials.

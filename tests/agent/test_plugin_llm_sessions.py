@@ -209,7 +209,8 @@ async def test_active_turn_deadline_survives_question_suspension(tmp_path, monke
 @pytest.mark.live_system_guard_bypass
 @pytest.mark.parametrize("execution_permission", ["read", "write"])
 @pytest.mark.parametrize("external_auth", [False, True])
-async def test_real_app_server_registers_function_and_resumes(tmp_path, monkeypatch, execution_permission, external_auth):
+@pytest.mark.parametrize("installation", ["standalone", "npm"])
+async def test_real_app_server_registers_function_and_resumes(tmp_path, monkeypatch, execution_permission, external_auth, installation):
     """Real Codex, local inference fixture: tools, completion and persisted resume."""
     ok, version = sessions.check_codex_binary("codex", sessions.PROTOCOL_BASELINE)
     if not ok or version != "0.161.0":
@@ -325,6 +326,14 @@ async def test_real_app_server_registers_function_and_resumes(tmp_path, monkeypa
         tool_called.set()
         return None  # the product has persisted a question before suspension
     ctx = context(tmp_path / "profile")
+    if installation == 'npm':
+        import shutil
+        from agent.plugin_session_runtime import codex_runtime_files
+        from tests.agent.test_plugin_session_runtime import npm_launcher
+        if shutil.which('node') is None:
+            pytest.skip('Node is required for the npm launcher acceptance case')
+        launcher = npm_launcher(tmp_path / 'npm-installation', codex_runtime_files('codex')[0])
+        (tmp_path / 'profile' / 'config.yaml').write_text('model:\n  codex_bin: ' + json.dumps(str(launcher)) + '\n')
     (tmp_path / "profile" / ".env").write_text("GITHUB_USER_TOKEN=test-only-token\n")
     registration = ctx.register_auxiliary_task("test", display_name="Protocol contract", description="Local native fixture")
     handle = ctx.workspaces.acquire("native", intent=ctx.workspaces.new_intent())
