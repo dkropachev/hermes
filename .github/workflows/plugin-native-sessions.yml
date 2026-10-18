@@ -11,6 +11,7 @@ on:
       - tests/agent/transports/test_codex_app_server*.py
       - tests/plugins/test_workspace_trees.py
       - scripts/ci/plugin_native_sandbox.sh
+      - scripts/ci/plugin_native_acceptance.sh
       - tests/scripts/test_plugin_native_sandbox.py
       - .github/workflows/plugin-native-sessions.yml
   push:
@@ -23,6 +24,7 @@ on:
       - tests/agent/transports/test_codex_app_server*.py
       - tests/plugins/test_workspace_trees.py
       - scripts/ci/plugin_native_sandbox.sh
+      - scripts/ci/plugin_native_acceptance.sh
       - tests/scripts/test_plugin_native_sandbox.py
       - .github/workflows/plugin-native-sessions.yml
   workflow_dispatch:
@@ -59,17 +61,4 @@ jobs:
       - name: Prepare scoped native sandbox support
         run: bash scripts/ci/plugin_native_sandbox.sh
       - name: Exercise native sessions, isolation and recovery
-        run: |
-          .venv/bin/python -m pytest -q \
-            tests/agent/test_plugin_session_runtime.py \
-            tests/agent/test_plugin_llm_sessions.py \
-            tests/agent/test_plugin_native_questions.py \
-            tests/agent/test_plugin_session_children.py \
-            tests/agent/test_plugin_session_credentials.py \
-            tests/agent/test_plugin_session_image_scope.py \
-            tests/agent/test_plugin_session_recovery.py \
-            tests/agent/transports/test_codex_app_server_supervisor.py \
-            tests/plugins/test_workspace_trees.py \
-            tests/scripts/test_plugin_native_sandbox.py \
-            --junitxml="$RUNNER_TEMP/native-session-results.xml"
-          .venv/bin/python -c 'import sys,xml.etree.ElementTree as E; suites=E.parse(sys.argv[1]).getroot().iter("testsuite"); assert sum(int(s.get("skipped", "0")) for s in suites)==0, "Native acceptance must not skip"' "$RUNNER_TEMP/native-session-results.xml"
+        run: bash scripts/ci/plugin_native_acceptance.sh "$PWD/.venv/bin/python" "$RUNNER_TEMP/native-session-results.xml"
